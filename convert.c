@@ -1211,7 +1211,7 @@ do { \
 
     /* PERF_SAMPLE_REGS_USER - Fixed size */
     size = sizeof(u64) + hweight64(attr->sample_regs_user) * sizeof(u64);
-    ADD_MEMBER("regs_user", size, PERF_SAMPLE_REGS_USER, "User registers");
+    ADD_MEMBER("regs_user", 0, PERF_SAMPLE_REGS_USER, "User registers", members[i].size = size; cache->regs_user = &members[i]);
 
     /* PERF_SAMPLE_STACK_USER - variable size */
     ADD_MEMBER("stack_user", 0, PERF_SAMPLE_STACK_USER, "User stack", cache->stack_user = &members[i]);
@@ -1224,7 +1224,7 @@ do { \
 
     /* PERF_SAMPLE_REGS_INTR - Fixed size */
     size = sizeof(u64) + hweight64(attr->sample_regs_intr) * sizeof(u64);
-    ADD_MEMBER("regs_intr", size, PERF_SAMPLE_REGS_INTR, "Interrupt registers");
+    ADD_MEMBER("regs_intr", 0, PERF_SAMPLE_REGS_INTR, "Interrupt registers", members[i].size = size; cache->regs_intr = &members[i]);
 
     ADD_MEMBER("phys_addr", sizeof(u64), PERF_SAMPLE_PHYS_ADDR, "Physical address");
 
@@ -1244,6 +1244,10 @@ do { \
  * Calculate the offset of a member in a perf_event sample.
  * For variable-size members (callchain, raw, etc.), we need to
  * compute the actual offset based on deps.
+ *
+ * Each variable-size member's stored offset assumes all prior variable-size
+ * members occupy 0 bytes. We accumulate deps_size by reading the actual size
+ * of each prior variable-size member, and add it to the stored offset.
  */
 int perf_event_member_offset(struct perf_event_member_cache *cache,
                              struct perf_event_member *member,
@@ -1257,31 +1261,47 @@ int perf_event_member_offset(struct perf_event_member_cache *cache,
 
     /* PERF_SAMPLE_CALLCHAIN: { u64 nr; u64 ips[nr]; } */
     if (member->deps & PERF_SAMPLE_CALLCHAIN) {
-        u64 nr = *(u64 *)(data + cache->callchain->offset);
+        u64 nr = *(u64 *)(data + cache->callchain->offset + deps_size);
         deps_size += sizeof(u64) + nr * sizeof(u64);
     }
 
     /* PERF_SAMPLE_RAW: { u32 size; char data[size]; } */
     if (member->deps & PERF_SAMPLE_RAW) {
-        u32 size = *(u32 *)(data + cache->raw->offset);
+        u32 size = *(u32 *)(data + cache->raw->offset + deps_size);
         deps_size += sizeof(u32) + size;
     }
 
     /* PERF_SAMPLE_BRANCH_STACK - { u64 nr; { u64 from, to, flags } lbr[nr]; } */
     if (member->deps & PERF_SAMPLE_BRANCH_STACK) {
-        u64 nr = *(u64 *)(data + cache->branch_stack->offset);
+        u64 nr = *(u64 *)(data + cache->branch_stack->offset + deps_size);
         deps_size += sizeof(u64) + nr * sizeof(struct perf_branch_entry);
     }
 
-    /* PERF_SAMPLE_STACK_USER: { u64 size; char data[size]; u64 dyn_size; } */
+    /* PERF_SAMPLE_REGS_USER: { u64 abi; u64 regs[weight(mask)]; }
+     * When abi == 0 (e.g. kernel threads), kernel only writes the abi field. */
+    if (member->deps & PERF_SAMPLE_REGS_USER) {
+        u64 abi = *(u64 *)(data + cache->regs_user->offset + deps_size);
+        deps_size += abi ? cache->regs_user->size : sizeof(u64);
+    }
+
+    /* PERF_SAMPLE_STACK_USER: { u64 size; char data[size]; u64 dyn_size; }
+     * When size == 0 (e.g. kernel threads), kernel only writes the size field,
+     * data[] and dyn_size are not present. */
     if (member->deps & PERF_SAMPLE_STACK_USER) {
-        u64 size = *(u64 *)(data + cache->stack_user->offset);
-        deps_size += sizeof(u64) + size + sizeof(u64);
+        u64 size = *(u64 *)(data + cache->stack_user->offset + deps_size);
+        deps_size += sizeof(u64) + (size ? size + sizeof(u64) : 0);
+    }
+
+    /* PERF_SAMPLE_REGS_INTR: { u64 abi; u64 regs[weight(mask)]; }
+     * When abi == 0, kernel only writes the abi field. */
+    if (member->deps & PERF_SAMPLE_REGS_INTR) {
+        u64 abi = *(u64 *)(data + cache->regs_intr->offset + deps_size);
+        deps_size += abi ? cache->regs_intr->size : sizeof(u64);
     }
 
     /* PERF_SAMPLE_AUX: { u64 size; char data[size]; } */
     if (member->deps & PERF_SAMPLE_AUX) {
-        u64 size = *(u64 *)(data + cache->aux->offset);
+        u64 size = *(u64 *)(data + cache->aux->offset + deps_size);
         deps_size += sizeof(u64) + size;
     }
 
