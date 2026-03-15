@@ -16,6 +16,7 @@
 #include <api/fs/fs.h>
 #include <trace_helpers.h>
 #include <event-parse-local.h>
+#include "perf_regs_mask.h"
 
 #define PLUGINS_DIR "/usr/lib64/perf-prof/traceevent/plugins"
 
@@ -1370,18 +1371,24 @@ static void __config_retprobe(const char *retprobe, struct perf_event_attr *attr
         attr->config |= (1<<bit);
 }
 
-struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *attr)
+// Create a per-event evsel from the template attr. Copy tmpl to a local attr
+// so per-event modifications (type, config, callchain, DWARF sampling) don't
+// leak back to the caller. When tp->stack is set (via /stack/ attribute or
+// env->callchain), enable PERF_SAMPLE_CALLCHAIN and DWARF regs/stack sampling.
+struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
 {
+    struct perf_event_attr new;
+    struct perf_event_attr *attr = &new;
     struct perf_evsel *evsel;
 
     if (tp_is_dev(tp))
         return NULL;
 
+    *attr = *tmpl;
+
     if (tp->id <= TRACE_EVENT_TYPE_MAX) {
         attr->type = PERF_TYPE_TRACEPOINT;
         attr->config = tp->id;
-        attr->kprobe_func = 0;
-        attr->probe_offset = 0;
     } else {
         if (attr->sample_period != 0 &&
             !(attr->sample_type & (PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_ID |
@@ -1414,6 +1421,19 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *attr)
     }
 
     attr->sample_max_stack = tp->max_stack;
+    if (tp->stack) {
+        attr->sample_type |= PERF_SAMPLE_CALLCHAIN;
+
+        // --user-callchain=dwarf
+        // Only sample REGS_USER/STACK_USER for events with callchain enabled.
+        if (tp->dev->env->dwarf_record_size) {
+            attr->sample_type |= PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+            attr->sample_regs_user = PERF_REGS_MASK;
+            attr->sample_stack_user = tp->dev->env->dwarf_record_size;
+            /* Enable kernel FP-based user callchain */
+            attr->exclude_callchain_user = 0;
+        }
+    }
 
     evsel = perf_evsel__new(attr);
     if (!evsel) {
