@@ -4,28 +4,12 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <asm/perf_regs.h>
-#include <linux/bitops.h>
 #include <monitor.h>
 #include <dlfcn.h>
 #include <tep.h>
 #include <trace_helpers.h>
 #include <stack_helpers.h>
-
-#if defined(__i386__) || defined(__x86_64__)
-#define REG_NOSUPPORT_N 4
-#define REG_NOSUPPORT ((1ULL << PERF_REG_X86_DS) | \
-		       (1ULL << PERF_REG_X86_ES) | \
-		       (1ULL << PERF_REG_X86_FS) | \
-		       (1ULL << PERF_REG_X86_GS))
-#if defined(__i386__)
-#define PERF_REGS_MASK (((1ULL << PERF_REG_X86_32_MAX) - 1) & ~REG_NOSUPPORT)
-#else
-#define PERF_REGS_MASK (((1ULL << PERF_REG_X86_64_MAX) - 1) & ~REG_NOSUPPORT)
-#endif
-#elif defined(__aarch64__)
-#define PERF_REGS_MASK ((1ULL << PERF_REG_ARM64_MAX) - 1)
-#endif
+#include "perf_regs_mask.h"
 
 struct page_faults_ctx {
     struct callchain_ctx *cc;
@@ -193,8 +177,10 @@ static void page_faults_print_event(struct prof_dev *dev, union perf_event *even
         printf("%016llx\n", data->ip);
 
     if (dev->env->callchain && !(flags & OMIT_CALLCHAIN)) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
         regs_user = (struct sample_regs_user *)&data->callchain.ips[data->callchain.nr];
-        print_callchain_common_cbs(ctx->cc, &data->callchain, data->tid_entry.pid, NULL, (callchain_cbs)print_regs_user, regs_user);
+        print_callchain_data_cbs(ctx->cc, &cd, NULL, (callchain_cbs)print_regs_user, regs_user);
     }
 }
 
