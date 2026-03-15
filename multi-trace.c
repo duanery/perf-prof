@@ -642,12 +642,6 @@ static int __multi_trace_init(struct prof_dev *dev)
         struct tp *tp;
         for_each_real_tp(ctx->tp_list[i], tp, j) {
             struct perf_evsel *evsel;
-
-            if (tp->stack)
-                attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
-            else
-                attr.sample_type &= (~PERF_SAMPLE_CALLCHAIN);
-
             evsel = tp_evsel_new(tp, &attr);
             if (!evsel) {
                 goto failed;
@@ -1073,7 +1067,9 @@ void multi_trace_print_title(union perf_event *event, struct tp *tp, const char 
     tp_print_event(tp, data->h.time, data->h.cpu_entry.cpu, raw, size);
 
     if (tp->stack) {
-        print_callchain_common(ctx->cc, &data->callchain, data->h.tid_entry.pid);
+        struct callchain_data cd;
+        perf_event_build_callchain_data(tp->evsel, event, &cd);
+        print_callchain_data(ctx->cc, &cd);
     }
 }
 
