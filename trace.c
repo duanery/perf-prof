@@ -117,13 +117,6 @@ static int trace_init(struct prof_dev *dev)
     prof_dev_env2attr(dev, &attr);
 
     for_each_real_tp(ctx->tp_list, tp, i) {
-        if (!env->callchain) {
-            if (tp->stack)
-                attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
-            else
-                attr.sample_type &= (~PERF_SAMPLE_CALLCHAIN);
-        }
-
         evsel = tp_evsel_new(tp, &attr);
         if (!evsel) {
             goto failed;
@@ -198,15 +191,17 @@ static void __raw_size(union perf_event *event, void **praw, int *psize, bool ca
     }
 }
 
-static inline void __print_callchain(struct prof_dev *dev, union perf_event *event, bool callchain)
+static inline void __print_callchain(struct prof_dev *dev, struct tp *tp, union perf_event *event)
 {
     struct trace_ctx *ctx = dev->private;
     struct sample_type_callchain *data = (void *)event->sample.array;
 
-    if (callchain) {
-        if (!dev->env->flame_graph)
-            print_callchain_common(ctx->cc, &data->callchain, data->h.tid_entry.pid);
-        else {
+    if (tp->stack) {
+        if (!dev->env->flame_graph) {
+            struct callchain_data cd;
+            perf_event_build_callchain_data(tp->evsel, event, &cd);
+            print_callchain_data(ctx->cc, &cd);
+        } else {
             const char *comm = tep__pid_to_comm((int)data->h.tid_entry.pid);
             flame_graph_add_callchain_at_time(ctx->flame, &data->callchain, data->h.tid_entry.pid,
                                               !strcmp(comm, "<...>") ? NULL : comm,
@@ -254,8 +249,9 @@ static void trace_print_event(struct prof_dev *dev, union perf_event *event, int
     tp_print_event(tp, data->time, data->cpu_entry.cpu, raw, size);
 
     if (tp->stack && !(flags & OMIT_CALLCHAIN)) {
-        struct sample_type_callchain *c = (void *)event->sample.array;
-        print_callchain_common(ctx->cc, &c->callchain, data->tid_entry.pid);
+        struct callchain_data cd;
+        perf_event_build_callchain_data(evsel, event, &cd);
+        print_callchain_data(ctx->cc, &cd);
     }
 }
 
@@ -284,7 +280,7 @@ static void trace_sample(struct prof_dev *dev, union perf_event *event, int inst
     tp_print_event(tp, data->time, data->cpu_entry.cpu, raw, size);
     if (tp->exec_prog)
         tp_prog_run(tp, tp->exec_prog, GLOBAL(data->cpu_entry.cpu, data->tid_entry.pid, raw, size));
-    __print_callchain(dev, event, tp->stack);
+    __print_callchain(dev, tp, event);
 }
 
 static void trace_interval(struct prof_dev *dev)
