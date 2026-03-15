@@ -255,8 +255,11 @@ static void print_event(struct prof_dev *dev, union perf_event *event, int insta
             data->time / NSEC_PER_SEC, (data->time % NSEC_PER_SEC)/1000,
             counter, miscstr(event->header.misc), data->ip);
 
-    if (dev->env->callchain && !(flags & OMIT_CALLCHAIN))
-        print_callchain_common(ctx->cc, &data->callchain, data->tid_entry.pid);
+    if (dev->env->callchain && !(flags & OMIT_CALLCHAIN)) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+        print_callchain_data(ctx->cc, &cd);
+    }
 }
 
 static void split_lock_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
