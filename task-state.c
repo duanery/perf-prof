@@ -674,9 +674,11 @@ static inline void __print_callchain(struct prof_dev *dev, union perf_event *eve
     struct sample_type_callchain *data = (void *)event->sample.array;
 
     if (dev->env->callchain) {
-        if (!dev->env->flame_graph)
-            print_callchain_common(ctx->cc, &data->callchain, data->h.tid_entry.pid);
-        else {
+        if (!dev->env->flame_graph) {
+            struct callchain_data cd;
+            perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+            print_callchain_data(ctx->cc, &cd);
+        } else {
             const char *comm = tep__pid_to_comm((int)data->h.tid_entry.pid);
             flame_graph_add_callchain(ctx->flame, &data->callchain, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
         }
@@ -743,8 +745,9 @@ static void task_state_print_event(struct prof_dev *dev, union perf_event *event
     tep__print_event(data->time, data->cpu_entry.cpu, raw, size);
 
     if (dev->env->callchain && !(flags & OMIT_CALLCHAIN)) {
-        struct sample_type_callchain *c = (void *)event->sample.array;
-        print_callchain_common(ctx->cc, &c->callchain, data->tid_entry.pid);
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+        print_callchain_data(ctx->cc, &cd);
     }
 }
 
