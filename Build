@@ -1,5 +1,6 @@
 perf-prof-y += trace_helpers.o uprobe_helpers.o stack_helpers.o latency_helpers.o
 perf-prof-y += count_helpers.o localtime.o
+perf-prof-$(CONFIG_LIBUNWIND) += dwarf_unwind.o
 perf-prof-y += lib/ filter/ arch/
 perf-prof-y += monitor.o tep.o timer.o convert.o net.o event-spread.o vcpu_info.o
 perf-prof-y += sched.o comm.o perfeval.o ptrace.o pystack.o
@@ -56,6 +57,7 @@ perf-prof-libs-$(CONFIG_LIBBPF)     += lib/bpf/libbpf.a
 LIBS_perf-prof-$(CONFIG_CPLUS_DEMANGLE) += -liberty
 LIBS_perf-prof-$(CONFIG_CXX_DEMANGLE)   += -lstdc++
 LIBS_perf-prof-$(CONFIG_LIBTCMALLOC)    += -ltcmalloc
+LIBS_perf-prof-$(CONFIG_LIBUNWIND)      += -lunwind -lunwind-$(LIBUNWIND_ARCH)
 
 perf-prof-libs += lib/perf/libperf.a lib/api/libapi.a
 perf-prof-libs += lib/traceevent/libtraceevent.a lib/subcmd/libsubcmd.a

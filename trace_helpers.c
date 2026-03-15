@@ -391,6 +391,20 @@ struct object {
 
     char *demangled;
     int demangled_sz; // demangled_cap = strs_cap;
+
+#ifdef HAVE_LIBUNWIND
+    /* Cached .eh_frame_hdr data for DWARF unwind */
+    void *eh_frame_hdr;         /* copied eh_frame_hdr segment data */
+    uint64_t eh_frame_hdr_sz;   /* size of eh_frame_hdr data */
+    uint64_t eh_frame_hdr_vaddr; /* ELF virtual address of eh_frame_hdr */
+    /* Cached .eh_frame data for DWARF unwind */
+    void *eh_frame;             /* copied eh_frame data */
+    uint64_t eh_frame_sz;       /* size of eh_frame data */
+    uint64_t eh_frame_vaddr;    /* ELF virtual address of eh_frame */
+    /* First PT_LOAD segment vaddr (for base address computation) */
+    uint64_t elf_load_vaddr;
+    bool unwind_info_loaded;    /* whether we attempted to load unwind info */
+#endif
 };
 
 struct dso {
@@ -665,6 +679,10 @@ static void object_node_delete(struct rblist *rblist, struct rb_node *rbn)
     if (obj->syms) free(obj->syms);
     if (obj->strs) free(obj->strs);
     if (obj->demangled) free(obj->demangled);
+#ifdef HAVE_LIBUNWIND
+    if (obj->eh_frame_hdr) free(obj->eh_frame_hdr);
+    if (obj->eh_frame) free(obj->eh_frame);
+#endif
     free(obj);
 }
 
@@ -721,6 +739,10 @@ void obj__stat(FILE *fp)
         obj = container_of(node, struct object, rbnode);
         used = obj->syms_sz * sizeof(*obj->syms) + obj->strs_sz + obj->demangled_sz;
         size = obj->syms_cap * sizeof(*obj->syms) + obj->strs_cap + (obj->demangled ? obj->strs_cap : 0);
+#ifdef HAVE_LIBUNWIND
+        used += obj->eh_frame_hdr_sz + obj->eh_frame_sz;
+        size += obj->eh_frame_hdr_sz + obj->eh_frame_sz;
+#endif
         total_used += used;
         total_size += size;
         fprintf(fp, "%-4u %-8s %-8d %-12ld %-12ld %s%s", refcount_read(&obj->refcnt),
@@ -1338,6 +1360,163 @@ const char *dso__name(struct dso *dso)
 {
     return dso ? (dso->obj->name_atmnt ? : dso->obj->name) : NULL;
 }
+
+#ifdef HAVE_LIBUNWIND
+/*
+ * Lazy-load .eh_frame_hdr and .eh_frame data for DWARF unwind.
+ * Called on first use to reduce memory for DSOs that never need unwinding.
+ * Must enter the object's mount namespace since the ELF file may be
+ * inaccessible from the current namespace.
+ */
+static void obj__load_unwind_info(struct object *obj)
+{
+    Elf *e;
+    GElf_Ehdr ehdr;
+    int fd, phnum, i;
+
+    if (obj->unwind_info_loaded)
+        return;
+    obj->unwind_info_loaded = true;
+
+    if (obj->type != EXEC && obj->type != DYN)
+        return;
+
+    enter_mntns(obj->mnt);
+    e = open_elf(obj->name, &fd);
+    exit_mntns(obj->mnt);
+    if (!e)
+        return;
+
+    if (!gelf_getehdr(e, &ehdr))
+        goto out;
+
+    phnum = ehdr.e_phnum;
+
+    /* Find first PT_LOAD for base vaddr */
+    for (i = 0; i < phnum; i++) {
+        GElf_Phdr phdr;
+        if (!gelf_getphdr(e, i, &phdr))
+            continue;
+        if (phdr.p_type == PT_LOAD) {
+            obj->elf_load_vaddr = phdr.p_vaddr;
+            break;
+        }
+    }
+
+    /* Find PT_GNU_EH_FRAME and copy its data */
+    for (i = 0; i < phnum; i++) {
+        GElf_Phdr phdr;
+        if (!gelf_getphdr(e, i, &phdr))
+            continue;
+        if (phdr.p_type == PT_GNU_EH_FRAME && phdr.p_filesz > 0) {
+            void *buf = malloc(phdr.p_filesz);
+            if (buf) {
+                if (pread(fd, buf, phdr.p_filesz, phdr.p_offset) == (ssize_t)phdr.p_filesz) {
+                    obj->eh_frame_hdr = buf;
+                    obj->eh_frame_hdr_sz = phdr.p_filesz;
+                    obj->eh_frame_hdr_vaddr = phdr.p_vaddr;
+                } else {
+                    free(buf);
+                }
+            }
+            break;
+        }
+    }
+
+    /* Find PT_LOAD that contains .eh_frame (right after eh_frame_hdr usually) */
+    if (obj->eh_frame_hdr) {
+        /*
+            * Parse eh_frame_hdr to find eh_frame location.
+            * eh_frame_hdr format (version 1):
+            *   byte  version
+            *   byte  eh_frame_ptr_enc
+            *   byte  fde_count_enc
+            *   byte  table_enc
+            *   encoded  eh_frame_ptr  (points to .eh_frame)
+            *
+            * For DW_EH_PE_sdata4|DW_EH_PE_pcrel (0x1b) encoding,
+            * eh_frame_ptr is a signed 32-bit offset relative to its own location.
+            */
+        unsigned char *hdr = obj->eh_frame_hdr;
+        if (hdr[0] == 1 && obj->eh_frame_hdr_sz >= 8) {
+            unsigned char eh_frame_ptr_enc = hdr[1];
+            int32_t eh_frame_off = *(int32_t *)(hdr + 4);
+            uint64_t eh_frame_vaddr = 0;
+
+            if (eh_frame_ptr_enc == 0x1b) {
+                /* DW_EH_PE_sdata4 | DW_EH_PE_pcrel */
+                eh_frame_vaddr = obj->eh_frame_hdr_vaddr + 4 + eh_frame_off;
+            } else if (eh_frame_ptr_enc == 0x03) {
+                /* DW_EH_PE_udata4 | DW_EH_PE_absptr */
+                eh_frame_vaddr = *(uint32_t *)(hdr + 4);
+            } else if (eh_frame_ptr_enc == 0x0b) {
+                /* DW_EH_PE_sdata4 | DW_EH_PE_absptr */
+                eh_frame_vaddr = (uint64_t)(int64_t)eh_frame_off;
+            } else if ((eh_frame_ptr_enc & 0xf0) == 0x30 && (eh_frame_ptr_enc & 0x0f) == 0x0b) {
+                /* DW_EH_PE_sdata4 | DW_EH_PE_datarel */
+                eh_frame_vaddr = obj->eh_frame_hdr_vaddr + eh_frame_off;
+            }
+
+            if (eh_frame_vaddr) {
+                /* Find the PT_LOAD segment containing .eh_frame */
+                for (i = 0; i < phnum; i++) {
+                    GElf_Phdr phdr;
+                    if (!gelf_getphdr(e, i, &phdr))
+                        continue;
+                    if (phdr.p_type == PT_LOAD &&
+                        eh_frame_vaddr >= phdr.p_vaddr &&
+                        eh_frame_vaddr < phdr.p_vaddr + phdr.p_filesz) {
+                        uint64_t offset_in_seg = eh_frame_vaddr - phdr.p_vaddr;
+                        uint64_t file_off = phdr.p_offset + offset_in_seg;
+                        uint64_t remaining = phdr.p_filesz - offset_in_seg;
+                        void *buf = malloc(remaining);
+                        if (buf) {
+                            if (pread(fd, buf, remaining, file_off) == (ssize_t)remaining) {
+                                obj->eh_frame = buf;
+                                obj->eh_frame_sz = remaining;
+                                obj->eh_frame_vaddr = eh_frame_vaddr;
+                            } else {
+                                free(buf);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+out:
+    close_elf(e, fd);
+}
+
+bool dso__get_unwind_data(struct dso *dso, struct dso_unwind_data *data)
+{
+    struct object *obj;
+    uint64_t runtime_base;
+
+    obj = dso->obj;
+    if (!obj)
+        return false;
+
+    /* Lazy-load unwind info on first access */
+    if (!obj->unwind_info_loaded)
+        obj__load_unwind_info(obj);
+
+    if (!obj->eh_frame_hdr)
+        return false;
+
+    runtime_base = dso->ranges[0].start - dso->ranges[0].file_off;
+    data->eh_frame_hdr = obj->eh_frame_hdr;
+    data->eh_frame_hdr_sz = obj->eh_frame_hdr_sz;
+    data->eh_frame_hdr_addr = runtime_base + obj->eh_frame_hdr_vaddr - obj->elf_load_vaddr;
+    data->eh_frame = obj->eh_frame;
+    data->eh_frame_sz = obj->eh_frame_sz;
+    data->eh_frame_addr = runtime_base + obj->eh_frame_vaddr - obj->elf_load_vaddr;
+
+    return true;
+}
+#endif
 
 static struct syms *__syms__load_file(FILE *f, char *line, int size, pid_t tgid)
 {
