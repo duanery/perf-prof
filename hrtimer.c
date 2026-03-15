@@ -292,7 +292,6 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
             } ctnr[0];
         } groups;
     } *data = (void *)event->sample.array;
-    struct callchain *callchain;
     int n = env->event ? ctx->tp_list->nr_real_tp : 0;
     u64 *jcounter = ctx->counters + instance * (n + 1);
     u64 counter, cpu_clock = 0;
@@ -358,8 +357,9 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
             }
         }
         if (dev->env->callchain) {
-            callchain = (struct callchain *)&data->groups.ctnr[data->groups.nr];
-            print_callchain_common(ctx->cc, callchain, data->tid_entry.pid);
+            struct callchain_data cd;
+            perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+            print_callchain_data(ctx->cc, &cd);
         }
     }
 }
