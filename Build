@@ -17,7 +17,6 @@ perf-prof-y += kmemleak.o
 perf-prof-y += percpu-stat.o
 perf-prof-y += kvm-exit.o
 perf-prof-y += num-dist.o
-perf-prof-y += sched-migrate.o
 perf-prof-y += top.o
 perf-prof-y += order.o
 perf-prof-y += blktrace.o
