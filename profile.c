@@ -251,8 +251,11 @@ static void profile_print_event(struct prof_dev *dev, union perf_event *event, i
     printf("%16s %6u [%03d] %llu.%06llu: profile: %lu cpu-cycles\n", tep__pid_to_comm(data->tid_entry.tid), data->tid_entry.tid,
                     data->cpu_entry.cpu, data->time / NSEC_PER_SEC, (data->time % NSEC_PER_SEC)/1000, counter);
 
-    if (dev->env->callchain && !(flags & OMIT_CALLCHAIN))
-        print_callchain_common(ctx->cc, &data->callchain, data->tid_entry.pid);
+    if (dev->env->callchain && !(flags & OMIT_CALLCHAIN)) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(ctx->evsel, event, &cd);
+        print_callchain_data(ctx->cc, &cd);
+    }
 }
 
 static void profile_sample(struct prof_dev *dev, union perf_event *event, int instance)
@@ -288,9 +291,11 @@ static void profile_sample(struct prof_dev *dev, union perf_event *event, int in
                             data->cpu_entry.cpu, data->time / NSEC_PER_SEC, (data->time % NSEC_PER_SEC)/1000, counter);
         }
         if (dev->env->callchain) {
-            if (!dev->env->flame_graph)
-                print_callchain_common(ctx->cc, &data->callchain, data->tid_entry.pid);
-            else {
+            if (!dev->env->flame_graph) {
+                struct callchain_data cd;
+                perf_event_build_callchain_data(ctx->evsel, event, &cd);
+                print_callchain_data(ctx->cc, &cd);
+            } else {
                 const char *comm = tep__pid_to_comm((int)data->tid_entry.pid);
                 flame_graph_add_callchain_at_time(ctx->flame, &data->callchain, data->tid_entry.pid,
                                                   !strcmp(comm, "<...>") ? NULL : comm,
