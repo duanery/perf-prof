@@ -176,14 +176,6 @@ static int num_dist_init(struct prof_dev *dev)
 
     for_each_real_tp(ctx->tp_list, tp, i) {
         struct perf_evsel *evsel;
-
-        if (!env->callchain) {
-            if (tp->stack)
-                attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
-            else
-                attr.sample_type &= (~PERF_SAMPLE_CALLCHAIN);
-        }
-
         evsel = tp_evsel_new(tp, &attr);
         if (!evsel)
             goto failed;
@@ -274,9 +266,9 @@ static void __raw_size(union perf_event *event, void **praw, int *psize, bool ca
 
 static void __print_callchain(struct num_dist_ctx *ctx, union perf_event *event, struct tp *tp)
 {
-    struct sample_type_callchain *data = (void *)event->sample.array;
-
-    print_callchain_common(ctx->cc, &data->callchain, data->h.tid_entry.pid);
+    struct callchain_data cd;
+    perf_event_build_callchain_data(tp->evsel, event, &cd);
+    print_callchain_data(ctx->cc, &cd);
 }
 
 static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
