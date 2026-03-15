@@ -16,6 +16,7 @@
 #include <api/fs/fs.h>
 #include <linux/bitops.h>
 #include <internal/evlist.h>
+#include <stack_helpers.h>
 
 bool current_clocksource_is_tsc = false;
 
@@ -1306,4 +1307,45 @@ int perf_event_member_offset(struct perf_event_member_cache *cache,
     }
 
     return member->offset + deps_size;
+}
+
+/* Export callchain_data from a perf_event sample. */
+void perf_event_build_callchain_data(struct perf_evsel *evsel,
+                                     union perf_event *event,
+                                     struct callchain_data *data)
+{
+    struct perf_event_member_cache *cache = perf_evsel_member_cache(evsel);
+    struct perf_event_member *pid = cache ? cache->pid : NULL;
+    struct perf_event_member *callchain = cache ? cache->callchain : NULL;
+    struct perf_event_member *regs_user = cache ? cache->regs_user : NULL;
+    struct perf_event_member *stack_user = cache ? cache->stack_user : NULL;
+    void *base = event->sample.array;
+    int offset;
+    u64 size;
+
+    *data = (struct callchain_data){0};
+
+    /* pid and callchain have no variable-size deps before them,
+     * so their offsets can be used directly without adjustment. */
+    if (pid)
+        data->pid = *(u32 *)(base + pid->offset);
+
+    if (callchain)
+        data->callchain = (struct callchain *)(base + callchain->offset);
+
+    if (regs_user && stack_user) {
+        /* PERF_SAMPLE_REGS_USER: { u64 abi; u64 regs[weight(mask)]; } */
+        offset = perf_event_member_offset(cache, regs_user, event);
+        data->regs_abi = *(u64 *)(base + offset);
+        if (data->regs_abi)
+            data->regs = (void *)(base + offset + sizeof(u64));
+
+        /* PERF_SAMPLE_STACK_USER: { u64 size; char data[size]; u64 dyn_size; } */
+        offset = perf_event_member_offset(cache, stack_user, event);
+        size = *(u64 *)(base + offset);
+        if (size) {
+            data->stack = (void *)(base + offset + sizeof(u64));
+            data->stack_sz = *(u64 *)(base + offset + sizeof(u64) + size);
+        }
+    }
 }

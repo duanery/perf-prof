@@ -141,6 +141,7 @@ struct env {
     bool exclude_guest;
     bool exclude_host;
     bool user_callchain, user_callchain_set;
+    int dwarf_record_size;
     bool kernel_callchain, kernel_callchain_set;
     bool python_callchain;
     // ebpf
@@ -759,7 +760,10 @@ struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel);
 int perf_event_member_offset(struct perf_event_member_cache *cache,
                              struct perf_event_member *member,
                              union perf_event *event);
-
+struct callchain_data;
+void perf_event_build_callchain_data(struct perf_evsel *evsel,
+                                     union perf_event *event,
+                                     struct callchain_data *data);
 
 //comm.c
 int global_comm_ref(void);

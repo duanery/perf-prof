@@ -113,7 +113,7 @@ int main_epoll_del(int fd)
 perf-prof argc argv
 ******************************************************/
 
-struct env env;
+struct env env = {0};
 
 static volatile int running = 0;
 
@@ -127,6 +127,9 @@ enum {
     LONG_OPT_threshold,
     LONG_OPT_detail,
     LONG_OPT_period,
+#ifdef HAVE_LIBUNWIND
+    LONG_OPT_user_callchain,
+#endif
 };
 
 static int workload_prepare(struct workload *workload, char *argv[]);
@@ -195,7 +198,7 @@ static void detail_parse(const char *s)
         env.after_event2 = nsparse(s, NULL);
 }
 
-static int parse_arg(int key, char *arg)
+static int parse_arg(int key, char *arg, int unset)
 {
     switch (key) {
     case 'e':
@@ -235,6 +238,27 @@ static int parse_arg(int key, char *arg)
     case LONG_OPT_period:
         env.sample_period = nsparse(arg, NULL);
         break;
+#ifdef HAVE_LIBUNWIND
+    case LONG_OPT_user_callchain:
+        env.user_callchain = !unset;
+        env.user_callchain_set = true;
+        env.dwarf_record_size = 0;
+        if (arg) {
+            char *record_mode = strtok(arg, ",");
+            char *record_size_str = strtok(NULL, ",");
+            if (strcmp(record_mode, "fp") == 0) {
+                env.dwarf_record_size = 0; // FP-based callchain, no need to record user stack
+            } else if (strcmp(record_mode, "dwarf") == 0) {
+                env.dwarf_record_size = 4096; // default 4KB
+                if (record_size_str)
+                    env.dwarf_record_size = atoi(record_size_str);
+            } else {
+                fprintf(stderr, "Invalid call-graph record mode: %s\n", record_mode);
+                return -1;
+            }
+        }
+        break;
+#endif
     case 'V':
         printf("%s\n", main_program_version);
         exit(0);
@@ -252,7 +276,7 @@ static int parse_help_cb(const struct option *opt, const char *arg, int unset)
 
 static int parse_arg_cb(const struct option *opt, const char *arg, int unset)
 {
-    return parse_arg(opt->short_name, (char *)arg);
+    return parse_arg(opt->short_name, (char *)arg, unset);
 }
 
 static void compgen_events(char **evt_list, int evt_num, void *opaque)
@@ -429,6 +453,8 @@ static int compgen_arg(const struct option *opt, const char *arg, int comp_type)
     { .type = OPTION_CALLBACK, .short_name = (BUILD_BUG_ON_ZERO(s==0) + s), .long_name = (l), .value = (v), .argh = (a), .help = (h), .flags = PARSE_OPT_NONEG | PARSE_OPT_NOARG, .callback = (parse_arg_cb) }
 #define OPT_PARSE_OPTARG(s, l, v, a, h) \
     { .type = OPTION_CALLBACK, .short_name = (BUILD_BUG_ON_ZERO(s==0) + s), .long_name = (l), .value = (v), .argh = (a), .help = (h), .flags = PARSE_OPT_NONEG | PARSE_OPT_OPTARG, .callback = (parse_arg_cb) }
+#define OPT_PARSE_OPTNEG(s, l, v, a, h) \
+    { .type = OPTION_CALLBACK, .short_name = (BUILD_BUG_ON_ZERO(s==0) + s), .long_name = (l), .value = (v), .argh = (a), .help = (h), .flags = PARSE_OPT_OPTARG, .callback = (parse_arg_cb) }
 #define OPT_INT_OPTARG(s, l, v, d, a, h) \
     { .type = OPTION_INTEGER, .short_name = (s), .long_name = (l), .value = check_vtype(v, int *), .argh = (a), .defval = (intptr_t)(d), .help = (h), .flags = PARSE_OPT_NONEG | PARSE_OPT_OPTARG }
 #define OPT_INT_OPTARG_SET(s, l, v, os, d, a, h) \
@@ -466,7 +492,14 @@ struct option main_options[] = {
     OPT_BOOL_NONEG  ( 0 ,    "exclude-guest", &env.exclude_guest,               "exclude guest"),
     OPT_BOOL_NONEG  ( 0 ,     "exclude-user", &env.exclude_user,                "exclude user"),
     OPT_BOOL_NONEG  ( 0 ,   "exclude-kernel", &env.exclude_kernel,              "exclude kernel"),
+#ifdef HAVE_LIBUNWIND
+    OPT_PARSE_OPTNEG( LONG_OPT_user_callchain, "user-callchain", NULL, "record_mode[,record_size]", "include user callchains, no- prefix to exclude\n"
+                                                       "record_mode: user callchain recording mode (fp|dwarf), default: fp\n"
+                                                       "record_size: if record_mode is 'dwarf', max size of stack recording (<bytes>)\n"
+                                                       "             default: 4096 (bytes)"),
+#else
     OPT_BOOLEAN_SET ( 0 ,   "user-callchain", &env.user_callchain,   &env.user_callchain_set,   "include user callchains, no- prefix to exclude"),
+#endif
     OPT_BOOLEAN_SET ( 0 , "kernel-callchain", &env.kernel_callchain, &env.kernel_callchain_set, "include kernel callchains, no- prefix to exclude"),
     OPT_BOOL_NONEG  ( 0 , "python-callchain", &env.python_callchain,                            "include python callchains"),
     OPT_INT_OPTARG_SET( 0 ,    "irqs_disabled", &env.irqs_disabled,    &env.irqs_disabled_set,    1, "0|1",  "ebpf, irqs disabled or not."),
@@ -1600,6 +1633,11 @@ int callchain_flags(struct prof_dev *dev, int dflt_flags)
             flags |= CALLCHAIN_USER;
         else
             flags &= ~CALLCHAIN_USER;
+
+        if (dev->env->dwarf_record_size)
+            flags |= CALLCHAIN_DWARF;
+        else
+            flags &= ~CALLCHAIN_DWARF;
     }
     if (dev->env->kernel_callchain_set) {
         if (dev->env->kernel_callchain)

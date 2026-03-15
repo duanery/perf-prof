@@ -8,6 +8,7 @@
 #include <api/fs/fs.h>
 #include <internal/mmap.h>
 #include <trace_helpers.h>
+#include "perf_regs_mask.h"
 
 int perf_event_max_stack = PERF_MAX_STACK_DEPTH;
 int perf_event_max_contexts_per_stack = 0;
@@ -1043,6 +1044,20 @@ void prof_dev_env2attr(struct prof_dev *dev, struct perf_event_attr *attr)
     if (env->monotonic) {
         attr->use_clockid = 1;
         attr->clockid = CLOCK_MONOTONIC;
+    }
+
+    // --user-callchain=dwarf
+    // Keep kernel FP-based user callchain enabled (exclude_callchain_user = 0),
+    // so the kernel collects both FP callchain and DWARF data (regs + stack).
+    // build_callchain() merges the two: DWARF unwind first, then appends
+    // remaining FP frames for binaries lacking DWARF info (e.g. Go).
+    if (env->callchain && env->dwarf_record_size &&
+        (attr->sample_type & PERF_SAMPLE_CALLCHAIN)) {
+        attr->sample_type |= PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+        attr->sample_regs_user = PERF_REGS_MASK;
+        attr->sample_stack_user = env->dwarf_record_size;
+        /* Enable kernel FP-based user callchain */
+        attr->exclude_callchain_user = 0;
     }
 }
 

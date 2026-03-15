@@ -13,22 +13,41 @@ struct callchain {
     __u64   ips[0];
 };
 
+struct callchain_data {
+    struct callchain *callchain;
+    u32 pid;
+    u64 regs_abi;
+    u64 *regs;
+    void *stack;
+    u64 stack_sz;
+};
+
+typedef void (*callchain_cbs)(void *opaque, u64 perf_context);
 
 struct callchain_ctx;
 enum {
     CALLCHAIN_KERNEL = 1,
     CALLCHAIN_USER = 2,
+    CALLCHAIN_DWARF = 4,
 };
 struct callchain_ctx *callchain_ctx_new(int flags, FILE *fout);
 void callchain_ctx_config(struct callchain_ctx *cc, bool addr, bool symbol, bool offset,
         bool dso, bool reverse, char sep, char end);
 void callchain_ctx_free(struct callchain_ctx *cc);
 void print_callchain(struct callchain_ctx *cc, struct callchain *callchain, u32 pid);
-typedef void (*callchain_cbs)(void *opaque, u64 perf_context);
-void print_callchain_common_cbs(struct callchain_ctx *cc, struct callchain *callchain, u32 pid,
-            callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque);
-void print_callchain_common(struct callchain_ctx *cc, struct callchain *callchain, u32 pid);
 
+void print_callchain_common_cbs(struct callchain_ctx *cc, struct callchain *callchain, u32 pid,
+                                callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque);
+static inline
+void print_callchain_common(struct callchain_ctx *cc, struct callchain *callchain, u32 pid) {
+    print_callchain_common_cbs(cc, callchain, pid, NULL, NULL, NULL);
+}
+void print_callchain_data_cbs(struct callchain_ctx *cc, struct callchain_data *data,
+                              callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque);
+static inline
+void print_callchain_data(struct callchain_ctx *cc, struct callchain_data *data) {
+    print_callchain_data_cbs(cc, data, NULL, NULL, NULL);
+}
 
 typedef struct callchain struct_key;
 struct key_value_paires;

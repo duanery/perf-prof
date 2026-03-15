@@ -15,6 +15,7 @@
 #include <tep.h>
 #include <trace_helpers.h>
 #include <stack_helpers.h>
+#include "dwarf_unwind.h"
 
 #define ALIGN(x, a)  __ALIGN_KERNEL((x), (a))
 
@@ -24,6 +25,7 @@ static struct global_syms {
     refcount_t ksyms_ref;
     refcount_t syms_ref;
     struct comm_notify notify;
+    int dwarf_ref;
 } ctx;
 
 /*
@@ -38,6 +40,7 @@ static struct global_syms {
 struct callchain_ctx {
     u64 kernel      : 1, /* need kernel symbols, /proc/kallsyms */
         user        : 1, /* need user symbols, /proc/pid/maps */
+        dwarf       : 1, /* need dwarf unwind, need user symbols */
         addr        : 1, /* print addr */
         symbol      : 1, /* print symbol */
         offset      : 1, /* print +offset */
@@ -60,7 +63,7 @@ static int task_exit_free_syms(struct comm_notify *notify, int pid, int state, u
     return 0;
 }
 
-static int global_syms_ref(bool kernel, bool user)
+static int global_syms_ref(bool kernel, bool user, bool dwarf)
 {
     if (kernel) {
         if (!ctx.ksyms) {
@@ -89,10 +92,12 @@ static int global_syms_ref(bool kernel, bool user)
         } else
             refcount_inc(&ctx.syms_ref);
     }
+    if (dwarf && ctx.dwarf_ref++ == 0)
+        dwarf_unwind_init();
     return 0;
 }
 
-static void global_syms_unref(bool kernel, bool user)
+static void global_syms_unref(bool kernel, bool user, bool dwarf)
 {
     if (kernel && ctx.ksyms && refcount_dec_and_test(&ctx.ksyms_ref)) {
         //ksymbol_dev_close();
@@ -104,6 +109,8 @@ static void global_syms_unref(bool kernel, bool user)
         syms_cache__free(ctx.syms_cache);
         ctx.syms_cache = NULL;
     }
+    if (dwarf && --ctx.dwarf_ref == 0)
+        dwarf_unwind_exit();
 }
 
 void global_syms_stat(FILE *fp)
@@ -116,12 +123,12 @@ void global_syms_stat(FILE *fp)
 
 void function_resolver_ref(void)
 {
-    global_syms_ref(true, false);
+    global_syms_ref(true, false, false);
 }
 
 void function_resolver_unref(void)
 {
-    global_syms_unref(true, false);
+    global_syms_unref(true, false, false);
 }
 
 char *function_resolver(void *priv, unsigned long long *addrp, char **modp)
@@ -157,11 +164,15 @@ struct callchain_ctx *callchain_ctx_new(int flags, FILE *fout)
     struct callchain_ctx *cc;
     bool kernel = flags & CALLCHAIN_KERNEL;
     bool user   = flags & CALLCHAIN_USER;
+    bool dwarf  = flags & CALLCHAIN_DWARF;
 
     if (kernel == false && user == false)
         return NULL;
 
-    if (global_syms_ref(kernel, user) < 0)
+    if (dwarf && !user)
+        return NULL;
+
+    if (global_syms_ref(kernel, user, dwarf) < 0)
         return NULL;
 
     cc = calloc(1, sizeof(*cc));
@@ -170,6 +181,7 @@ struct callchain_ctx *callchain_ctx_new(int flags, FILE *fout)
 
     cc->kernel = kernel;
     cc->user   = user;
+    cc->dwarf  = dwarf;
     cc->addr   = 1;
     cc->symbol = 1;
     cc->offset = 1;
@@ -201,7 +213,7 @@ void callchain_ctx_free(struct callchain_ctx *cc)
 {
     if (!cc)
         return ;
-    global_syms_unref(cc->kernel, cc->user);
+    global_syms_unref(cc->kernel, cc->user, cc->dwarf);
     free(cc);
 }
 
@@ -403,7 +415,7 @@ void print_callchain(struct callchain_ctx *cc, struct callchain *callchain, u32 
 }
 
 void print_callchain_common_cbs(struct callchain_ctx *cc, struct callchain *callchain, u32 pid,
-            callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque)
+                                callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque)
 {
     __u64 i;
     bool kernel = false, user = false, py = false;
@@ -467,9 +479,98 @@ void print_callchain_common_cbs(struct callchain_ctx *cc, struct callchain *call
     }
 }
 
-void print_callchain_common(struct callchain_ctx *cc, struct callchain *callchain, u32 pid)
+/*
+ * Build a combined callchain from kernel FP-based and DWARF-unwound user stacks.
+ *
+ * The kernel samples both FP-based user callchain and DWARF data (regs + stack).
+ * This function synthesizes a new callchain:
+ *   1. Copy the kernel part (up to PERF_CONTEXT_USER)
+ *   2. Perform DWARF unwinding for the user part
+ *   3. Compare DWARF frames with FP frames: if they match, append remaining
+ *      FP frames. This handles Go binaries that have frame pointers but lack
+ *      DWARF unwind info, where DWARF stops early but FP can go further.
+ *
+ * If DWARF data is unavailable or unwinding fails, returns the original
+ * FP-based callchain unchanged.
+ */
+static inline
+struct callchain *build_callchain(struct callchain *synth, u64 nr, struct callchain_data *data)
 {
-    print_callchain_common_cbs(cc, callchain, pid, NULL, NULL, NULL);
+    struct callchain *callchain = data->callchain;
+    struct syms *syms = NULL;
+    int i, user, end;
+
+    if (data->pid > 0 && ctx.syms_cache &&
+        data->regs && data->regs_abi != PERF_SAMPLE_REGS_ABI_NONE &&
+        data->stack && data->stack_sz) {
+
+        syms = syms_cache__get_syms(ctx.syms_cache, data->pid);
+        if (!syms)
+            goto out;
+
+        /* Copy kernel part of callchain (up to PERF_CONTEXT_USER) */
+        synth->nr = 0;
+        if (callchain) {
+            for (i = 0; i < (int)callchain->nr; i++) {
+                u64 ip = callchain->ips[i];
+                synth->ips[synth->nr++] = ip;
+                if (ip == PERF_CONTEXT_USER)
+                    break;
+            }
+        }
+
+        /* If no PERF_CONTEXT_USER found, add it */
+        if (synth->nr == 0 || synth->ips[synth->nr - 1] != PERF_CONTEXT_USER) {
+            synth->ips[synth->nr++] = PERF_CONTEXT_USER;
+        }
+
+        /* DWARF unwind for user space */
+        user = dwarf_unwind_user(syms, data->regs, data->stack, data->stack_sz,
+                        (u64 *)&synth->ips[synth->nr], nr - synth->nr);
+        if (user <= 0)
+            goto out;
+
+        synth->nr += user;
+        if (callchain) {
+            end = synth->nr < callchain->nr ? synth->nr : callchain->nr;
+
+            /* Compare kernel FP-based user callchain with DWARF-unwound.
+             * If they match, copy the remaining entries from the FP callchain. */
+            for (i = synth->nr - user; i < end; i++) {
+                if (synth->ips[i] != callchain->ips[i])
+                    break;
+            }
+            if (i == synth->nr && synth->nr < callchain->nr) {
+                for (; i < callchain->nr; i++)
+                    synth->ips[synth->nr++] = callchain->ips[i];
+            }
+        }
+
+        callchain = synth;
+    }
+out:
+    return callchain;
+}
+
+void print_callchain_data_cbs(struct callchain_ctx *cc, struct callchain_data *data,
+                              callchain_cbs kernel_cb, callchain_cbs user_cb, void *opaque)
+{
+    struct {
+        __u64 nr;
+        __u64 ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK + 5];
+    } synth;
+    struct callchain *callchain;
+
+    if (!data)
+        return ;
+
+    if (cc && cc->dwarf)
+        callchain = build_callchain((struct callchain *)&synth,
+                    PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK + 5, data);
+    else
+        callchain = data->callchain;
+
+    print_callchain_common_cbs(cc, callchain, data->pid, kernel_cb, user_cb, opaque);
 }
 
 static void print2string_callchain(struct callchain_ctx *cc, struct callchain *callchain, u32 pid,
@@ -1348,7 +1449,9 @@ static void free_callchain_key_cache(void)
  */
 int callchain_pylist_init(int flags)
 {
-    return global_syms_ref(flags & CALLCHAIN_KERNEL, flags & CALLCHAIN_USER);
+    bool user = flags & CALLCHAIN_USER;
+    bool dwarf = flags & CALLCHAIN_DWARF;
+    return global_syms_ref(flags & CALLCHAIN_KERNEL, user || dwarf, dwarf);
 }
 
 /*
@@ -1357,8 +1460,10 @@ int callchain_pylist_init(int flags)
  */
 void callchain_pylist_exit(int flags)
 {
+    bool user = flags & CALLCHAIN_USER;
+    bool dwarf = flags & CALLCHAIN_DWARF;
     free_callchain_key_cache();
-    global_syms_unref(flags & CALLCHAIN_KERNEL, flags & CALLCHAIN_USER);
+    global_syms_unref(flags & CALLCHAIN_KERNEL, user || dwarf, dwarf);
 }
 
 #endif /* HAVE_LIBPYTHON */
