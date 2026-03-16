@@ -1474,6 +1474,30 @@ void *callchain_to_pylist(struct callchain *callchain, u32 pid, int flags)
 }
 
 /*
+ * Convert callchain_data (with DWARF unwind support) to Python list.
+ * Calls build_callchain() to perform DWARF unwinding, then delegates
+ * to callchain_to_pylist() for Python list construction.
+ *
+ * @data: The callchain_data to convert (may be NULL)
+ * @flags: CALLCHAIN_KERNEL and/or CALLCHAIN_USER flags
+ * Returns: New reference to Python list, or NULL on error
+ */
+void *callchain_data_to_pylist(struct callchain_data *data, int flags)
+{
+    struct {
+        __u64 nr;
+        __u64 ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK];
+    } synth;
+    struct callchain *callchain = NULL;
+
+    if (data)
+        callchain = build_callchain((struct callchain *)&synth,
+                    PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK, data);
+
+    return callchain_to_pylist(callchain, data ? data->pid : 0, flags);
+}
+
+/*
  * Free cached Python string keys for callchain dicts.
  */
 static void free_callchain_key_cache(void)

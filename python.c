@@ -1094,6 +1094,7 @@ static PyObject *PerfEvent_get_callchain(PerfEventObject *self, void *closure)
     struct python_ctx *ctx;
     struct callchain *callchain = NULL;
     int callchain_flags = 0;
+    struct callchain_data cd;
 
     if (!self->_callchain_list) {
         ctx = (struct python_ctx *)self->dev->private;
@@ -1108,9 +1109,9 @@ static PyObject *PerfEvent_get_callchain(PerfEventObject *self, void *closure)
             if (evsel) {
                 cache = perf_evsel_member_cache(evsel);
                 if (cache && cache->callchain) {
-                    int offset = perf_event_member_offset(cache, cache->callchain, self->event);
-                    callchain = (struct callchain *)((void *)self->event->sample.array + offset);
-                    callchain_flags = CALLCHAIN_KERNEL | CALLCHAIN_USER;
+                    perf_event_build_callchain_data(evsel, self->event, &cd);
+                    self->_callchain_list = callchain_data_to_pylist(&cd,
+                                            CALLCHAIN_KERNEL | CALLCHAIN_USER);
                 }
             }
         } else {
@@ -1119,12 +1120,17 @@ static PyObject *PerfEvent_get_callchain(PerfEventObject *self, void *closure)
             int raw_size;
             perfevent_get_raw(self, &raw, &raw_size, &callchain);
             callchain_flags = ctx->callchain_flags;
+
+            if (callchain && callchain_flags) {
+                if (self->tp->dwarf_unwind) {
+                    perf_event_build_callchain_data(self->tp->evsel, self->event, &cd);
+                    self->_callchain_list = callchain_data_to_pylist(&cd, callchain_flags);
+                } else
+                    self->_callchain_list = callchain_to_pylist(callchain, self->_pid,
+                                                                callchain_flags);
+            }
         }
 
-        if (callchain && callchain_flags) {
-            self->_callchain_list = callchain_to_pylist(callchain, self->_pid,
-                                                        callchain_flags);
-        }
         if (!self->_callchain_list) {
             self->_callchain_list = PyList_New(0);  /* Empty list if no callchain */
         }
@@ -1634,9 +1640,14 @@ static PyObject *PerfEvent_print(PerfEventObject *self, PyObject *args, PyObject
         tp_print_event(self->tp, self->_time, self->_cpu, raw, raw_size);
 
         /* Print callchain if requested */
-        if (print_callchain && callchain && callchain->nr > 0) {
+        if (print_callchain && callchain) {
             ctx = (struct python_ctx *)self->dev->private;
-            print_callchain_common(ctx->cc, callchain, self->_pid);
+            if (self->tp->dwarf_unwind) {
+                struct callchain_data cd;
+                perf_event_build_callchain_data(self->tp->evsel, self->event, &cd);
+                print_callchain_data(ctx->cc, &cd);
+            } else if (callchain->nr > 0)
+                print_callchain_common(ctx->cc, callchain, self->_pid);
         }
     }
 
@@ -2697,17 +2708,9 @@ static int python_init(struct prof_dev *dev)
         return -1;
     ctx = dev->private;
 
-    reduce_wakeup_times(dev, &attr);
+    prof_dev_env2attr(dev, &attr);
 
     for_each_real_tp(ctx->tp_list, tp, i) {
-        /* Enable callchain for events with stack attribute if not globally enabled */
-        if (!env->callchain) {
-            if (tp->stack)
-                attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
-            else
-                attr.sample_type &= (~PERF_SAMPLE_CALLCHAIN);
-        }
-
         evsel = tp_evsel_new(tp, &attr);
         if (!evsel)
             goto failed;

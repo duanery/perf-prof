@@ -108,6 +108,7 @@ void heatmap_write(struct heatmap *heatmap, unsigned long time, unsigned long la
  * Returns: New reference to Python list, or NULL on error
  */
 void *callchain_to_pylist(struct callchain *callchain, u32 pid, int flags);
+void *callchain_data_to_pylist(struct callchain_data *data, int flags);
 
 /* Initialize/cleanup symbol resolution for callchain_to_pylist */
 int callchain_pylist_init(int flags);
