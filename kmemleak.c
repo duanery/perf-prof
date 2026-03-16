@@ -29,9 +29,9 @@ struct kmemleak_ctx {
     struct rb_root alloc;
     struct kmemleak_stat stat;
     struct list_head lost_list;
+    int default_flags;
     bool report_leaked_bytes;
     bool collect_comm;
-    bool user;
 };
 struct perf_event_backup {
     struct rb_node rbnode;
@@ -165,7 +165,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
 
     tep__ref();
     global_comm_ref();
-    ctx->user = !prof_dev_ins_oncpu(dev);
 
     ctx->alloc = RB_ROOT;
     memset(&ctx->stat, 0, sizeof(ctx->stat));
@@ -208,7 +207,8 @@ static int add_tp_list(struct prof_dev *dev, struct tp_list *tp_list, bool callc
         .read_format   = PERF_FORMAT_ID,
         .pinned        = 1,
         .disabled      = 1,
-        .exclude_callchain_user = prof_dev_ins_oncpu(dev),
+        .exclude_callchain_user = exclude_callchain_user(dev, CALLCHAIN_KERNEL),
+        .exclude_callchain_kernel = exclude_callchain_kernel(dev, CALLCHAIN_KERNEL),
         .watermark     = 1,
     };
     struct perf_evsel *evsel;
@@ -222,13 +222,6 @@ static int add_tp_list(struct prof_dev *dev, struct tp_list *tp_list, bool callc
         if (!tp->mem_ptr) {
             fprintf(stderr, "%s:%s//ptr=?/ ptr attribute is not set\n", tp->sys, tp->name);
             return -1;
-        }
-
-        if (!callchain) {
-            if (tp->stack)
-                attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
-            else
-                attr.sample_type &= (~PERF_SAMPLE_CALLCHAIN);
         }
 
         evsel = tp_evsel_new(tp, &attr);
@@ -263,10 +256,10 @@ static int kmemleak_init(struct prof_dev *dev)
         env->callchain = (ctx->tp_alloc->nr_need_stack == ctx->tp_alloc->nr_real_tp);
 
     if (env->callchain || ctx->tp_alloc->nr_need_stack || ctx->tp_free->nr_need_stack) {
-        int user = ctx->user ? CALLCHAIN_USER : 0;
-        ctx->cc = callchain_ctx_new(CALLCHAIN_KERNEL | user, stdout);
+        ctx->default_flags = callchain_flags(dev, CALLCHAIN_KERNEL);
+        ctx->cc = callchain_ctx_new(ctx->default_flags, stdout);
         if (env->flame_graph)
-            ctx->flame = flame_graph_open(CALLCHAIN_KERNEL | user, env->flame_graph);
+            ctx->flame = flame_graph_open(ctx->default_flags, env->flame_graph);
         dev->pages *= 2;
     }
 
@@ -401,7 +394,7 @@ static void __print_callchain(struct prof_dev *dev, union perf_event *event, boo
         perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
         print_callchain_data(ctx->cc, &cd);
         if (dev->env->flame_graph) {
-            if (ctx->user) {
+            if (ctx->default_flags & CALLCHAIN_USER) {
                 const char *comm = tep__pid_to_comm((int)data->h.tid_entry.tid);
                 flame_graph_add_callchain(ctx->flame, &cd, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
             } else
@@ -442,9 +435,16 @@ static void collect_leaked_bytes(struct prof_dev *dev, struct kmemleak_ctx *ctx,
             bytes_alloc = tp_get_mem_size(tp, GLOBAL(data->h.cpu_entry.cpu, data->h.tid_entry.pid, raw, size));
         }
 
-        leaked = keyvalue_pairs_add_key(kv_pairs, (struct_key *)&data->callchain);
+        if (tp->dwarf_unwind) {
+            struct callchain_data cd;
+            perf_event_build_callchain_data(evsel, event, &cd);
+            leaked = keyvalue_pairs_add_callchain(kv_pairs, &cd);
+        } else
+            leaked = keyvalue_pairs_add_key(kv_pairs, (struct_key *)&data->callchain);
+
         leaked->leaked += bytes_alloc;
-        leaked->pid = ctx->user ? data->h.tid_entry.pid : 0;
+        if (leaked->pid == 0)
+            leaked->pid = data->h.tid_entry.pid;
 
         if (ctx->collect_comm && alloc->comm[0]) {
             const char *ucomm = unique_string(alloc->comm);
@@ -729,10 +729,6 @@ static void kmemleak_sample(struct prof_dev *dev, union perf_event *event, int i
     if (kmemleak_event_lost(dev, event) < 0)
         return;
 
-    if (ctx->user) {
-        tep__update_comm(NULL, data->tid_entry.tid);
-    }
-
     glo = GLOBAL(data->cpu_entry.cpu, data->tid_entry.pid, raw, size);
     if (is_alloc) {
         ptr = tp_get_mem_ptr(tp, glo);
@@ -839,6 +835,7 @@ static const char *kmemleak_desc[] = PROFILER_DESC("kmemleak",
     "                       --free kmem:kfree//ptr=ptr/ -m 128 -g");
 static const char *kmemleak_argv[] = PROFILER_ARGV("kmemleak",
     PROFILER_ARGV_OPTION,
+    "FILTER OPTION:", "user-callchain", "kernel-callchain",
     PROFILER_ARGV_PROFILER, "event", "alloc", "free", "call-graph", "flame-graph",
     "comm\nShow alloc events comm.",
     "than\nMemory allocation exceeded the specified time.");
