@@ -104,7 +104,6 @@ static u64 get_sp(struct unwind_info *ui)
 static int libunwind_to_perf_idx(int unw_reg)
 {
     int perf_reg;
-    int idx = 0;
 
     if (unw_reg >= UNW_AARCH64_X0 && unw_reg <= UNW_AARCH64_X30)
         perf_reg = PERF_REG_ARM64_X0 + (unw_reg - UNW_AARCH64_X0);
