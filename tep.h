@@ -42,6 +42,7 @@ struct tp {
     char *filter;
     int stack;
     int max_stack;
+    bool dwarf_unwind;
     char *alias;
     void *private;
     struct tp_matcher *matcher;

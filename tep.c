@@ -1432,6 +1432,7 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
             attr->sample_stack_user = tp->dev->env->dwarf_record_size;
             /* Enable kernel FP-based user callchain */
             attr->exclude_callchain_user = 0;
+            tp->dwarf_unwind = 1;
         }
     }
 
@@ -1443,6 +1444,12 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
     tp->evsel = evsel;
     if (!tp->stack)
         tp->stack = attr->sample_type & PERF_SAMPLE_CALLCHAIN;
+
+    if (!tp->dwarf_unwind) {
+        u64 dwarf_sample_type = PERF_SAMPLE_CALLCHAIN |
+                                PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+        tp->dwarf_unwind = (attr->sample_type & dwarf_sample_type) == dwarf_sample_type;
+    }
 
     if (!tp_kernel(tp))
         perf_evsel__keep_disable(evsel, true);

@@ -775,6 +775,21 @@ void *keyvalue_pairs_add_key(struct key_value_paires *pairs, struct_key *key)
     return value;
 }
 
+void *keyvalue_pairs_add_callchain(struct key_value_paires *pairs, struct callchain_data *data)
+{
+    struct {
+        __u64 nr;
+        __u64 ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK];
+    } synth;
+    struct callchain *callchain = NULL;
+
+    if (data)
+        callchain = build_callchain((struct callchain *)&synth,
+                    PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK, data);
+
+    return callchain ? keyvalue_pairs_add_key(pairs, callchain) : NULL;
+}
+
 void keyvalue_pairs_foreach(struct key_value_paires *pairs, foreach_keyvalue f, void *opaque)
 {
     struct rblist *rblist;

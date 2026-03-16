@@ -1127,6 +1127,7 @@ static void mem_profile_two(struct two_event *two, union perf_event *event1, uni
 {
     struct mem_profile *profile = NULL;
     struct multi_trace_type_callchain *data;
+    struct callchain_data cd;
 
     if (!two)
         return ;
@@ -1148,7 +1149,12 @@ static void mem_profile_two(struct two_event *two, union perf_event *event1, uni
         profile->alloc_bytes += bytes_alloc;
         if (two->tp1->stack) {
             data = (void *)event1->sample.array;
-            val = keyvalue_pairs_add_key(profile->alloc, (struct_key *)&data->callchain);
+            if (two->tp1->dwarf_unwind) {
+                perf_event_build_callchain_data(two->tp1->evsel, event1, &cd);
+                val = keyvalue_pairs_add_callchain(profile->alloc, &cd);
+            } else {
+                val = keyvalue_pairs_add_key(profile->alloc, (struct_key *)&data->callchain);
+            }
             val->bytes += bytes_alloc;
             if (val->pid == 0)
                 val->pid = data->h.tid_entry.pid;
@@ -1159,7 +1165,12 @@ static void mem_profile_two(struct two_event *two, union perf_event *event1, uni
             profile->free_bytes += bytes_alloc;
             if (two->tp2->stack) {
                 data = (void *)event2->sample.array;
-                val = keyvalue_pairs_add_key(profile->free, (struct_key *)&data->callchain);
+                if (two->tp2->dwarf_unwind) {
+                    perf_event_build_callchain_data(two->tp2->evsel, event2, &cd);
+                    val = keyvalue_pairs_add_callchain(profile->free, &cd);
+                } else {
+                    val = keyvalue_pairs_add_key(profile->free, (struct_key *)&data->callchain);
+                }
                 val->bytes += bytes_alloc;
                 if (val->pid == 0)
                     val->pid = data->h.tid_entry.pid;
