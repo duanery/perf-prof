@@ -397,13 +397,15 @@ static void __print_callchain(struct prof_dev *dev, union perf_event *event, boo
     struct sample_type_callchain *data = (void *)event->sample.array;
 
     if (callchain) {
-        print_callchain_common(ctx->cc, &data->callchain, data->h.tid_entry.pid);
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+        print_callchain_data(ctx->cc, &cd);
         if (dev->env->flame_graph) {
             if (ctx->user) {
                 const char *comm = tep__pid_to_comm((int)data->h.tid_entry.tid);
-                flame_graph_add_callchain(ctx->flame, &data->callchain, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
+                flame_graph_add_callchain(ctx->flame, &cd, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
             } else
-                flame_graph_add_callchain(ctx->flame, &data->callchain, 0/*only kernel stack*/, NULL);
+                flame_graph_add_callchain(ctx->flame, &cd, 0/*only kernel stack*/, NULL);
         }
     }
 }

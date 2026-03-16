@@ -511,7 +511,7 @@ struct callchain *build_callchain(struct callchain *synth, u64 nr, struct callch
         /* Copy kernel part of callchain (up to PERF_CONTEXT_USER) */
         synth->nr = 0;
         if (callchain) {
-            for (i = 0; i < (int)callchain->nr; i++) {
+            for (i = 0; i < callchain->nr && synth->nr < nr; i++) {
                 u64 ip = callchain->ips[i];
                 synth->ips[synth->nr++] = ip;
                 if (ip == PERF_CONTEXT_USER)
@@ -520,9 +520,13 @@ struct callchain *build_callchain(struct callchain *synth, u64 nr, struct callch
         }
 
         /* If no PERF_CONTEXT_USER found, add it */
-        if (synth->nr == 0 || synth->ips[synth->nr - 1] != PERF_CONTEXT_USER) {
+        if (synth->nr < nr &&
+            (synth->nr == 0 || synth->ips[synth->nr - 1] != PERF_CONTEXT_USER)) {
             synth->ips[synth->nr++] = PERF_CONTEXT_USER;
         }
+
+        if (synth->nr >= nr)
+            goto out;
 
         /* DWARF unwind for user space */
         user = dwarf_unwind_user(syms, data->regs, data->stack, data->stack_sz,
@@ -541,7 +545,7 @@ struct callchain *build_callchain(struct callchain *synth, u64 nr, struct callch
                     break;
             }
             if (i == synth->nr && synth->nr < callchain->nr) {
-                for (; i < callchain->nr; i++)
+                for (; i < callchain->nr && synth->nr < nr; i++)
                     synth->ips[synth->nr++] = callchain->ips[i];
             }
         }
@@ -557,7 +561,7 @@ void print_callchain_data_cbs(struct callchain_ctx *cc, struct callchain_data *d
 {
     struct {
         __u64 nr;
-        __u64 ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK + 5];
+        __u64 ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK];
     } synth;
     struct callchain *callchain;
 
@@ -566,7 +570,7 @@ void print_callchain_data_cbs(struct callchain_ctx *cc, struct callchain_data *d
 
     if (cc && cc->dwarf)
         callchain = build_callchain((struct callchain *)&synth,
-                    PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK + 5, data);
+                    PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK, data);
     else
         callchain = data->callchain;
 
@@ -1017,7 +1021,7 @@ void flame_graph_free(struct flame_graph *fg)
     free(fg);
 }
 
-void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain *callchain,
+void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain_data *data,
                                          u32 pid, const char *comm,
                                          u64 time, const char *time_str)
 {
@@ -1025,12 +1029,37 @@ void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain 
         __u64   nr;
         __u64   ips[PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK + 5];
     } key;
+    struct callchain *callchain;
+    __u64 callchain_nr = 0;
     char buff[128];
     int context_kernel_num = 0;
     int context_user_num = 0;
 
-    if (!fg)
+    if (!fg || !data)
         return ;
+
+    if (fg->cc && fg->cc->dwarf) {
+        /*
+         * Build DWARF-unwound callchain directly into key to avoid extra copy.
+         *
+         * Without time: synth = &key, build_callchain writes nr and ips directly
+         *   into key. Zero-copy: key.nr = synth->nr, key.ips = synth->ips.
+         * With time: key.ips[0] = PERF_CONTEXT_FLAME_GRAPH, synth = &key.ips[1]
+         *   where key.ips[1] temporarily holds synth->nr and key.ips[2..] holds
+         *   synth->ips. On success, save synth->nr then restore key.ips[1] = time.
+         */
+        struct callchain *synth;
+
+        if (time)
+            synth = (struct callchain *)&key.ips[1];
+        else
+            synth = (struct callchain *)&key;
+
+        callchain = build_callchain(synth, PERF_MAX_STACK_DEPTH + PERF_MAX_CONTEXTS_PER_STACK, data);
+        /* DWARF succeeded, data built directly into key */
+        if (callchain == synth)
+            callchain_nr = synth->nr;
+    }
 
     key.nr = 0;
     /*
@@ -1043,8 +1072,14 @@ void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain 
         key.ips[key.nr++] = time;
     }
 
-    memcpy(&key.ips[key.nr], callchain->ips, callchain->nr * sizeof(callchain->ips[0]));
-    key.nr += callchain->nr;
+    /* DWARF unavailable, fallback to FP-based callchain */
+    if (callchain_nr == 0) {
+        callchain = data->callchain;
+        callchain_nr = callchain->nr;
+        memcpy(&key.ips[key.nr], callchain->ips, callchain_nr * sizeof(callchain->ips[0]));
+    }
+    key.nr += callchain_nr;
+
     /*
      * convert callchain to unique string.
      * For user-mode stacks, symbols are freed after the process exits. Therefore,
@@ -1052,7 +1087,7 @@ void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain 
     **/
     print2string_callchain(fg->cc, (struct callchain *)&key, pid, &context_kernel_num, &context_user_num);
     // callchain empty
-    if (context_kernel_num + context_user_num == callchain->nr) {
+    if (context_kernel_num + context_user_num == callchain_nr) {
         return;
     }
     /*
@@ -1065,7 +1100,7 @@ void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain 
         fprintf(stderr, "BUG: callchain error%s%s\n",
                 context_kernel_num > 1 ? " PERF_CONTEXT_KERNEL >1" : "",
                 context_user_num > 1 ? " PERF_CONTEXT_USER >1" : "");
-        print_callchain_common(&debug, callchain, pid);
+        print_callchain_common(&debug, data->callchain, pid);
     }
 
     if ((fg->cc->user && fg->cc->print2string_user) || comm) {

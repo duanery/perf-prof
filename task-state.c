@@ -674,13 +674,13 @@ static inline void __print_callchain(struct prof_dev *dev, union perf_event *eve
     struct sample_type_callchain *data = (void *)event->sample.array;
 
     if (dev->env->callchain) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
         if (!dev->env->flame_graph) {
-            struct callchain_data cd;
-            perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
             print_callchain_data(ctx->cc, &cd);
         } else {
             const char *comm = tep__pid_to_comm((int)data->h.tid_entry.pid);
-            flame_graph_add_callchain(ctx->flame, &data->callchain, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
+            flame_graph_add_callchain(ctx->flame, &cd, data->h.tid_entry.pid, !strcmp(comm, "<...>") ? NULL : comm);
         }
     }
 }

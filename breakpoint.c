@@ -1383,13 +1383,13 @@ static void print_event(struct prof_dev *dev, union perf_event *event, int insta
         return;
 
     if (env->callchain) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
         if (!env->flame_graph || ctx->print_event) {
-            struct callchain_data cd;
-            perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
             print_callchain_data_cbs(ctx->cc, &cd,
                 env->verbose >= 0 ? (callchain_cbs)print_regs_intr : NULL, NULL, regs_intr);
         } else
-            flame_graph_add_callchain(ctx->flame, &data->callchain, data->tid_entry.pid, NULL);
+            flame_graph_add_callchain(ctx->flame, &cd, data->tid_entry.pid, NULL);
     } else if (env->verbose >= 0)
         print_regs_intr(regs_intr, 0);
 }

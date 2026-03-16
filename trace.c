@@ -197,13 +197,13 @@ static inline void __print_callchain(struct prof_dev *dev, struct tp *tp, union 
     struct sample_type_callchain *data = (void *)event->sample.array;
 
     if (tp->stack) {
+        struct callchain_data cd;
+        perf_event_build_callchain_data(tp->evsel, event, &cd);
         if (!dev->env->flame_graph) {
-            struct callchain_data cd;
-            perf_event_build_callchain_data(tp->evsel, event, &cd);
             print_callchain_data(ctx->cc, &cd);
         } else {
             const char *comm = tep__pid_to_comm((int)data->h.tid_entry.pid);
-            flame_graph_add_callchain_at_time(ctx->flame, &data->callchain, data->h.tid_entry.pid,
+            flame_graph_add_callchain_at_time(ctx->flame, &cd, data->h.tid_entry.pid,
                                               !strcmp(comm, "<...>") ? NULL : comm,
                                               ctx->time, ctx->time_str);
         }

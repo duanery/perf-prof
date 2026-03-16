@@ -73,14 +73,14 @@ void unique_string_stat(FILE *fp);
 struct flame_graph;
 struct flame_graph *flame_graph_new(int flags, FILE *fout);
 void flame_graph_free(struct flame_graph *fg);
-void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain *callchain,
+void flame_graph_add_callchain_at_time(struct flame_graph *fg, struct callchain_data *data,
                                          u32 pid, const char *comm,
                                          u64 time, const char *time_str);
 static inline
-void flame_graph_add_callchain(struct flame_graph *fg, struct callchain *callchain,
+void flame_graph_add_callchain(struct flame_graph *fg, struct callchain_data *data,
                                          u32 pid, const char *comm)
 {
-    flame_graph_add_callchain_at_time(fg, callchain, pid, comm, 0, NULL);
+    flame_graph_add_callchain_at_time(fg, data, pid, comm, 0, NULL);
 }
 void flame_graph_output(struct flame_graph *fg);
 struct flame_graph *flame_graph_open(int flags, const char *path);

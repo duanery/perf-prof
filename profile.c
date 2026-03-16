@@ -291,13 +291,13 @@ static void profile_sample(struct prof_dev *dev, union perf_event *event, int in
                             data->cpu_entry.cpu, data->time / NSEC_PER_SEC, (data->time % NSEC_PER_SEC)/1000, counter);
         }
         if (dev->env->callchain) {
+            struct callchain_data cd;
+            perf_event_build_callchain_data(ctx->evsel, event, &cd);
             if (!dev->env->flame_graph) {
-                struct callchain_data cd;
-                perf_event_build_callchain_data(ctx->evsel, event, &cd);
                 print_callchain_data(ctx->cc, &cd);
             } else {
                 const char *comm = tep__pid_to_comm((int)data->tid_entry.pid);
-                flame_graph_add_callchain_at_time(ctx->flame, &data->callchain, data->tid_entry.pid,
+                flame_graph_add_callchain_at_time(ctx->flame, &cd, data->tid_entry.pid,
                                                   !strcmp(comm, "<...>") ? NULL : comm,
                                                   ctx->time, ctx->time_str);
             }
