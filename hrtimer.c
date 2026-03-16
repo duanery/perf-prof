@@ -190,7 +190,7 @@ static int hrtimer_init(struct prof_dev *dev)
     }
     attr.wakeup_watermark = (dev->pages << 12) / 2;
 
-    reduce_wakeup_times(dev, &attr);
+    prof_dev_env2attr(dev, &attr);
 
     ctx->leader = evsel = perf_evsel__new(&attr);
     if (!evsel) {
