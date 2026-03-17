@@ -162,7 +162,6 @@ perf-prof 提供 30+ 专用分析器，按类别组织：
 ### 调度与进程
 - **task-state** - 进程状态监控（R, S, D, T, I）
 - **rundelay** - 调度运行延迟分析
-- **sched-migrate** - 进程迁移监控
 
 ### I/O 性能
 - **blktrace** - 块设备 I/O 跟踪

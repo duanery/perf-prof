@@ -154,7 +154,6 @@ perf-prof provides 30+ specialized profilers organized by category:
 ### Scheduling & Process
 - **task-state** - Process state monitoring (R, S, D, T, I)
 - **rundelay** - Scheduling run delay analysis
-- **sched-migrate** - Process migration monitoring
 
 ### I/O Performance
 - **blktrace** - Block device I/O tracking
