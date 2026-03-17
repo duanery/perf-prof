@@ -1499,6 +1499,9 @@ bool dso__get_unwind_data(struct dso *dso, struct dso_unwind_data *data)
     if (!obj)
         return false;
 
+    /* get the object that actually stores the unwind info */
+    obj = obj->buildid_obj;
+
     /* Lazy-load unwind info on first access */
     if (!obj->unwind_info_loaded)
         obj__load_unwind_info(obj);
