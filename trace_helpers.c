@@ -1348,6 +1348,24 @@ static const struct sym *obj__find_offset(struct object *obj, uint64_t offset)
         obj->syms[start].start <= offset &&
         obj->syms[start].start + obj->syms[start].size >= offset)
         return obj__demangle_sym(obj, &obj->syms[start]);
+
+    /*
+     * Handle nested function definitions. In glibc-2.17, a function can
+     * be defined inside another, e.g. __poll_nocancel inside poll:
+     *
+     *   syms[start-1]: poll              start=0xf3db0  size=0x5a
+     *   syms[start]:   __poll_nocancel   start=0xf3db9  size=0x10
+     *
+     * When offset falls in the gap between __poll_nocancel's end and
+     * poll's end (0xf3dc9 ~ 0xf3e09), binary search lands on
+     * __poll_nocancel but its size doesn't cover the offset. Fall back
+     * to the previous symbol which is the enclosing outer function.
+     */
+    if (start > 0 &&
+        obj->syms[start-1].start <= offset &&
+        obj->syms[start-1].start + obj->syms[start-1].size >= offset)
+        return obj__demangle_sym(obj, &obj->syms[start-1]);
+
     return NULL;
 }
 
