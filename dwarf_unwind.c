@@ -136,11 +136,31 @@ static u64 get_sp(struct unwind_info *ui) { return 0; }
 /*
  * libunwind accessor: read memory.
  *
- * Handles reads from two regions:
+ * Handles reads from three regions:
  * 1. Captured stack: [sp, sp + stack_sz)
  * 2. Cached ELF unwind data: eh_frame_hdr and eh_frame.
  *    dwarf_search_unwind_table accesses them via the runtime addresses
  *    we provide in unw_dyn_info_t.
+ *
+ * For addresses outside these regions, we return zero instead of an error.
+ *
+ * Why: libunwind may read addresses we don't have cached. This happens
+ * when eh_frame CIE entries use DW_EH_PE_indirect encoding for the
+ * personality routine pointer. The indirect reference points to data in
+ * segments we don't cache (.data, .data.rel.ro, .got), e.g.:
+ *
+ *   DW.ref.__gcc_personality_v0  (in .data or .data.rel.ro)
+ *   GOT entries for personality   (in .got, for PIC code)
+ *
+ * These personality routine pointers are only used for C++/language-level
+ * exception handling, NOT for stack unwinding. The unw_step() process
+ * only needs CFA rules and register restore rules from the FDE/CIE to
+ * walk the stack. Returning zero makes libunwind treat the personality
+ * routine as NULL, which is harmless for our stack-walking purpose.
+ *
+ * Returning -UNW_EINVAL would cause dwarf_search_unwind_table() to fail
+ * entirely, aborting the unwind for that frame — which is worse than
+ * returning a benign zero value.
  */
 static int access_mem(unw_addr_space_t as, unw_word_t addr,
                       unw_word_t *valp, int write, void *arg)
@@ -181,7 +201,12 @@ static int access_mem(unw_addr_space_t as, unw_word_t addr,
         }
     }
 
-    return -UNW_EINVAL;
+    /*
+     * Address not in any cached region. Return zero rather than an error
+     * to avoid aborting the unwind. See function comment for details.
+     */
+    *valp = 0;
+    return 0;
 }
 
 /*
