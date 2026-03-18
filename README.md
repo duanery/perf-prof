@@ -104,6 +104,9 @@ The `PYTHON=` option automatically detects the standalone Python prefix, sets `P
 # Profile CPU usage at 997Hz with call graph
 ./perf-prof profile -F 997 -g
 
+# Use DWARF unwind for user-space callchain (more reliable than frame pointers)
+./perf-prof profile -F 997 -g --user-callchain=dwarf
+
 # Generate flame graph
 ./perf-prof profile -F 997 -g --flame-graph cpu.folded
 

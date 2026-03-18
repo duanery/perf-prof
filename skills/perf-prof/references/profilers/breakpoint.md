@@ -39,6 +39,8 @@ type: 断点类型
 - `-i, --interval`: 不支持周期输出
 
 ### FILTER OPTION
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈，`no-`前缀排除。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`: 包含内核态调用栈，`no-`前缀排除
 - `--exclude-user`: 过滤用户态断点触发
 - `--exclude-kernel`: 过滤内核态断点触发
 

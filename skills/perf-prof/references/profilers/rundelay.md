@@ -25,6 +25,8 @@ perf-prof rundelay [OPTION...] -e sched:sched_wakeup*,sched:sched_switch \
 - `--order`: 自动启用，无需手动指定
 
 ### FILTER OPTION
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`: 包含内核态调用栈
 - `--filter <comm>`: 过滤进程名，支持通配符，自动应用到所有事件
 - `-p, --pids <pid,...>`: 附加到进程，自动过滤线程id
 - `-t, --tids <tid,...>`: 附加到线程，自动过滤线程id

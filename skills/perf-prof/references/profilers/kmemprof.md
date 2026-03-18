@@ -25,7 +25,7 @@ perf-prof kmemprof [OPTION...] -e alloc_event -e free_event [-k str]
 - `--order`: 跨CPU关联时必需
 
 ### FILTER OPTION
-- `--user-callchain`: 包含用户态调用栈
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈。`=dwarf` 启用DWARF栈回溯
 - `--kernel-callchain`: 包含内核态调用栈
 - `--python-callchain`: 包含Python调用栈
 - trace event过滤器: 在事件后使用`/filter/`语法

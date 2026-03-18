@@ -28,7 +28,7 @@ perf-prof python -e EVENT[,EVENT...] [选项] [--] module [args...]
 
 ### FILTER OPTION
 - `-g, --call-graph`: 启用堆栈采样（默认选中内核态和用户态堆栈）
-- `--user-callchain`: 启用用户态堆栈，`no-` 前缀排除
+- `--user-callchain[=dwarf[,size]]`: 启用用户态堆栈，`no-` 前缀排除。`=dwarf` 启用DWARF栈回溯，比帧指针更可靠
 - `--kernel-callchain`: 启用内核态堆栈，`no-` 前缀排除
 - `--python-callchain`: 包含Python调用栈
 

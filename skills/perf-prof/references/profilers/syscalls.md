@@ -26,6 +26,8 @@ perf-prof syscalls [OPTION...] -e raw_syscalls:sys_enter -e raw_syscalls:sys_exi
 - `--order`: 根据attach方式自动决定
 
 ### FILTER OPTION
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`: 包含内核态调用栈
 - `-p, --pids <pid,...>`: 附加到进程
 - `-t, --tids <tid,...>`: 附加到线程
 - `-C, --cpus <cpu,...>`: 监控指定CPU

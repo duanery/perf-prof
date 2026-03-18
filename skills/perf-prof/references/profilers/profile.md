@@ -22,6 +22,8 @@ perf-prof profile -F <freq> [选项]
 - `-i, --interval`: 不指定时实时输出每个采样事件
 
 ### FILTER OPTION
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈，`no-`前缀排除。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`: 包含内核态调用栈，`no-`前缀排除
 - `--exclude-user`: 只分析内核态热点
 - `--exclude-kernel`: 只分析用户态热点
 - `--exclude-guest`/`-G`: Host/Guest 隔离分析

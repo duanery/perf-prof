@@ -448,6 +448,134 @@ multi-trace提供多层次的性能优化机制，可根据实际场景灵活选
 | **进程/线程关联** | `-p pid` / `-t tid` / `-k common_pid` | 分析进程/线程维度的事件关系 | 优秀，按TID隔离 |
 | **自定义字段关联** | `-k EXPR` / `key=EXPR` | 复杂关联场景（如按指针、优先级等） | 取决于key值分布 |
 
+##### 4.4 从事件上下文理解Key选择
+
+**Key选择的本质问题**：你希望哪个event1和哪个event2关联在一起？
+
+从"事件发生的上下文"角度理解key选择，比从"字段名"入手更本质。
+
+**事件的基本上下文**
+
+每个事件发生时，都有两个基本上下文：
+- **CPU上下文**：事件发生在哪个CPU上
+- **线程上下文**：事件发生在哪个线程上（common_pid）
+
+```
+事件发生 → [CPU=2, TID=1234, 事件字段...]
+```
+
+**核心问题：延迟路径上，上下文是否变化？**
+
+| 上下文变化情况 | Key选择 | 典型场景 |
+|---------------|----------|----------|
+| **同CPU、同线程** | 默认（按CPU）或不指定 | 软中断、hardirq |
+| **可能跨CPU、同线程** | `-k common_pid` 或 `-p`/`-t` | 系统调用（线程可能迁移） |
+| **跨线程、可能跨CPU** | `key=资源标识` | 调度延迟、跨进程通信 |
+
+**三种典型路径模式**
+
+**模式A：同上下文路径**（最简单）
+
+```
+softirq_entry [CPU=0, TID=100]
+    ↓ (同CPU、同线程)
+softirq_exit  [CPU=0, TID=100]
+
+→ Key：默认按CPU，无需指定
+```
+
+**模式B：线程内路径，可能迁移**
+
+```
+sys_enter [CPU=0, TID=1234]
+    ↓ (同线程，但CPU可能变化)
+sys_exit  [CPU=2, TID=1234]
+
+→ Key：common_pid（线程ID）
+→ 需要 --order（跨CPU排序）
+```
+
+**模式C：跨线程路径**（最复杂）
+
+```
+sched_wakeup  [CPU=0, TID=100]  唤醒 pid=1234
+    ↓ (被唤醒的进程在另一个CPU开始运行)
+sched_switch  [CPU=2, TID=1234] next_pid=1234
+
+→ event1的TID=100（唤醒者），event2的TID=1234（被唤醒者）
+→ Key不能用common_pid！要用业务字段 pid/next_pid
+```
+
+**Key选择判断流程**
+
+```
+问：event1到event2，线程上下文是否相同？
+
+是 → 问：CPU上下文是否相同？
+     │
+     ├── 是 → 不需要key（默认按CPU）
+     │        例：软中断、本地定时器
+     │
+     └── 否 → key=common_pid，需要 --order
+              例：系统调用（线程可能迁移）
+
+否 → 必须用"业务字段"作为key，需要 --order
+     问：什么东西从event1"传递"到event2？
+     │
+     ├── 进程ID → key=pid相关字段
+     │   例：调度（pid → next_pid）
+     │
+     ├── 资源指针 → key=ptr/address
+     │   例：内存分配（kmalloc.ptr → kfree.ptr）
+     │
+     └── 请求标识 → key=request_id/bio
+         例：I/O请求（提交 → 完成）
+```
+
+**具体例子对比**
+
+**例1：软中断延迟（同上下文）**
+```bash
+# 软中断不会跨CPU，不会切换线程
+# event1和event2的CPU、TID完全相同
+perf-prof multi-trace \
+    -e irq:softirq_entry/vec==3/ \
+    -e irq:softirq_exit/vec==3/ \
+    -i 1000
+# 不需要 -k，不需要 --order
+```
+
+**例2：系统调用延迟（同线程，可能跨CPU）**
+```bash
+# 系统调用期间线程可能被迁移到其他CPU
+# event1.TID == event2.TID，但CPU可能不同
+perf-prof multi-trace \
+    -e raw_syscalls:sys_enter \
+    -e raw_syscalls:sys_exit \
+    -k common_pid --order -i 1000
+```
+
+**例3：调度延迟（跨线程）**
+```bash
+# 唤醒者和被唤醒者是不同线程
+# event1 [TID=A] 唤醒 pid=B
+# event2 [TID=B] 开始运行
+# 两个事件的common_pid不同！
+perf-prof multi-trace \
+    -e 'sched:sched_wakeup//key=pid/' \
+    -e 'sched:sched_switch//key=next_pid/' \
+    --order -i 1000
+```
+
+**Key选择的本质总结**
+
+```
+Key的作用 = 在"上下文可能变化"的情况下，找到"不变的关联标识"
+
+上下文相同 → 用默认（CPU）
+上下文不同 → 找"传递的东西"作为key
+```
+
 
 #### 5. 关键算法特性
 
@@ -1424,7 +1552,7 @@ alloc_event total alloc N bytes on M objects but not freed
 - `-t, --tids <tid,...>`：附加到线程
 
 **过滤选项**：
-- `--user-callchain`：包含用户态调用栈
+- `--user-callchain[=dwarf[,size]]`：包含用户态调用栈。`=dwarf` 启用DWARF栈回溯，可选指定栈数据大小
 - `--kernel-callchain`：包含内核态调用栈
 - `--python-callchain`：包含Python调用栈
 

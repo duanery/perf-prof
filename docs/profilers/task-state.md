@@ -22,7 +22,7 @@ OPTION:
 - `--order`                   未指定该选项：默认启用
 
 FILTER OPTION:
-- `--user-callchain`      启用-g时默认打开，"no-"前缀关闭
+- `--user-callchain[=dwarf[,size]]`  启用-g时默认打开，"no-"前缀关闭。`=dwarf` 启用DWARF栈回溯
 - `--kernel-callchain`    启用-g时默认打开，"no-"前缀关闭
 - `--python-callchain`    启用-g时默认关闭
 

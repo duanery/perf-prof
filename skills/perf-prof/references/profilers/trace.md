@@ -25,7 +25,7 @@ perf-prof trace -e EVENT [--overwrite] [-g [--flame-graph file [-i INT]]]
 - `--inherit`: 子任务继承计数器，跟踪创建的子进程/线程 (实验性)
 
 ### FILTER OPTION
-- `--user-callchain`: 包含用户态调用栈，`no-` 前缀排除 (默认：包含)
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈，`no-` 前缀排除 (默认：包含)。`=dwarf` 启用DWARF栈回溯
 - `--kernel-callchain`: 包含内核态调用栈，`no-` 前缀排除 (默认：包含)
 - `--python-callchain`: 包含 Python 调用栈
 

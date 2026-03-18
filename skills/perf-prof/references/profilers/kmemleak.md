@@ -25,6 +25,8 @@ perf-prof kmemleak --alloc EVENT[...] --free EVENT[...] [OPTION]
 - `--order`: 启用事件时间戳排序，**强烈推荐启用**，提高分析准确性
 
 ### FILTER OPTION
+- `--user-callchain[=dwarf[,size]]`  堆栈开关，选中用户态堆栈，`no-`前缀反选。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`               堆栈开关，选中内核态堆栈，`no-`前缀反选
 - 支持标准的 trace event filter 语法，在事件定义的第一个 `/` 后指定
 - 示例：`--alloc kmem:kmalloc/bytes_alloc>1048576/ptr=ptr/` 只跟踪大于1MB的分配
 

@@ -26,6 +26,10 @@ OPTION:
 - `-m, --mmap-pages`: ringbuffer大小，页数，默认值: 4
 - `--order`: 启用事件时间戳排序（强烈推荐），提高分析准确性
 
+FILTER OPTION:
+- `--user-callchain[=dwarf[,size]]`  堆栈开关，选中用户态堆栈，`no-`前缀反选。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`               堆栈开关，选中内核态堆栈，`no-`前缀反选
+
 PROFILER OPTION:
 - `--alloc <EVENT,...>`: 指定内存分配事件，必须包含 `ptr` 属性，可选 `size` 和 `stack` 属性
 - `--free <EVENT,...>`: 指定内存释放事件，必须包含 `ptr` 属性

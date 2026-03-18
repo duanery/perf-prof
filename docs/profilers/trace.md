@@ -38,7 +38,7 @@ OPTION:
 - `--inherit` - 子任务继承计数器，跟踪创建的子进程/线程，实验性功能
 
 FILTER OPTION:
-- `--user-callchain` - 包含用户态调用栈，`no-` 前缀排除 (默认：包含)
+- `--user-callchain[=dwarf[,size]]` - 包含用户态调用栈，`no-` 前缀排除 (默认：包含)。`=dwarf` 启用DWARF栈回溯，可选指定栈数据大小
 - `--kernel-callchain` - 包含内核态调用栈，`no-` 前缀排除 (默认：包含)
 - `--python-callchain` - 包含 Python 调用栈
 

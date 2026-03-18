@@ -112,6 +112,9 @@ make PYTHON=python/bin/python3
 # 以 997Hz 采样分析 CPU 使用情况，包含调用栈
 ./perf-prof profile -F 997 -g
 
+# 使用 DWARF unwind 采样用户态调用栈（比帧指针更可靠）
+./perf-prof profile -F 997 -g --user-callchain=dwarf
+
 # 生成火焰图
 ./perf-prof profile -F 997 -g --flame-graph cpu.folded
 

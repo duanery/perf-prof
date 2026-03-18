@@ -25,8 +25,10 @@ perf-prof multi-trace [OPTION...] -e EVENT [-e ...] [-k EXPR] [--impl impl] [--t
 - `--order`: 根据场景动态决定是否启用（详见性能优化章节）
 
 ### FILTER OPTION
-- `--exclude-user`: 排除用户态堆栈
-- `--exclude-kernel`: 排除内核态堆栈
+- `--user-callchain[=dwarf[,size]]`: 包含用户态调用栈。`=dwarf` 启用DWARF栈回溯
+- `--kernel-callchain`: 包含内核态调用栈
+- `--exclude-user`: 排除用户态事件
+- `--exclude-kernel`: 排除内核态事件
 - trace event过滤器: 在事件后使用`/filter/`语法
 
 ### PROFILER OPTION

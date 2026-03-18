@@ -21,7 +21,7 @@ OPTION:
 - `-p, --pids`: 指定进程ID列表
 - `-i, --interval`: 周期性调用`__interval__()`的间隔(ms)
 - `-g, --call-graph`: 启用堆栈采样（默认只采样内核态堆栈）
-- `--user-callchain`: 启用用户态堆栈采样
+- `--user-callchain[=dwarf[,size]]`: 启用用户态堆栈采样。`=dwarf` 启用DWARF栈回溯，比帧指针更可靠
 - `--no-kernel-callchain`: 禁用内核态堆栈采样
 
 PROFILER OPTION:
@@ -823,8 +823,11 @@ perf-prof python -e sched:sched_wakeup -g -i 1000 callstack_analyzer.py
 # 或使用stack属性
 perf-prof python -e 'sched:sched_wakeup//stack/' -i 1000 callstack_analyzer.py
 
-# 同时采样用户态堆栈
+# 同时采样用户态堆栈（FP模式）
 perf-prof python -e sched:sched_wakeup -g --user-callchain -i 1000 callstack_analyzer.py
+
+# 使用DWARF模式采样用户态堆栈（更可靠）
+perf-prof python -e sched:sched_wakeup -g --user-callchain=dwarf -i 1000 callstack_analyzer.py
 ```
 
 ### Profiler事件源示例
