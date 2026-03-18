@@ -41,6 +41,7 @@ ExclusiveArch:  x86_64 aarch64
 Requires:       elfutils-libelf
 Requires:       glibc
 Requires:       xz-libs
+Requires:       libunwind
 %if %{has_tcmalloc}
 Requires:       gperftools-libs
 %endif
@@ -50,6 +51,7 @@ Requires:       python3-libs
 
 BuildRequires:  elfutils-libelf-devel
 BuildRequires:  xz-devel
+BuildRequires:  libunwind-devel
 %if %{standalone}
 BuildRequires:  patchelf, llvm
 %else
