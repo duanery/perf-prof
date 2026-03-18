@@ -3,7 +3,7 @@
 #
 # Package selection:
 #   - Version: first argument or PYTHON_VERSION env var, default 3.12
-#   - Architecture: auto-detected via uname -m (x86_64, aarch64)
+#   - Architecture: second argument or auto-detected via uname -m (x86_64, aarch64)
 #   - Variant: install_only_stripped — minimal runtime without debug symbols,
 #     pre-installed layout (bin/ lib/ include/), ready to use directly
 #   - Stability: alpha/beta/rc versions are filtered out, highest patch version selected
@@ -12,16 +12,18 @@
 # Asset naming: cpython-{ver}+{tag}-{arch}-unknown-linux-gnu-install_only_stripped.tar.gz
 #
 # Usage:
-#   ./download-python-standalone.sh [PYTHON_VERSION]
+#   ./download-python-standalone.sh [PYTHON_VERSION] [ARCH]
 #
 # Examples:
-#   ./download-python-standalone.sh          # download latest stable (3.12.x)
-#   ./download-python-standalone.sh 3.13     # download latest 3.13.x
+#   ./download-python-standalone.sh          # download latest stable (3.12.x) for current arch
+#   ./download-python-standalone.sh 3.13     # download latest 3.13.x for current arch
+#   ./download-python-standalone.sh 3.12 aarch64  # download 3.12.x for aarch64
 
 set -euo pipefail
 
 PYTHON_VERSION="${1:-${PYTHON_VERSION:-3.12}}"
-VARIANT="$(uname -m)-unknown-linux-gnu-install_only_stripped"
+ARCH="${2:-$(uname -m)}"
+VARIANT="${ARCH}-unknown-linux-gnu-install_only_stripped"
 
 echo "Fetching latest release info..."
 RELEASE_JSON=$(curl -sfL https://raw.githubusercontent.com/astral-sh/python-build-standalone/latest-release/latest-release.json)
