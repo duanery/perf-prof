@@ -1,6 +1,9 @@
 ---
 name: perf-prof
-description: 使用perf-prof进行Linux系统问题分析。perf-prof是基于perf_event的系统级分析工具，事件在内存中实时处理，可长期运行。触发场景：(1) CPU使用率高、热点分析 (2) 进程状态异常(D/S状态多) (3) 延迟抖动、响应慢 (4) 内存泄露或增长异常 (5) 块设备IO慢 (6) 虚拟机性能问题 (7) 事件聚合统计 (8) 自定义脚本分析。核心分析器：profile(CPU采样)、task-state(进程状态)、multi-trace(延迟分析)、kmemleak(内存泄露)、blktrace(IO延迟)、top/sql(聚合统计)、kvm-exit(虚拟化退出)、rundelay(调度延迟)、syscalls(系统调用耗时)、python(自定义脚本分析)。适用于：性能问题定位、内核/应用开发调试、学习理解Linux内核机制（调度、内存、IO、中断等）。
+metadata:
+  version: "0.1"
+  source: https://github.com/OpenCloudOS/perf-prof.git
+description: 使用perf-prof进行Linux系统问题分析。perf-prof是基于perf_event的系统级分析工具，事件在内存中实时处理，可长期运行。触发场景：(1) CPU使用率高、热点分析 (2) 进程状态异常(D/S状态多) (3) 延迟抖动、响应慢 (4) 内存泄露或增长异常 (5) 块设备IO慢 (6) 虚拟机性能问题 (7) 事件聚合统计 (8) 自定义脚本分析。核心分析器：profile(CPU采样)、task-state(进程状态)、multi-trace(延迟分析)、kmemleak(内存泄露)、blktrace(IO延迟)、top/sql(聚合统计)、kvm-exit(虚拟化退出)、rundelay(调度延迟)、syscalls(系统调用耗时)、python(自定义脚本分析)。适用于：性能问题定位、内核/应用开发调试、学习理解Linux内核机制（调度、内存、IO、中断等）。English: Linux system performance analysis with perf-prof, a perf_event-based tool for real-time in-memory event processing. Triggers: high CPU usage, hotspot profiling, process state issues (D/S states), latency spikes, slow response, memory leak detection, memory growth, block device IO slowness, VM performance issues, event aggregation, custom script analysis. Key profilers: profile (CPU sampling), task-state (process state), multi-trace (latency analysis), kmemleak (memory leak), blktrace (IO latency), top/sql (aggregation), kvm-exit (virtualization exit), rundelay (scheduling delay), syscalls (syscall latency), python (custom scripting).
 ---
 
 # perf-prof 系统性能分析
@@ -8,6 +11,31 @@ description: 使用perf-prof进行Linux系统问题分析。perf-prof是基于pe
 ## 概述
 
 perf-prof 是一个Linux系统级性能分析工具，基于perf_event在内存中实时处理事件。本技能提供使用perf-prof分析系统问题的工作流程和方法。
+
+### 安装
+
+使用前先检查 perf-prof 是否已安装：
+
+```bash
+which perf-prof && perf-prof --version
+```
+
+如果系统中没有 perf-prof 二进制文件，**需要询问用户确认**是否可以下载源码并编译安装，然后执行以下步骤：
+
+```bash
+# 1. 下载源码
+git clone https://github.com/OpenCloudOS/perf-prof.git
+cd perf-prof
+
+# 2. 安装依赖包
+yum install -y xz-devel elfutils-libelf-devel libunwind-devel python3-devel
+
+# 3. 编译
+make
+
+# 4. 验证安装
+./perf-prof --version
+```
 
 ## 核心分析流程
 
