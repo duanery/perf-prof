@@ -28,6 +28,7 @@ struct profile_ctx {
 
 static void monitor_ctx_exit(struct prof_dev *dev);
 static void profile_interval(struct prof_dev *dev);
+extern struct monitor profile;
 
 // in linux/perf_event.h
 // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ | PERF_SAMPLE_CALLCHAIN
@@ -141,6 +142,11 @@ static int profile_init(struct prof_dev *dev)
         .exclude_callchain_kernel = exclude_callchain_kernel(dev, CALLCHAIN_KERNEL | CALLCHAIN_USER),
     };
     struct perf_evsel *evsel;
+
+    if (dev->prof == &profile && !env->freq) {
+        fprintf(stderr, "-F/--freq is required for profile.\n");
+        return -1;
+    }
 
     if (env->exclude_guest && env->exclude_host)
         return -1;
