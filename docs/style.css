@@ -8,7 +8,7 @@
   --w:1120px;
 }
 html{scroll-behavior:smooth}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans CJK SC','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--tx);line-height:1.7;font-size:16px;-webkit-font-smoothing:antialiased}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans CJK SC','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--tx);line-height:1.7;font-size:16px;-webkit-font-smoothing:antialiased;overflow-x:hidden}
 a{color:var(--lk);text-decoration:none;transition:color .15s}
 a:hover{color:var(--ac2);text-decoration:underline}
 code{font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:.88em;background:var(--code);border:1px solid var(--bd);border-radius:5px;padding:1px 6px;color:var(--tx)}
@@ -131,7 +131,16 @@ footer a{color:var(--tx2)}
   section{padding:36px 0}
   .section-title{font-size:24px}
   .features{grid-template-columns:1fr}
-  .cmp{grid-template-columns:1fr 1fr}
-  .flow{font-size:12px}
-  .flow-step{min-width:90px;padding:8px 10px}
+  .cmp{grid-template-columns:1fr}
+  .flow{font-size:12px;overflow-x:auto}
+  .flow-step{min-width:80px;padding:8px 8px}
+  .flow-arrow{padding:0 3px;font-size:18px}
+  .workflows{grid-template-columns:1fr}
+  pre{padding:14px 12px;font-size:13px}
+  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{min-width:600px}
+  .guide{grid-template-columns:1fr 1fr}
+  .framework-img img{max-width:100%}
+  .lang-toggle{top:10px;right:10px}
+  .card{padding:18px 16px}
 }
