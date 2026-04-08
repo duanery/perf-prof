@@ -3,11 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>perf-prof - Linux 实时性能分析框架</title>
+<title data-i18n="title">perf-prof - Linux 实时性能分析框架</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><polygon points='32,4 55.3,17.5 55.3,46.5 32,60 8.7,46.5 8.7,17.5' fill='%23E8A735'/><rect x='22' y='18' width='20' height='4' rx='2' fill='%23fff'/><rect x='17' y='24.5' width='10' height='4' rx='2' fill='%23fff'/><rect x='30' y='24.5' width='17' height='4' rx='2' fill='%23fff'/><rect x='14' y='31' width='36' height='4' rx='2' fill='%23fff'/><rect x='17' y='37.5' width='17' height='4' rx='2' fill='%23fff'/><rect x='37' y='37.5' width='10' height='4' rx='2' fill='%23fff'/><rect x='22' y='44' width='20' height='4' rx='2' fill='%23fff'/></svg>">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+
+<!-- Language toggle -->
+<div class="lang-toggle" id="langToggle">
+  <button class="lang-btn" id="langEn" onclick="setLang('en')">EN</button>
+  <button class="lang-btn" id="langZh" onclick="setLang('zh')">中文</button>
+</div>
 
 <!-- ====== Hero ====== -->
 <div class="hero">
@@ -16,19 +22,19 @@
       <svg viewBox="0 0 64 64" width="48" height="48"><polygon points="32,4 55.3,17.5 55.3,46.5 32,60 8.7,46.5 8.7,17.5" fill="#E8A735"/><rect x="22" y="18" width="20" height="4" rx="2" fill="#fff"/><rect x="17" y="24.5" width="10" height="4" rx="2" fill="#fff"/><rect x="30" y="24.5" width="17" height="4" rx="2" fill="#fff"/><rect x="14" y="31" width="36" height="4" rx="2" fill="#fff"/><rect x="17" y="37.5" width="17" height="4" rx="2" fill="#fff"/><rect x="37" y="37.5" width="10" height="4" rx="2" fill="#fff"/><rect x="22" y="44" width="20" height="4" rx="2" fill="#fff"/></svg>
       <span>perf-prof</span>
     </div>
-    <h1>基于 perf_event 的 Linux 系统级分析工具<br>权衡性能与灵活性，兼容旧内核，可长期运行</h1>
+    <h1 data-i18n-html="hero_h1">基于 perf_event 的 Linux 系统级分析工具<br>权衡性能与灵活性，兼容旧内核，可长期运行</h1>
     <div class="hero-badges">
-      <span class="badge"><span class="dot c"></span>C 语言</span>
-      <span class="badge"><span class="dot k"></span>Linux 3.10+</span>
-      <span class="badge"><span class="dot p"></span>30+ 分析器</span>
+      <span class="badge"><span class="dot c"></span><span data-i18n="badge_c">C 语言</span></span>
+      <span class="badge"><span class="dot k"></span><span>Linux 3.10+</span></span>
+      <span class="badge"><span class="dot p"></span><span data-i18n="badge_p">30+ 分析器</span></span>
     </div>
     <div class="hero-actions">
       <a class="btn btn-primary" href="https://github.com/OpenCloudOS/perf-prof" target="_blank" rel="noopener">
         <svg width="18" height="18" viewBox="0 0 98 96" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362l-.08-9.127c-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126l-.08 13.526c0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z"/></svg>
         GitHub
       </a>
-      <a class="btn btn-outline" href="#quick-start">快速开始</a>
-      <a class="btn btn-outline" href="#profilers">分析器一览</a>
+      <a class="btn btn-outline" href="#quick-start" data-i18n="btn_start">快速开始</a>
+      <a class="btn btn-outline" href="#profilers" data-i18n="btn_profilers">分析器一览</a>
     </div>
   </div>
 </div>
@@ -36,10 +42,10 @@
 <!-- ====== Architecture ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">架构概览</h2>
-    <p class="section-sub">内核态采样 → 三层过滤器 → 环形缓冲区 → 时序排序 → 分析器实时处理</p>
+    <h2 class="section-title" data-i18n="arch_title">架构概览</h2>
+    <p class="section-sub" data-i18n="arch_sub">内核态采样 → 三层过滤器 → 环形缓冲区 → 时序排序 → 分析器实时处理</p>
     <div class="framework-img">
-      <img src="images/perf-prof_framework.png" alt="perf-prof 框架架构图" loading="lazy">
+      <img src="images/perf-prof_framework.png" alt="perf-prof framework" loading="lazy">
     </div>
   </div>
 </section>
@@ -47,46 +53,46 @@
 <!-- ====== Design Philosophy ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">设计理念：围绕 Tracepoint 构建分析能力</h2>
-    <p class="section-sub">内核 maintainer 在关键流程上预埋了 tracepoint，理解这些点就是理解内核</p>
+    <h2 class="section-title" data-i18n="phil_title">设计理念：围绕 Tracepoint 构建分析能力</h2>
+    <p class="section-sub" data-i18n="phil_sub">内核 maintainer 在关键流程上预埋了 tracepoint，理解这些点就是理解内核</p>
 
     <div style="display:grid;gap:20px">
 
       <div class="card">
-        <h3>&#127919; Tracepoint：内核的观测基础设施</h3>
-        <p>内核 maintainer 在<strong>调度、内存、文件系统、IO、网络</strong>等子系统的关键节点预埋了 tracepoint，每个点标记一个关键的状态转换或决策点。</p>
-        <p><strong>解决性能问题的本质，就是跟踪和分析 tracepoint 之间的关系</strong> —— 事件的先后顺序、延迟、配对、聚合。</p>
+        <h3 data-i18n-html="tp_h3">&#127919; Tracepoint：内核的观测基础设施</h3>
+        <p data-i18n-html="tp_p1">内核 maintainer 在<strong>调度、内存、文件系统、IO、网络</strong>等子系统的关键节点预埋了 tracepoint，每个点标记一个关键的状态转换或决策点。</p>
+        <p data-i18n-html="tp_p2"><strong>解决性能问题的本质，就是跟踪和分析 tracepoint 之间的关系</strong> —— 事件的先后顺序、延迟、配对、聚合。</p>
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px">
         <div class="card">
-          <h3 style="color:var(--red)">&#9888; 原始事件的困境</h3>
-          <p>perf、ftrace 可以采集原始 tracepoint 事件，但一秒内就能产生数十万条。<strong>海量原始数据既超出 AI 上下文窗口，也远超人的阅读能力</strong>，靠逐条分析无法定位问题。</p>
+          <h3 style="color:var(--red)" data-i18n-html="raw_h3">&#9888; 原始事件的困境</h3>
+          <p data-i18n-html="raw_p">perf、ftrace 可以采集原始 tracepoint 事件，但一秒内就能产生数十万条。<strong>海量原始数据既超出 AI 上下文窗口，也远超人的阅读能力</strong>，靠逐条分析无法定位问题。</p>
         </div>
         <div class="card card-accent">
-          <h3 style="color:var(--lk)">&#10003; perf-prof 的方案</h3>
-          <p>在用户态实时处理事件关系，将海量事件压缩为分析结论：</p>
+          <h3 style="color:var(--lk)" data-i18n-html="sol_h3">&#10003; perf-prof 的方案</h3>
+          <p data-i18n="sol_p">在用户态实时处理事件关系，将海量事件压缩为分析结论：</p>
           <ul>
-            <li>&#x2022;&ensp;<strong>multi-trace</strong> — tracepoint 之间的延迟与因果</li>
-            <li>&#x2022;&ensp;<strong>top / sql</strong> — 按维度聚合，输出 Top-N</li>
-            <li>&#x2022;&ensp;<strong>task-state</strong> — 调度事件流 → 状态耗时分布</li>
-            <li>&#x2022;&ensp;<strong>kmemleak</strong> — 配对 alloc/free，只输出泄漏</li>
+            <li data-i18n-html="sol_li1">&#x2022;&ensp;<strong>multi-trace</strong> — tracepoint 之间的延迟与因果</li>
+            <li data-i18n-html="sol_li2">&#x2022;&ensp;<strong>top / sql</strong> — 按维度聚合，输出 Top-N</li>
+            <li data-i18n-html="sol_li3">&#x2022;&ensp;<strong>task-state</strong> — 调度事件流 → 状态耗时分布</li>
+            <li data-i18n-html="sol_li4">&#x2022;&ensp;<strong>kmemleak</strong> — 配对 alloc/free，只输出泄漏</li>
           </ul>
         </div>
       </div>
 
       <div class="card">
-        <h3>&#129302; AI + perf-prof 协作</h3>
+        <h3 data-i18n-html="ai_h3">&#129302; AI + perf-prof 协作</h3>
         <div class="flow">
-          <div class="flow-step"><strong>AI 理解问题</strong><span>选择 tracepoint</span></div>
+          <div class="flow-step"><strong data-i18n="ai_s1">AI 理解问题</strong><span data-i18n="ai_s1d">选择 tracepoint</span></div>
           <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step"><strong>perf-prof 处理</strong><span>过滤、关联、聚合</span></div>
+          <div class="flow-step"><strong data-i18n="ai_s2">perf-prof 处理</strong><span data-i18n="ai_s2d">过滤、关联、聚合</span></div>
           <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step"><strong>精简结论</strong><span>延迟分布 / Top-N / 泄漏栈</span></div>
+          <div class="flow-step"><strong data-i18n="ai_s3">精简结论</strong><span data-i18n="ai_s3d">延迟分布 / Top-N / 泄漏栈</span></div>
           <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step accent"><strong>AI 解读定位</strong><span>上下文可控，结论可达</span></div>
+          <div class="flow-step accent"><strong data-i18n="ai_s4">AI 解读定位</strong><span data-i18n="ai_s4d">上下文可控，结论可达</span></div>
         </div>
-        <p style="margin-top:14px">perf-prof 将数十万条原始事件压缩为数行结论，<strong>比 AI 直接消化原始事件流高效几个数量级。</strong></p>
+        <p style="margin-top:14px" data-i18n-html="ai_p">perf-prof 将数十万条原始事件压缩为数行结论，<strong>比 AI 直接消化原始事件流高效几个数量级。</strong></p>
       </div>
 
     </div>
@@ -96,44 +102,44 @@
 <!-- ====== Features ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">核心特性</h2>
-    <p class="section-sub">事件在内存中实时处理后直接丢弃，可长期运行，安全可靠</p>
+    <h2 class="section-title" data-i18n="feat_title">核心特性</h2>
+    <p class="section-sub" data-i18n="feat_sub">事件在内存中实时处理后直接丢弃，可长期运行，安全可靠</p>
     <div class="features">
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#9889;</span><h3>内存中实时处理</h3></div>
-        <p>采样事件不写文件，处理后直接丢弃。无磁盘瓶颈，适合长期运行。</p>
+        <div class="feat-header"><span class="feat-icon">&#9889;</span><h3 data-i18n="f1_h">内存中实时处理</h3></div>
+        <p data-i18n="f1_p">采样事件不写文件，处理后直接丢弃。无磁盘瓶颈，适合长期运行。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128268;</span><h3>广泛兼容性</h3></div>
-        <p>支持 Linux 3.10+（仅需 perf_event），远低于 BCC/bpftrace 的 4.1+ 要求。</p>
+        <div class="feat-header"><span class="feat-icon">&#128268;</span><h3 data-i18n="f2_h">广泛兼容性</h3></div>
+        <p data-i18n="f2_p">支持 Linux 3.10+（仅需 perf_event），远低于 BCC/bpftrace 的 4.1+ 要求。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128269;</span><h3>延迟根因分析</h3></div>
-        <p>multi-trace 事件配对与延迟分析，还原中间事件细节。</p>
+        <div class="feat-header"><span class="feat-icon">&#128269;</span><h3 data-i18n="f3_h">延迟根因分析</h3></div>
+        <p data-i18n="f3_p">multi-trace 事件配对与延迟分析，还原中间事件细节。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128736;</span><h3>三层过滤 + eBPF</h3></div>
-        <p>eBPF / trace event / PMU 三层内核态过滤。支持 eBPF 过滤器和 BPF skeleton 分析器。</p>
+        <div class="feat-header"><span class="feat-icon">&#128736;</span><h3 data-i18n="f4_h">三层过滤 + eBPF</h3></div>
+        <p data-i18n="f4_p">eBPF / trace event / PMU 三层内核态过滤。支持 eBPF 过滤器和 BPF skeleton 分析器。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128200;</span><h3>30+ 内建分析器</h3></div>
-        <p>覆盖 CPU、内存、调度、IO、虚拟化等场景，紧急问题直接拼命令。</p>
+        <div class="feat-header"><span class="feat-icon">&#128200;</span><h3 data-i18n="f5_h">30+ 内建分析器</h3></div>
+        <p data-i18n="f5_p">覆盖 CPU、内存、调度、IO、虚拟化等场景，紧急问题直接拼命令。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128013;</span><h3>Python 脚本扩展</h3></div>
-        <p>事件自动转为 PerfEvent 对象，只需了解字段即可分析，无需编写内核代码。</p>
+        <div class="feat-header"><span class="feat-icon">&#128013;</span><h3 data-i18n="f6_h">Python 脚本扩展</h3></div>
+        <p data-i18n="f6_p">事件自动转为 PerfEvent 对象，只需了解字段即可分析，无需编写内核代码。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#128293;</span><h3>火焰图 &amp; 热图</h3></div>
-        <p>内建火焰图折叠栈和延迟热图，一条命令完成可视化。</p>
+        <div class="feat-header"><span class="feat-icon">&#128293;</span><h3 data-i18n="f7_h">火焰图 &amp; 热图</h3></div>
+        <p data-i18n="f7_p">内建火焰图折叠栈和延迟热图，一条命令完成可视化。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#127760;</span><h3>跨主机联合分析</h3></div>
-        <p>通过 virtio-ports / TCP 传播事件，Guest ↔ Host 跨系统联合分析。</p>
+        <div class="feat-header"><span class="feat-icon">&#127760;</span><h3 data-i18n="f8_h">跨主机联合分析</h3></div>
+        <p data-i18n="f8_p">通过 virtio-ports / TCP 传播事件，Guest ↔ Host 跨系统联合分析。</p>
       </div>
       <div class="feat">
-        <div class="feat-header"><span class="feat-icon">&#129302;</span><h3>AI 技能集成</h3></div>
-        <p>提供 <a href="https://github.com/OpenCloudOS/perf-prof/tree/main/skills/perf-prof">perf-prof skill</a>，AI 自动选择分析器、拼命令、解读结果。</p>
+        <div class="feat-header"><span class="feat-icon">&#129302;</span><h3 data-i18n="f9_h">AI 技能集成</h3></div>
+        <p data-i18n-html="f9_p">提供 <a href="https://github.com/OpenCloudOS/perf-prof/tree/main/skills/perf-prof">perf-prof skill</a>，AI 自动选择分析器、拼命令、解读结果。</p>
       </div>
     </div>
   </div>
@@ -142,68 +148,68 @@
 <!-- ====== Comparison ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">工具定位</h2>
-    <p class="section-sub">在性能、灵活性、跟踪时效、兼容性之间权衡</p>
+    <h2 class="section-title" data-i18n="cmp_title">工具定位</h2>
+    <p class="section-sub" data-i18n="cmp_sub">在性能、灵活性、跟踪时效、兼容性之间权衡</p>
 
     <div class="card" style="margin-bottom:28px">
-      <h3>Linux 跟踪工具优先级</h3>
+      <h3 data-i18n="cmp_prio">Linux 跟踪工具优先级</h3>
       <div class="flow" style="margin-bottom:16px">
-        <div class="flow-step" style="border-radius:8px 0 0 8px"><strong style="color:var(--grn)">bcc / bpftrace / bpftime</strong><span>性能影响最小，内核态聚合</span></div>
+        <div class="flow-step" style="border-radius:8px 0 0 8px"><strong style="color:var(--grn)">bcc / bpftrace / bpftime</strong><span data-i18n="prio_1">性能影响最小，内核态聚合</span></div>
         <div class="flow-arrow">&rsaquo;</div>
-        <div class="flow-step accent"><strong style="color:var(--lk)">perf-prof</strong><span>兼容旧内核，延迟根因分析</span></div>
+        <div class="flow-step accent"><strong style="color:var(--lk)">perf-prof</strong><span data-i18n="prio_2">兼容旧内核，延迟根因分析</span></div>
         <div class="flow-arrow">&rsaquo;</div>
-        <div class="flow-step"><strong style="color:var(--ylw)">perf / ftrace</strong><span>短时采样，离线分析</span></div>
+        <div class="flow-step"><strong style="color:var(--ylw)">perf / ftrace</strong><span data-i18n="prio_3">短时采样，离线分析</span></div>
         <div class="flow-arrow">&rsaquo;</div>
-        <div class="flow-step" style="border-radius:0 8px 8px 0"><strong style="color:var(--tx3)">其他</strong><span>特定场景</span></div>
+        <div class="flow-step" style="border-radius:0 8px 8px 0"><strong style="color:var(--tx3)" data-i18n="prio_4n">其他</strong><span data-i18n="prio_4">特定场景</span></div>
       </div>
-      <p style="font-size:14px;color:var(--tx3);margin:0">类比编程语言：<span style="color:var(--grn)">C/C++/Rust</span> &rsaquo; <span style="color:var(--lk)">JavaScript/TypeScript</span> &rsaquo; <span style="color:var(--ylw)">Python</span> &rsaquo; <span style="color:var(--tx3)">Shell</span></p>
+      <p style="font-size:14px;color:var(--tx3);margin:0" data-i18n-html="prio_lang">类比编程语言：<span style="color:var(--grn)">C/C++/Rust</span> &rsaquo; <span style="color:var(--lk)">JavaScript/TypeScript</span> &rsaquo; <span style="color:var(--ylw)">Python</span> &rsaquo; <span style="color:var(--tx3)">Shell</span></p>
     </div>
 
     <div class="cmp">
       <div class="cmp-item">
         <h4>bcc / bpftrace</h4>
-        <div class="sub">类比 C/C++/Rust</div>
+        <div class="sub" data-i18n="cmp1_sub">类比 C/C++/Rust</div>
         <ul>
-          <li>性能影响最小，内核态聚合</li>
-          <li>高频事件首选</li>
-          <li>需 4.1+ 内核</li>
-          <li>需掌握 eBPF C 代码细节</li>
+          <li data-i18n="cmp1_l1">性能影响最小，内核态聚合</li>
+          <li data-i18n="cmp1_l2">高频事件首选</li>
+          <li data-i18n="cmp1_l3">需 4.1+ 内核</li>
+          <li data-i18n="cmp1_l4">需掌握 eBPF C 代码细节</li>
         </ul>
       </div>
       <div class="cmp-item highlight">
         <h4>perf-prof</h4>
-        <div class="sub">类比 JavaScript/TypeScript</div>
+        <div class="sub" data-i18n="cmp2_sub">类比 JavaScript/TypeScript</div>
         <ul>
-          <li>兼容 3.10 旧内核</li>
-          <li>延迟根因分析（multi-trace）</li>
-          <li>紧急问题快速拼命令</li>
-          <li>eBPF 过滤器 + BPF 分析器</li>
-          <li>Python 分析器降低门槛</li>
+          <li data-i18n="cmp2_l1">兼容 3.10 旧内核</li>
+          <li data-i18n="cmp2_l2">延迟根因分析（multi-trace）</li>
+          <li data-i18n="cmp2_l3">紧急问题快速拼命令</li>
+          <li data-i18n="cmp2_l4">eBPF 过滤器 + BPF 分析器</li>
+          <li data-i18n="cmp2_l5">Python 分析器降低门槛</li>
         </ul>
       </div>
       <div class="cmp-item">
         <h4>perf / ftrace</h4>
-        <div class="sub">类比 Python</div>
+        <div class="sub" data-i18n="cmp3_sub">类比 Python</div>
         <ul>
-          <li>短时采样后离线分析</li>
-          <li>无长期运行需求时使用</li>
-          <li>事件写文件，磁盘开销</li>
+          <li data-i18n="cmp3_l1">短时采样后离线分析</li>
+          <li data-i18n="cmp3_l2">无长期运行需求时使用</li>
+          <li data-i18n="cmp3_l3">事件写文件，磁盘开销</li>
         </ul>
       </div>
     </div>
 
     <div style="margin-top:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px">
       <div class="card">
-        <h3 style="color:var(--grn);font-size:15px">&#10095; 优先选 bcc/bpftrace</h3>
-        <p style="margin:0">性能影响最小化，高频事件内核态聚合，新内核（4.1+）环境</p>
+        <h3 style="color:var(--grn);font-size:15px" data-i18n-html="pick1_h">&#10095; 优先选 bcc/bpftrace</h3>
+        <p style="margin:0" data-i18n="pick1_p">性能影响最小化，高频事件内核态聚合，新内核（4.1+）环境</p>
       </div>
       <div class="card card-accent">
-        <h3 style="color:var(--lk);font-size:15px">&#10095; 选择 perf-prof</h3>
-        <p style="margin:0">旧内核（3.10+）且需要性能保障；延迟根因分析；紧急问题快速拼命令</p>
+        <h3 style="color:var(--lk);font-size:15px" data-i18n-html="pick2_h">&#10095; 选择 perf-prof</h3>
+        <p style="margin:0" data-i18n="pick2_p">旧内核（3.10+）且需要性能保障；延迟根因分析；紧急问题快速拼命令</p>
       </div>
       <div class="card">
-        <h3 style="color:var(--ylw);font-size:15px">&#10095; 可以用 perf/ftrace</h3>
-        <p style="margin:0">无长期采样需求，短时采样后离线分析即可</p>
+        <h3 style="color:var(--ylw);font-size:15px" data-i18n-html="pick3_h">&#10095; 可以用 perf/ftrace</h3>
+        <p style="margin:0" data-i18n="pick3_p">无长期采样需求，短时采样后离线分析即可</p>
       </div>
     </div>
   </div>
@@ -212,32 +218,32 @@
 <!-- ====== Python Analyzer ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">Python 分析器</h2>
-    <p class="section-sub">降低跟踪分析的门槛，让更多人能分析性能问题</p>
+    <h2 class="section-title" data-i18n="py_title">Python 分析器</h2>
+    <p class="section-sub" data-i18n="py_sub">降低跟踪分析的门槛，让更多人能分析性能问题</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px">
       <div class="card">
-        <h3 style="color:var(--red);font-size:15px">bcc 的门槛</h3>
+        <h3 style="color:var(--red);font-size:15px" data-i18n="py_bcc_h">bcc 的门槛</h3>
         <ul>
-          <li>&#x2717;&ensp;需掌握 eBPF C 代码（不同 prog 类型参数不同）</li>
-          <li>&#x2717;&ensp;需了解不同 prog 可调用的 bpf helper</li>
-          <li>&#x2717;&ensp;需理解 perf_event、tracepoint、kprobe、poll</li>
+          <li data-i18n-html="py_bcc1">&#x2717;&ensp;需掌握 eBPF C 代码（不同 prog 类型参数不同）</li>
+          <li data-i18n-html="py_bcc2">&#x2717;&ensp;需了解不同 prog 可调用的 bpf helper</li>
+          <li data-i18n-html="py_bcc3">&#x2717;&ensp;需理解 perf_event、tracepoint、kprobe、poll</li>
         </ul>
       </div>
       <div class="card">
-        <h3 style="color:var(--ylw);font-size:15px">bpftrace 的门槛</h3>
+        <h3 style="color:var(--ylw);font-size:15px" data-i18n="py_bt_h">bpftrace 的门槛</h3>
         <ul>
-          <li>&#x2717;&ensp;需学习一套全新的跟踪语言</li>
-          <li>&#x2717;&ensp;大量新函数需要记忆</li>
-          <li>&#x2717;&ensp;限制性较大，复杂逻辑难以表达</li>
+          <li data-i18n-html="py_bt1">&#x2717;&ensp;需学习一套全新的跟踪语言</li>
+          <li data-i18n-html="py_bt2">&#x2717;&ensp;大量新函数需要记忆</li>
+          <li data-i18n-html="py_bt3">&#x2717;&ensp;限制性较大，复杂逻辑难以表达</li>
         </ul>
       </div>
       <div class="card card-accent">
         <h3 style="color:var(--lk);font-size:15px">perf-prof python</h3>
         <ul>
-          <li>&#x2713;&ensp;采样事件自动转换为 PerfEvent 对象</li>
-          <li>&#x2713;&ensp;不需要关注如何采样和内核逻辑</li>
-          <li>&#x2713;&ensp;只需了解事件成员即可开始分析</li>
-          <li>&#x2713;&ensp;使用 <code>help</code> 生成模板后修改</li>
+          <li data-i18n-html="py_pp1">&#x2713;&ensp;采样事件自动转换为 PerfEvent 对象</li>
+          <li data-i18n-html="py_pp2">&#x2713;&ensp;不需要关注如何采样和内核逻辑</li>
+          <li data-i18n-html="py_pp3">&#x2713;&ensp;只需了解事件成员即可开始分析</li>
+          <li data-i18n-html="py_pp4">&#x2713;&ensp;使用 <code>help</code> 生成模板后修改</li>
         </ul>
       </div>
     </div>
@@ -247,32 +253,32 @@
 <!-- ====== Profilers ====== -->
 <section id="profilers">
   <div class="wrap">
-    <h2 class="section-title">分析器一览</h2>
-    <p class="section-sub">每个分析器都是独立模块，针对特定场景优化</p>
+    <h2 class="section-title" data-i18n="prof_title">分析器一览</h2>
+    <p class="section-sub" data-i18n="prof_sub">每个分析器都是独立模块，针对特定场景优化</p>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>分析器</th><th>功能</th><th>领域</th></tr></thead>
+        <thead><tr><th data-i18n="th_prof">分析器</th><th data-i18n="th_func">功能</th><th data-i18n="th_area">领域</th></tr></thead>
         <tbody>
-          <tr><td><a href="profilers/profile.md">profile</a></td><td>CPU 采样：热点函数定位、火焰图，支持内核/用户态</td><td><span class="tag tag-cpu">CPU</span></td></tr>
-          <tr><td><a href="profilers/trace.md">trace</a></td><td>通用事件跟踪：打印事件与调用栈，支持 kprobe / uprobe</td><td><span class="tag tag-trace">跟踪</span></td></tr>
-          <tr><td><a href="profilers/multi-trace.md">multi-trace</a></td><td>多事件关系：延迟分析、事件配对、<code>--detail</code> 还原中间细节</td><td><span class="tag tag-sched">延迟</span></td></tr>
-          <tr><td><a href="profilers/top.md">top</a></td><td>键值聚合统计：按进程/线程/自定义键排序</td><td><span class="tag tag-trace">统计</span></td></tr>
-          <tr><td><a href="profilers/sql.md">sql</a></td><td>SQL 聚合查询：基于 SQLite 的灵活事件分析</td><td><span class="tag tag-trace">统计</span></td></tr>
-          <tr><td><a href="profilers/task-state.md">task-state</a></td><td>进程状态监控：R/S/D/T 耗时分布与根因分析</td><td><span class="tag tag-sched">调度</span></td></tr>
-          <tr><td><a href="profilers/oncpu.md">oncpu</a></td><td>CPU 运行监控：实时显示各 CPU 运行进程及时间</td><td><span class="tag tag-cpu">CPU</span></td></tr>
-          <tr><td><a href="profilers/blktrace.md">blktrace</a></td><td>块设备 IO：全生命周期延迟、毛刺检测</td><td><span class="tag tag-io">IO</span></td></tr>
-          <tr><td><a href="profilers/kvm-exit.md">kvm-exit</a></td><td>KVM VM-Exit/Entry 延迟分析与退出原因统计</td><td><span class="tag tag-vm">虚拟化</span></td></tr>
-          <tr><td><a href="profilers/kmemleak.md">kmemleak</a></td><td>内存泄漏检测：内核/用户态分配追踪</td><td><span class="tag tag-mem">内存</span></td></tr>
-          <tr><td><a href="profilers/python.md">python</a></td><td>Python 脚本：自定义脚本处理 perf 事件</td><td><span class="tag tag-trace">脚本</span></td></tr>
-          <tr><td><a href="profilers/multi-trace.md#syscalls---系统调用耗时分析">syscalls</a></td><td>系统调用延迟：完整生命周期分析</td><td><span class="tag tag-sched">延迟</span></td></tr>
-          <tr><td><a href="profilers/multi-trace.md#rundelay---调度延迟分析">rundelay</a></td><td>调度延迟：唤醒到实际运行的延迟</td><td><span class="tag tag-sched">调度</span></td></tr>
-          <tr><td>kmemprof</td><td>内存分配统计：分配器热点与大小分布</td><td><span class="tag tag-mem">内存</span></td></tr>
-          <tr><td>bpf:kvm_exit</td><td>基于 eBPF 的 KVM 退出事件生成</td><td><span class="tag tag-vm">虚拟化</span></td></tr>
-          <tr><td>watchdog</td><td>硬锁/软锁检测：预测 lockup 并输出内核栈</td><td><span class="tag tag-cpu">调试</span></td></tr>
-          <tr><td>irq-off</td><td>中断关闭检测：定位长时间关中断代码段</td><td><span class="tag tag-cpu">调试</span></td></tr>
-          <tr><td>num-dist</td><td>数值分布：任意字段的直方图与百分位</td><td><span class="tag tag-trace">统计</span></td></tr>
-          <tr><td>hwstat / llcstat / tlbstat</td><td>硬件计数器：IPC、LLC 命中率、TLB 命中率</td><td><span class="tag tag-cpu">硬件</span></td></tr>
-          <tr><td>breakpoint</td><td>硬件断点：监控指定地址的读写</td><td><span class="tag tag-cpu">调试</span></td></tr>
+          <tr><td><a href="profilers/profile.md">profile</a></td><td data-i18n="pd_profile">CPU 采样：热点函数定位、火焰图，支持内核/用户态</td><td><span class="tag tag-cpu">CPU</span></td></tr>
+          <tr><td><a href="profilers/trace.md">trace</a></td><td data-i18n="pd_trace">通用事件跟踪：打印事件与调用栈，支持 kprobe / uprobe</td><td><span class="tag tag-trace" data-i18n="tag_trace">跟踪</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md">multi-trace</a></td><td data-i18n-html="pd_mt">多事件关系：延迟分析、事件配对、<code>--detail</code> 还原中间细节</td><td><span class="tag tag-sched" data-i18n="tag_latency">延迟</span></td></tr>
+          <tr><td><a href="profilers/top.md">top</a></td><td data-i18n="pd_top">键值聚合统计：按进程/线程/自定义键排序</td><td><span class="tag tag-trace" data-i18n="tag_stat">统计</span></td></tr>
+          <tr><td><a href="profilers/sql.md">sql</a></td><td data-i18n="pd_sql">SQL 聚合查询：基于 SQLite 的灵活事件分析</td><td><span class="tag tag-trace" data-i18n="tag_stat2">统计</span></td></tr>
+          <tr><td><a href="profilers/task-state.md">task-state</a></td><td data-i18n="pd_ts">进程状态监控：R/S/D/T 耗时分布与根因分析</td><td><span class="tag tag-sched" data-i18n="tag_sched">调度</span></td></tr>
+          <tr><td><a href="profilers/oncpu.md">oncpu</a></td><td data-i18n="pd_oncpu">CPU 运行监控：实时显示各 CPU 运行进程及时间</td><td><span class="tag tag-cpu">CPU</span></td></tr>
+          <tr><td><a href="profilers/blktrace.md">blktrace</a></td><td data-i18n="pd_blk">块设备 IO：全生命周期延迟、毛刺检测</td><td><span class="tag tag-io">IO</span></td></tr>
+          <tr><td><a href="profilers/kvm-exit.md">kvm-exit</a></td><td data-i18n="pd_kvm">KVM VM-Exit/Entry 延迟分析与退出原因统计</td><td><span class="tag tag-vm" data-i18n="tag_vm">虚拟化</span></td></tr>
+          <tr><td><a href="profilers/kmemleak.md">kmemleak</a></td><td data-i18n="pd_kml">内存泄漏检测：内核/用户态分配追踪</td><td><span class="tag tag-mem" data-i18n="tag_mem">内存</span></td></tr>
+          <tr><td><a href="profilers/python.md">python</a></td><td data-i18n="pd_py">Python 脚本：自定义脚本处理 perf 事件</td><td><span class="tag tag-trace" data-i18n="tag_script">脚本</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md#syscalls---系统调用耗时分析">syscalls</a></td><td data-i18n="pd_sys">系统调用延迟：完整生命周期分析</td><td><span class="tag tag-sched" data-i18n="tag_latency2">延迟</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md#rundelay---调度延迟分析">rundelay</a></td><td data-i18n="pd_rd">调度延迟：唤醒到实际运行的延迟</td><td><span class="tag tag-sched" data-i18n="tag_sched2">调度</span></td></tr>
+          <tr><td>kmemprof</td><td data-i18n="pd_kmp">内存分配统计：分配器热点与大小分布</td><td><span class="tag tag-mem" data-i18n="tag_mem2">内存</span></td></tr>
+          <tr><td>bpf:kvm_exit</td><td data-i18n="pd_bpfkvm">基于 eBPF 的 KVM 退出事件生成</td><td><span class="tag tag-vm" data-i18n="tag_vm2">虚拟化</span></td></tr>
+          <tr><td>watchdog</td><td data-i18n="pd_wd">硬锁/软锁检测：预测 lockup 并输出内核栈</td><td><span class="tag tag-cpu" data-i18n="tag_debug">调试</span></td></tr>
+          <tr><td>irq-off</td><td data-i18n="pd_irq">中断关闭检测：定位长时间关中断代码段</td><td><span class="tag tag-cpu" data-i18n="tag_debug2">调试</span></td></tr>
+          <tr><td>num-dist</td><td data-i18n="pd_nd">数值分布：任意字段的直方图与百分位</td><td><span class="tag tag-trace" data-i18n="tag_stat3">统计</span></td></tr>
+          <tr><td>hwstat / llcstat / tlbstat</td><td data-i18n="pd_hw">硬件计数器：IPC、LLC 命中率、TLB 命中率</td><td><span class="tag tag-cpu" data-i18n="tag_hw">硬件</span></td></tr>
+          <tr><td>breakpoint</td><td data-i18n="pd_bp">硬件断点：监控指定地址的读写</td><td><span class="tag tag-cpu" data-i18n="tag_debug3">调试</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -282,47 +288,47 @@
 <!-- ====== Problem Guide ====== -->
 <section>
   <div class="wrap">
-    <h2 class="section-title">按问题类型查找</h2>
-    <p class="section-sub">快速定位合适的分析器</p>
+    <h2 class="section-title" data-i18n="guide_title">按问题类型查找</h2>
+    <p class="section-sub" data-i18n="guide_sub">快速定位合适的分析器</p>
     <div class="guide">
       <div class="guide-item">
-        <h4>&#128308; CPU 使用率高</h4>
-        <p>采样热点函数，生成火焰图</p>
+        <h4 data-i18n-html="g1_h">&#128308; CPU 使用率高</h4>
+        <p data-i18n="g1_p">采样热点函数，生成火焰图</p>
         <code>profile</code> <code>oncpu</code> <code>cpu-util</code>
       </div>
       <div class="guide-item">
-        <h4>&#128992; 调度延迟</h4>
-        <p>唤醒 → 运行延迟、进程状态分析</p>
+        <h4 data-i18n-html="g2_h">&#128992; 调度延迟</h4>
+        <p data-i18n="g2_p">唤醒 → 运行延迟、进程状态分析</p>
         <code>multi-trace</code> <code>rundelay</code> <code>task-state</code>
       </div>
       <div class="guide-item">
-        <h4>&#128993; IO 性能</h4>
-        <p>块设备 IO 全链路延迟、毛刺检测</p>
+        <h4 data-i18n-html="g3_h">&#128993; IO 性能</h4>
+        <p data-i18n="g3_p">块设备 IO 全链路延迟、毛刺检测</p>
         <code>blktrace</code>
       </div>
       <div class="guide-item">
-        <h4>&#128995; 内存泄漏</h4>
-        <p>分配/释放配对追踪，泄漏字节统计</p>
+        <h4 data-i18n-html="g4_h">&#128995; 内存泄漏</h4>
+        <p data-i18n="g4_p">分配/释放配对追踪，泄漏字节统计</p>
         <code>kmemleak</code> <code>kmemprof</code> <code>page-faults</code>
       </div>
       <div class="guide-item">
-        <h4>&#128309; 虚拟化开销</h4>
-        <p>VM-Exit 延迟与退出原因统计</p>
+        <h4 data-i18n-html="g5_h">&#128309; 虚拟化开销</h4>
+        <p data-i18n="g5_p">VM-Exit 延迟与退出原因统计</p>
         <code>kvm-exit</code> <code>bpf:kvm_exit</code> <code>kvmmmu</code>
       </div>
       <div class="guide-item">
-        <h4>&#11035; 进程 D/S 状态</h4>
-        <p>状态耗时分布与堆栈定位</p>
+        <h4 data-i18n-html="g6_h">&#11035; 进程 D/S 状态</h4>
+        <p data-i18n="g6_p">状态耗时分布与堆栈定位</p>
         <code>task-state</code> <code>syscalls</code>
       </div>
       <div class="guide-item">
-        <h4>&#128312; 系统调用慢</h4>
-        <p>系统调用延迟全链路分析</p>
+        <h4 data-i18n-html="g7_h">&#128312; 系统调用慢</h4>
+        <p data-i18n="g7_p">系统调用延迟全链路分析</p>
         <code>syscalls</code> <code>multi-trace</code>
       </div>
       <div class="guide-item">
-        <h4>&#11036; 事件聚合统计</h4>
-        <p>按维度聚合，Top-N 排序</p>
+        <h4 data-i18n-html="g8_h">&#11036; 事件聚合统计</h4>
+        <p data-i18n="g8_p">按维度聚合，Top-N 排序</p>
         <code>top</code> <code>sql</code> <code>num-dist</code> <code>stat</code>
       </div>
     </div>
@@ -332,57 +338,57 @@
 <!-- ====== Quick Start ====== -->
 <section id="quick-start">
   <div class="wrap">
-    <h2 class="section-title">快速开始</h2>
-    <p class="section-sub">安装构建与常见分析场景示例</p>
+    <h2 class="section-title" data-i18n="qs_title">快速开始</h2>
+    <p class="section-sub" data-i18n="qs_sub">安装构建与常见分析场景示例</p>
     <div class="workflows">
       <div class="wf">
-        <h3>&#9312; 构建安装</h3>
-<pre><code># 安装依赖
-yum install -y xz-devel elfutils-libelf-devel
+        <h3 data-i18n-html="qs1_h">&#9312; 构建安装</h3>
+<pre><code># Install dependencies
+yum install -y xz-devel elfutils-libelf-devel libunwind-devel python3-devel
 
-# 克隆并构建
+# Clone and build
 git clone https://github.com/OpenCloudOS/perf-prof.git
 cd perf-prof &amp;&amp; make</code></pre>
       </div>
       <div class="wf">
-        <h3>&#9313; CPU 热点分析</h3>
-<pre><code># 采样内核态 CPU 热点
+        <h3 data-i18n-html="qs2_h">&#9313; CPU 热点分析</h3>
+<pre><code># Sample kernel CPU hotspots
 perf-prof profile -F 997 -g --exclude-user --than 30
 
-# 生成火焰图
+# Generate flame graph
 perf-prof profile -F 997 -g --flame-graph cpu.folded
 flamegraph.pl cpu.folded.folded &gt; cpu.svg</code></pre>
       </div>
       <div class="wf">
-        <h3>&#9314; 延迟分析</h3>
-<pre><code># 调度延迟 &gt; 4ms，还原中间细节
+        <h3 data-i18n-html="qs3_h">&#9314; 延迟分析</h3>
+<pre><code># Scheduling latency &gt; 4ms, with intermediate details
 perf-prof multi-trace \
   -e sched:sched_wakeup,sched:sched_wakeup_new \
   -e 'sched:sched_switch//key=next_pid/' \
   -k pid --order --than 4ms --detail</code></pre>
       </div>
       <div class="wf">
-        <h3>&#9315; 内存泄漏检测</h3>
-<pre><code># 跟踪 kmalloc/kfree 配对
+        <h3 data-i18n-html="qs4_h">&#9315; 内存泄漏检测</h3>
+<pre><code># Track kmalloc/kfree pairs
 perf-prof kmemleak \
   --alloc "kmem:kmalloc//ptr=ptr/size=bytes_alloc/stack/" \
   --free "kmem:kfree//ptr=ptr/" \
   --order -m 128 -g</code></pre>
       </div>
       <div class="wf">
-        <h3>&#9316; IO 跟踪</h3>
-<pre><code># IO 延迟 &gt; 10ms
+        <h3 data-i18n-html="qs5_h">&#9316; IO 跟踪</h3>
+<pre><code># IO latency &gt; 10ms
 perf-prof blktrace -d /dev/sda -i 1000 --than 10ms
 
-# IO 延迟热图
+# IO latency heatmap
 perf-prof blktrace -d /dev/sda --heatmap io_lat</code></pre>
       </div>
       <div class="wf">
-        <h3>&#9317; 进程状态分析</h3>
-<pre><code># D 状态 &gt; 100ms，带堆栈
+        <h3 data-i18n-html="qs6_h">&#9317; 进程状态分析</h3>
+<pre><code># D state &gt; 100ms, with call stacks
 perf-prof task-state -D --than 100ms -g
 
-# S 状态分析
+# S state analysis
 perf-prof task-state -S -p &lt;pid&gt; --than 50ms -g</code></pre>
       </div>
     </div>
@@ -392,16 +398,218 @@ perf-prof task-state -S -p &lt;pid&gt; --than 50ms -g</code></pre>
 <!-- ====== Footer ====== -->
 <footer>
   <div class="wrap">
-    <p style="margin-bottom:8px"><strong>perf-prof</strong> &mdash; Linux 实时性能分析框架</p>
+    <p style="margin-bottom:8px" data-i18n-html="footer_t"><strong>perf-prof</strong> &mdash; Linux 实时性能分析框架</p>
     <p>
       <a href="https://github.com/OpenCloudOS/perf-prof" target="_blank" rel="noopener">GitHub</a>
       &nbsp;&bull;&nbsp;
-      <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html" target="_blank" rel="noopener">perf_event 文档</a>
+      <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html" target="_blank" rel="noopener" data-i18n="footer_perf">perf_event 文档</a>
       &nbsp;&bull;&nbsp;
-      <a href="https://www.kernel.org/doc/html/latest/trace/events.html" target="_blank" rel="noopener">Tracepoint 文档</a>
+      <a href="https://www.kernel.org/doc/html/latest/trace/events.html" target="_blank" rel="noopener" data-i18n="footer_tp">Tracepoint 文档</a>
     </p>
   </div>
 </footer>
+
+<script>
+var T = {
+  // title
+  title: { zh: 'perf-prof - Linux 实时性能分析框架', en: 'perf-prof - Linux Real-time Performance Analysis Framework' },
+  // hero
+  hero_h1: { zh: '基于 perf_event 的 Linux 系统级分析工具<br>权衡性能与灵活性，兼容旧内核，可长期运行', en: 'Linux System-level Analysis Tool Based on perf_event<br>Balancing performance and flexibility, compatible with legacy kernels, designed for long-running' },
+  badge_c: { zh: 'C 语言', en: 'C Language' },
+  badge_p: { zh: '30+ 分析器', en: '30+ Profilers' },
+  btn_start: { zh: '快速开始', en: 'Quick Start' },
+  btn_profilers: { zh: '分析器一览', en: 'Profilers' },
+  // architecture
+  arch_title: { zh: '架构概览', en: 'Architecture Overview' },
+  arch_sub: { zh: '内核态采样 → 三层过滤器 → 环形缓冲区 → 时序排序 → 分析器实时处理', en: 'Kernel sampling → 3-layer filters → Ring buffer → Time-ordered → Real-time profiler processing' },
+  // design philosophy
+  phil_title: { zh: '设计理念：围绕 Tracepoint 构建分析能力', en: 'Design Philosophy: Building Analysis Around Tracepoints' },
+  phil_sub: { zh: '内核 maintainer 在关键流程上预埋了 tracepoint，理解这些点就是理解内核', en: 'Kernel maintainers embed tracepoints at critical paths — understanding these points is understanding the kernel' },
+  tp_h3: { zh: '&#127919; Tracepoint：内核的观测基础设施', en: '&#127919; Tracepoint: The Kernel\'s Observability Infrastructure' },
+  tp_p1: { zh: '内核 maintainer 在<strong>调度、内存、文件系统、IO、网络</strong>等子系统的关键节点预埋了 tracepoint，每个点标记一个关键的状态转换或决策点。', en: 'Kernel maintainers embed tracepoints at critical nodes in <strong>scheduling, memory, filesystem, IO, networking</strong> subsystems, each marking a key state transition or decision point.' },
+  tp_p2: { zh: '<strong>解决性能问题的本质，就是跟踪和分析 tracepoint 之间的关系</strong> —— 事件的先后顺序、延迟、配对、聚合。', en: '<strong>Solving performance problems is essentially about tracing and analyzing relationships between tracepoints</strong> — ordering, latency, pairing, and aggregation.' },
+  raw_h3: { zh: '&#9888; 原始事件的困境', en: '&#9888; The Raw Event Dilemma' },
+  raw_p: { zh: 'perf、ftrace 可以采集原始 tracepoint 事件，但一秒内就能产生数十万条。<strong>海量原始数据既超出 AI 上下文窗口，也远超人的阅读能力</strong>，靠逐条分析无法定位问题。', en: 'perf and ftrace can collect raw tracepoint events, but hundreds of thousands can be generated per second. <strong>The massive raw data overwhelms both AI context windows and human reading capacity</strong>, making line-by-line analysis impractical.' },
+  sol_h3: { zh: '&#10003; perf-prof 的方案', en: '&#10003; The perf-prof Solution' },
+  sol_p: { zh: '在用户态实时处理事件关系，将海量事件压缩为分析结论：', en: 'Process event relationships in user space in real time, compressing massive events into analytical conclusions:' },
+  sol_li1: { zh: '&#x2022;&ensp;<strong>multi-trace</strong> — tracepoint 之间的延迟与因果', en: '&#x2022;&ensp;<strong>multi-trace</strong> — Latency and causality between tracepoints' },
+  sol_li2: { zh: '&#x2022;&ensp;<strong>top / sql</strong> — 按维度聚合，输出 Top-N', en: '&#x2022;&ensp;<strong>top / sql</strong> — Aggregate by dimensions, output Top-N' },
+  sol_li3: { zh: '&#x2022;&ensp;<strong>task-state</strong> — 调度事件流 → 状态耗时分布', en: '&#x2022;&ensp;<strong>task-state</strong> — Scheduling events → State duration distribution' },
+  sol_li4: { zh: '&#x2022;&ensp;<strong>kmemleak</strong> — 配对 alloc/free，只输出泄漏', en: '&#x2022;&ensp;<strong>kmemleak</strong> — Pair alloc/free, report only leaks' },
+  ai_h3: { zh: '&#129302; AI + perf-prof 协作', en: '&#129302; AI + perf-prof Collaboration' },
+  ai_s1: { zh: 'AI 理解问题', en: 'AI Understands' },
+  ai_s1d: { zh: '选择 tracepoint', en: 'Select tracepoints' },
+  ai_s2: { zh: 'perf-prof 处理', en: 'perf-prof Processes' },
+  ai_s2d: { zh: '过滤、关联、聚合', en: 'Filter, correlate, aggregate' },
+  ai_s3: { zh: '精简结论', en: 'Condensed Results' },
+  ai_s3d: { zh: '延迟分布 / Top-N / 泄漏栈', en: 'Latency dist / Top-N / Leak stacks' },
+  ai_s4: { zh: 'AI 解读定位', en: 'AI Interprets' },
+  ai_s4d: { zh: '上下文可控，结论可达', en: 'Context manageable, conclusions actionable' },
+  ai_p: { zh: 'perf-prof 将数十万条原始事件压缩为数行结论，<strong>比 AI 直接消化原始事件流高效几个数量级。</strong>', en: 'perf-prof compresses hundreds of thousands of raw events into a few lines of conclusions, <strong>orders of magnitude more efficient than AI consuming raw event streams.</strong>' },
+  // features
+  feat_title: { zh: '核心特性', en: 'Core Features' },
+  feat_sub: { zh: '事件在内存中实时处理后直接丢弃，可长期运行，安全可靠', en: 'Events processed in memory in real time then discarded — long-running, safe, and reliable' },
+  f1_h: { zh: '内存中实时处理', en: 'Real-time In-memory Processing' },
+  f1_p: { zh: '采样事件不写文件，处理后直接丢弃。无磁盘瓶颈，适合长期运行。', en: 'Sampled events are never written to disk — processed and discarded. No disk bottleneck, suitable for long-running.' },
+  f2_h: { zh: '广泛兼容性', en: 'Broad Compatibility' },
+  f2_p: { zh: '支持 Linux 3.10+（仅需 perf_event），远低于 BCC/bpftrace 的 4.1+ 要求。', en: 'Supports Linux 3.10+ (only requires perf_event), well below the 4.1+ requirement of BCC/bpftrace.' },
+  f3_h: { zh: '延迟根因分析', en: 'Latency Root Cause Analysis' },
+  f3_p: { zh: 'multi-trace 事件配对与延迟分析，还原中间事件细节。', en: 'multi-trace event pairing and latency analysis, reconstructing intermediate event details.' },
+  f4_h: { zh: '三层过滤 + eBPF', en: '3-Layer Filtering + eBPF' },
+  f4_p: { zh: 'eBPF / trace event / PMU 三层内核态过滤。支持 eBPF 过滤器和 BPF skeleton 分析器。', en: 'eBPF / trace event / PMU three-layer kernel-space filtering. Supports eBPF filters and BPF skeleton profilers.' },
+  f5_h: { zh: '30+ 内建分析器', en: '30+ Built-in Profilers' },
+  f5_p: { zh: '覆盖 CPU、内存、调度、IO、虚拟化等场景，紧急问题直接拼命令。', en: 'Covering CPU, memory, scheduling, IO, virtualization scenarios. Quickly compose commands for urgent issues.' },
+  f6_h: { zh: 'Python 脚本扩展', en: 'Python Scripting' },
+  f6_p: { zh: '事件自动转为 PerfEvent 对象，只需了解字段即可分析，无需编写内核代码。', en: 'Events auto-converted to PerfEvent objects — just understand the fields to start analyzing, no kernel code needed.' },
+  f7_h: { zh: '火焰图 & 热图', en: 'Flame Graphs & Heatmaps' },
+  f7_p: { zh: '内建火焰图折叠栈和延迟热图，一条命令完成可视化。', en: 'Built-in flame graph folded stacks and latency heatmaps — one command for visualization.' },
+  f8_h: { zh: '跨主机联合分析', en: 'Cross-host Joint Analysis' },
+  f8_p: { zh: '通过 virtio-ports / TCP 传播事件，Guest ↔ Host 跨系统联合分析。', en: 'Propagate events via virtio-ports / TCP for Guest ↔ Host cross-system joint analysis.' },
+  f9_h: { zh: 'AI 技能集成', en: 'AI Skill Integration' },
+  f9_p: { zh: '提供 <a href="https://github.com/OpenCloudOS/perf-prof/tree/main/skills/perf-prof">perf-prof skill</a>，AI 自动选择分析器、拼命令、解读结果。', en: 'Provides <a href="https://github.com/OpenCloudOS/perf-prof/tree/main/skills/perf-prof">perf-prof skill</a> — AI automatically selects profilers, composes commands, and interprets results.' },
+  // comparison
+  cmp_title: { zh: '工具定位', en: 'Tool Positioning' },
+  cmp_sub: { zh: '在性能、灵活性、跟踪时效、兼容性之间权衡', en: 'Balancing performance, flexibility, tracing timeliness, and compatibility' },
+  cmp_prio: { zh: 'Linux 跟踪工具优先级', en: 'Linux Tracing Tool Priority' },
+  prio_1: { zh: '性能影响最小，内核态聚合', en: 'Minimal overhead, kernel-space aggregation' },
+  prio_2: { zh: '兼容旧内核，延迟根因分析', en: 'Legacy kernel compatible, latency root cause' },
+  prio_3: { zh: '短时采样，离线分析', en: 'Short sampling, offline analysis' },
+  prio_4n: { zh: '其他', en: 'Others' },
+  prio_4: { zh: '特定场景', en: 'Specific scenarios' },
+  prio_lang: { zh: '类比编程语言：<span style="color:var(--grn)">C/C++/Rust</span> &rsaquo; <span style="color:var(--lk)">JavaScript/TypeScript</span> &rsaquo; <span style="color:var(--ylw)">Python</span> &rsaquo; <span style="color:var(--tx3)">Shell</span>', en: 'Language analogy: <span style="color:var(--grn)">C/C++/Rust</span> &rsaquo; <span style="color:var(--lk)">JavaScript/TypeScript</span> &rsaquo; <span style="color:var(--ylw)">Python</span> &rsaquo; <span style="color:var(--tx3)">Shell</span>' },
+  cmp1_sub: { zh: '类比 C/C++/Rust', en: 'Analogy: C/C++/Rust' },
+  cmp1_l1: { zh: '性能影响最小，内核态聚合', en: 'Minimal overhead, kernel-space aggregation' },
+  cmp1_l2: { zh: '高频事件首选', en: 'Best for high-frequency events' },
+  cmp1_l3: { zh: '需 4.1+ 内核', en: 'Requires kernel 4.1+' },
+  cmp1_l4: { zh: '需掌握 eBPF C 代码细节', en: 'Requires eBPF C code expertise' },
+  cmp2_sub: { zh: '类比 JavaScript/TypeScript', en: 'Analogy: JavaScript/TypeScript' },
+  cmp2_l1: { zh: '兼容 3.10 旧内核', en: 'Compatible with 3.10 legacy kernels' },
+  cmp2_l2: { zh: '延迟根因分析（multi-trace）', en: 'Latency root cause analysis (multi-trace)' },
+  cmp2_l3: { zh: '紧急问题快速拼命令', en: 'Quick command composition for urgent issues' },
+  cmp2_l4: { zh: 'eBPF 过滤器 + BPF 分析器', en: 'eBPF filters + BPF profilers' },
+  cmp2_l5: { zh: 'Python 分析器降低门槛', en: 'Python profiler lowers the barrier' },
+  cmp3_sub: { zh: '类比 Python', en: 'Analogy: Python' },
+  cmp3_l1: { zh: '短时采样后离线分析', en: 'Short sampling then offline analysis' },
+  cmp3_l2: { zh: '无长期运行需求时使用', en: 'Use when no long-running requirement' },
+  cmp3_l3: { zh: '事件写文件，磁盘开销', en: 'Events written to files, disk overhead' },
+  pick1_h: { zh: '&#10095; 优先选 bcc/bpftrace', en: '&#10095; Prefer bcc/bpftrace' },
+  pick1_p: { zh: '性能影响最小化，高频事件内核态聚合，新内核（4.1+）环境', en: 'Minimize overhead, kernel-space aggregation for high-frequency events, kernel 4.1+ environment' },
+  pick2_h: { zh: '&#10095; 选择 perf-prof', en: '&#10095; Choose perf-prof' },
+  pick2_p: { zh: '旧内核（3.10+）且需要性能保障；延迟根因分析；紧急问题快速拼命令', en: 'Legacy kernel (3.10+) with performance requirements; latency root cause analysis; quick command for urgent issues' },
+  pick3_h: { zh: '&#10095; 可以用 perf/ftrace', en: '&#10095; Use perf/ftrace' },
+  pick3_p: { zh: '无长期采样需求，短时采样后离线分析即可', en: 'No long-running requirement, short sampling with offline analysis is sufficient' },
+  // python analyzer
+  py_title: { zh: 'Python 分析器', en: 'Python Profiler' },
+  py_sub: { zh: '降低跟踪分析的门槛，让更多人能分析性能问题', en: 'Lowering the barrier to tracing analysis, enabling more people to analyze performance issues' },
+  py_bcc_h: { zh: 'bcc 的门槛', en: 'bcc Barrier' },
+  py_bcc1: { zh: '&#x2717;&ensp;需掌握 eBPF C 代码（不同 prog 类型参数不同）', en: '&#x2717;&ensp;Must master eBPF C code (different prog types have different params)' },
+  py_bcc2: { zh: '&#x2717;&ensp;需了解不同 prog 可调用的 bpf helper', en: '&#x2717;&ensp;Must understand bpf helpers available to each prog type' },
+  py_bcc3: { zh: '&#x2717;&ensp;需理解 perf_event、tracepoint、kprobe、poll', en: '&#x2717;&ensp;Must understand perf_event, tracepoint, kprobe, poll' },
+  py_bt_h: { zh: 'bpftrace 的门槛', en: 'bpftrace Barrier' },
+  py_bt1: { zh: '&#x2717;&ensp;需学习一套全新的跟踪语言', en: '&#x2717;&ensp;Must learn a completely new tracing language' },
+  py_bt2: { zh: '&#x2717;&ensp;大量新函数需要记忆', en: '&#x2717;&ensp;Many new functions to memorize' },
+  py_bt3: { zh: '&#x2717;&ensp;限制性较大，复杂逻辑难以表达', en: '&#x2717;&ensp;Limited expressiveness, complex logic is hard to implement' },
+  py_pp1: { zh: '&#x2713;&ensp;采样事件自动转换为 PerfEvent 对象', en: '&#x2713;&ensp;Sampled events auto-converted to PerfEvent objects' },
+  py_pp2: { zh: '&#x2713;&ensp;不需要关注如何采样和内核逻辑', en: '&#x2713;&ensp;No need to worry about sampling or kernel internals' },
+  py_pp3: { zh: '&#x2713;&ensp;只需了解事件成员即可开始分析', en: '&#x2713;&ensp;Just understand event fields to start analyzing' },
+  py_pp4: { zh: '&#x2713;&ensp;使用 <code>help</code> 生成模板后修改', en: '&#x2713;&ensp;Use <code>help</code> to generate templates, then customize' },
+  // profiler table
+  prof_title: { zh: '分析器一览', en: 'Profiler Overview' },
+  prof_sub: { zh: '每个分析器都是独立模块，针对特定场景优化', en: 'Each profiler is an independent module optimized for specific scenarios' },
+  th_prof: { zh: '分析器', en: 'Profiler' },
+  th_func: { zh: '功能', en: 'Function' },
+  th_area: { zh: '领域', en: 'Domain' },
+  pd_profile: { zh: 'CPU 采样：热点函数定位、火焰图，支持内核/用户态', en: 'CPU sampling: hotspot identification, flame graphs, kernel/user space' },
+  pd_trace: { zh: '通用事件跟踪：打印事件与调用栈，支持 kprobe / uprobe', en: 'General event tracing: print events & call stacks, supports kprobe / uprobe' },
+  pd_mt: { zh: '多事件关系：延迟分析、事件配对、<code>--detail</code> 还原中间细节', en: 'Multi-event correlation: latency analysis, event pairing, <code>--detail</code> for intermediate details' },
+  pd_top: { zh: '键值聚合统计：按进程/线程/自定义键排序', en: 'Key-value aggregation: sort by process/thread/custom key' },
+  pd_sql: { zh: 'SQL 聚合查询：基于 SQLite 的灵活事件分析', en: 'SQL aggregation: flexible event analysis based on SQLite' },
+  pd_ts: { zh: '进程状态监控：R/S/D/T 耗时分布与根因分析', en: 'Process state monitoring: R/S/D/T duration distribution & root cause' },
+  pd_oncpu: { zh: 'CPU 运行监控：实时显示各 CPU 运行进程及时间', en: 'CPU run monitoring: real-time display of running processes per CPU' },
+  pd_blk: { zh: '块设备 IO：全生命周期延迟、毛刺检测', en: 'Block device IO: full lifecycle latency, spike detection' },
+  pd_kvm: { zh: 'KVM VM-Exit/Entry 延迟分析与退出原因统计', en: 'KVM VM-Exit/Entry latency analysis and exit reason statistics' },
+  pd_kml: { zh: '内存泄漏检测：内核/用户态分配追踪', en: 'Memory leak detection: kernel/user space allocation tracking' },
+  pd_py: { zh: 'Python 脚本：自定义脚本处理 perf 事件', en: 'Python scripting: custom scripts to process perf events' },
+  pd_sys: { zh: '系统调用延迟：完整生命周期分析', en: 'Syscall latency: full lifecycle analysis' },
+  pd_rd: { zh: '调度延迟：唤醒到实际运行的延迟', en: 'Scheduling delay: wakeup to actual run latency' },
+  pd_kmp: { zh: '内存分配统计：分配器热点与大小分布', en: 'Memory allocation stats: allocator hotspots & size distribution' },
+  pd_bpfkvm: { zh: '基于 eBPF 的 KVM 退出事件生成', en: 'eBPF-based KVM exit event generation' },
+  pd_wd: { zh: '硬锁/软锁检测：预测 lockup 并输出内核栈', en: 'Hard/soft lockup detection: predict lockups and dump kernel stacks' },
+  pd_irq: { zh: '中断关闭检测：定位长时间关中断代码段', en: 'IRQ-off detection: locate long interrupt-disabled code sections' },
+  pd_nd: { zh: '数值分布：任意字段的直方图与百分位', en: 'Numeric distribution: histograms & percentiles for any field' },
+  pd_hw: { zh: '硬件计数器：IPC、LLC 命中率、TLB 命中率', en: 'Hardware counters: IPC, LLC hit rate, TLB hit rate' },
+  pd_bp: { zh: '硬件断点：监控指定地址的读写', en: 'Hardware breakpoint: monitor reads/writes at specified addresses' },
+  tag_trace: { zh: '跟踪', en: 'Trace' },
+  tag_latency: { zh: '延迟', en: 'Latency' },
+  tag_latency2: { zh: '延迟', en: 'Latency' },
+  tag_stat: { zh: '统计', en: 'Stats' },
+  tag_stat2: { zh: '统计', en: 'Stats' },
+  tag_stat3: { zh: '统计', en: 'Stats' },
+  tag_sched: { zh: '调度', en: 'Sched' },
+  tag_sched2: { zh: '调度', en: 'Sched' },
+  tag_vm: { zh: '虚拟化', en: 'VM' },
+  tag_vm2: { zh: '虚拟化', en: 'VM' },
+  tag_mem: { zh: '内存', en: 'Memory' },
+  tag_mem2: { zh: '内存', en: 'Memory' },
+  tag_script: { zh: '脚本', en: 'Script' },
+  tag_debug: { zh: '调试', en: 'Debug' },
+  tag_debug2: { zh: '调试', en: 'Debug' },
+  tag_debug3: { zh: '调试', en: 'Debug' },
+  tag_hw: { zh: '硬件', en: 'HW' },
+  // problem guide
+  guide_title: { zh: '按问题类型查找', en: 'Find by Problem Type' },
+  guide_sub: { zh: '快速定位合适的分析器', en: 'Quickly locate the right profiler' },
+  g1_h: { zh: '&#128308; CPU 使用率高', en: '&#128308; High CPU Usage' },
+  g1_p: { zh: '采样热点函数，生成火焰图', en: 'Sample hotspot functions, generate flame graphs' },
+  g2_h: { zh: '&#128992; 调度延迟', en: '&#128992; Scheduling Latency' },
+  g2_p: { zh: '唤醒 → 运行延迟、进程状态分析', en: 'Wakeup → run latency, process state analysis' },
+  g3_h: { zh: '&#128993; IO 性能', en: '&#128993; IO Performance' },
+  g3_p: { zh: '块设备 IO 全链路延迟、毛刺检测', en: 'Block device IO full-path latency, spike detection' },
+  g4_h: { zh: '&#128995; 内存泄漏', en: '&#128995; Memory Leak' },
+  g4_p: { zh: '分配/释放配对追踪，泄漏字节统计', en: 'Alloc/free pair tracking, leaked bytes statistics' },
+  g5_h: { zh: '&#128309; 虚拟化开销', en: '&#128309; Virtualization Overhead' },
+  g5_p: { zh: 'VM-Exit 延迟与退出原因统计', en: 'VM-Exit latency and exit reason statistics' },
+  g6_h: { zh: '&#11035; 进程 D/S 状态', en: '&#11035; Process D/S State' },
+  g6_p: { zh: '状态耗时分布与堆栈定位', en: 'State duration distribution and stack trace location' },
+  g7_h: { zh: '&#128312; 系统调用慢', en: '&#128312; Slow Syscalls' },
+  g7_p: { zh: '系统调用延迟全链路分析', en: 'Syscall latency full-path analysis' },
+  g8_h: { zh: '&#11036; 事件聚合统计', en: '&#11036; Event Aggregation' },
+  g8_p: { zh: '按维度聚合，Top-N 排序', en: 'Aggregate by dimension, Top-N sorting' },
+  // quick start
+  qs_title: { zh: '快速开始', en: 'Quick Start' },
+  qs_sub: { zh: '安装构建与常见分析场景示例', en: 'Installation and common analysis scenario examples' },
+  qs1_h: { zh: '&#9312; 构建安装', en: '&#9312; Build & Install' },
+  qs2_h: { zh: '&#9313; CPU 热点分析', en: '&#9313; CPU Hotspot Analysis' },
+  qs3_h: { zh: '&#9314; 延迟分析', en: '&#9314; Latency Analysis' },
+  qs4_h: { zh: '&#9315; 内存泄漏检测', en: '&#9315; Memory Leak Detection' },
+  qs5_h: { zh: '&#9316; IO 跟踪', en: '&#9316; IO Tracing' },
+  qs6_h: { zh: '&#9317; 进程状态分析', en: '&#9317; Process State Analysis' },
+  // footer
+  footer_t: { zh: '<strong>perf-prof</strong> &mdash; Linux 实时性能分析框架', en: '<strong>perf-prof</strong> &mdash; Linux Real-time Performance Analysis Framework' },
+  footer_perf: { zh: 'perf_event 文档', en: 'perf_event Docs' },
+  footer_tp: { zh: 'Tracepoint 文档', en: 'Tracepoint Docs' }
+};
+
+var curLang = localStorage.getItem('pp_lang') || ((navigator.language || '').startsWith('zh') ? 'zh' : 'en');
+
+function setLang(lang) {
+  curLang = lang;
+  localStorage.setItem('pp_lang', lang);
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.getElementById('langEn').className = 'lang-btn' + (lang === 'en' ? ' active' : '');
+  document.getElementById('langZh').className = 'lang-btn' + (lang === 'zh' ? ' active' : '');
+  document.querySelectorAll('[data-i18n]').forEach(function(el) {
+    var k = el.getAttribute('data-i18n');
+    if (T[k]) el.textContent = T[k][lang];
+  });
+  document.querySelectorAll('[data-i18n-html]').forEach(function(el) {
+    var k = el.getAttribute('data-i18n-html');
+    if (T[k]) el.innerHTML = T[k][lang];
+  });
+}
+
+setLang(curLang);
+</script>
 
 </body>
 </html>

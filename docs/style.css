@@ -15,6 +15,11 @@ code{font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;fon
 pre{background:var(--code);border:1px solid var(--bd);border-radius:10px;padding:20px 22px;overflow-x:auto;margin:16px 0;line-height:1.6}
 pre code{background:0 0;border:0;padding:0;font-size:.88em;color:var(--tx)}
 
+/* ---- Language toggle ---- */
+.lang-toggle{position:fixed;top:16px;right:24px;z-index:100;display:flex;border-radius:20px;border:1px solid var(--bd);background:var(--bg);overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--tx3);font-size:13px;font-weight:600;cursor:pointer;transition:all .2s}
+.lang-btn.active{background:var(--ac);color:#fff}
+
 /* ---- Hero ---- */
 .hero{padding:60px 0 48px;text-align:center;position:relative;overflow:hidden;background:linear-gradient(180deg,#f0f6ff 0%,#ffffff 100%)}
 .hero::before{content:'';position:absolute;top:-120px;left:50%;transform:translateX(-50%);width:800px;height:500px;background:radial-gradient(ellipse,rgba(9,105,218,.07) 0%,transparent 70%);pointer-events:none}
@@ -37,7 +42,7 @@ pre code{background:0 0;border:0;padding:0;font-size:.88em;color:var(--tx)}
 section{padding:56px 0}
 section:nth-child(even){background:var(--bg2)}
 .section-title{font-size:28px;font-weight:700;margin-bottom:10px;color:var(--tx)}
-.section-sub{color:var(--tx2);font-size:16px;margin-bottom:36px;max-width:640px}
+.section-sub{color:var(--tx2);font-size:16px;margin-bottom:36px;max-width:900px}
 
 /* ---- Framework image ---- */
 .framework-img{margin:32px 0;text-align:center}
@@ -104,8 +109,9 @@ td:first-child{font-weight:600;white-space:nowrap;color:var(--lk)}
 .card li{padding:4px 0}
 
 /* ---- Flow bar ---- */
-.flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;font-size:15px}
-.flow-step{background:var(--bg2);border:1px solid var(--bd);padding:14px 20px;text-align:center;min-width:140px;display:flex;flex-direction:column;justify-content:center}
+.flow{display:flex;align-items:stretch;gap:0;flex-wrap:nowrap;font-size:15px;overflow-x:auto}
+.flow-step{background:var(--bg2);border:1px solid var(--bd);padding:14px 16px;text-align:center;min-width:0;display:flex;flex-direction:column;justify-content:center}
+html[lang="en"] .flow-step{flex:1}
 .flow-step:first-child{border-radius:8px 0 0 8px}
 .flow-step:last-child{border-radius:0 8px 8px 0}
 .flow-step.accent{background:#f0f6ff;border-color:var(--ac)}
