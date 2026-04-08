@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="256" height="256">
+  <!-- 金黄色六边形背景 -->
+  <polygon points="32,4 55.3,17.5 55.3,46.5 32,60 8.7,46.5 8.7,17.5" fill="#E8A735"/>
+
+  <!-- 白色圆角横条，按2.png样式 -->
+  <g fill="#ffffff">
+    <!-- 第1行：宽20 居中 -->
+    <rect x="22" y="18" width="20" height="4" rx="2"/>
+
+    <!-- 第2行：宽30，断开偏左 -->
+    <rect x="17" y="24.5" width="10" height="4" rx="2"/>
+    <rect x="30" y="24.5" width="17" height="4" rx="2"/>
+
+    <!-- 第3行：宽36 -->
+    <rect x="14" y="31" width="36" height="4" rx="2"/>
+
+    <!-- 第4行：宽30，断开 -->
+    <rect x="17" y="37.5" width="17" height="4" rx="2"/>
+    <rect x="37" y="37.5" width="10" height="4" rx="2"/>
+
+    <!-- 第5行：宽20 居中 -->
+    <rect x="22" y="44" width="20" height="4" rx="2"/>
+  </g>
+</svg>
