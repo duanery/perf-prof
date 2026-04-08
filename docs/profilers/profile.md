@@ -1,8 +1,3 @@
----
-layout: default
-title: "profile - CPU采样分析"
----
-
 # profile - CPU采样分析器
 以指定频率对CPU进行采样，分析CPU利用率高的问题，定位内核态/用户态的热点函数。
 

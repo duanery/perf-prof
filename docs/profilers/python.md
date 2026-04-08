@@ -1,8 +1,3 @@
----
-layout: default
-title: "python - 脚本分析"
----
-
 # python - Python脚本事件处理
 使用Python脚本或模块处理perf事件，将事件转换为PerfEvent对象进行灵活分析。
 

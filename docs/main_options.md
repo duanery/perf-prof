@@ -1,8 +1,3 @@
----
-layout: default
-title: "选项参数"
----
-
 # perf-prof 选项参数
 
 perf-prof 工具提供了丰富的选项参数，用于控制分析器的行为和输出格式。

@@ -1,8 +1,3 @@
----
-layout: default
-title: "事件过滤"
----
-
 5. Event filtering
 ==================
 

@@ -1,12 +1,1 @@
 theme: jekyll-theme-architect
-title: perf-prof
-description: "Linux 性能分析工具 — 基于 perf_event 的实时事件分析框架"
-baseurl: "/perf-prof"
-url: "https://opencloudos.github.io"
-
-exclude:
-  # 仓库内的非文档文件
-  - "VALGRIND_INTEGRATION.md"
-  - "images.pptx"
-  - "malloc_hook.c"
-  - "perf-prof User Guide.pdf"

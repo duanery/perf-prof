@@ -1,8 +1,3 @@
----
-layout: default
-title: "task-state - 进程状态"
----
-
 # task-state - 进程状态耗时分析
 
 task-state用来跟踪整个系统或进程状态（`R,S,D,T,t,I,RD`）的耗时分布。

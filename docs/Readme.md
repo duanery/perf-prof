@@ -1,8 +1,3 @@
----
-layout: default
-title: "基础框架"
----
-
 # 基础框架
 
 ![perf-prof框架](images/perf-prof_framework.png)

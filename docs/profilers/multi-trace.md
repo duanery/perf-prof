@@ -1,8 +1,3 @@
----
-layout: default
-title: "multi-trace - 多事件分析"
----
-
 # multi-trace - 多事件关系分析
 
 multi-trace是一个基于key关联的多事件关系分析工具，通过时间排序和状态管理实现复杂事件链的延迟分析和配对跟踪。
