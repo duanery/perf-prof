@@ -1,3 +1,8 @@
+---
+layout: default
+title: "top - 键值统计"
+---
+
 # top - 键值统计
 
 top分析器是一个多维度键值统计工具，通过采样事件，构建(key, [values], name)统计矩阵，并按指定列排序显示。

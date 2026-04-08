@@ -1,3 +1,8 @@
+---
+layout: default
+title: "kmemleak 概述"
+---
+
 # kmemleak
 
 分析内存泄露，一般内存分配至少需要alloc和free两个接口。内存泄露，alloc之后永远不释放。

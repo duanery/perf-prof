@@ -1,3 +1,8 @@
+---
+layout: default
+title: "watchdog"
+---
+
 # watchdog
 
 监控hard、soft lockup的情况，在将要发生时，预先打印出内核栈。

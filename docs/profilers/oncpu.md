@@ -1,3 +1,8 @@
+---
+layout: default
+title: "oncpu - CPU监控"
+---
+
 # oncpu - CPU运行进程监控
 实时监控在CPU上运行的进程及其运行时间统计。
 

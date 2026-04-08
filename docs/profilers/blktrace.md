@@ -1,3 +1,8 @@
+---
+layout: default
+title: "blktrace - IO跟踪"
+---
+
 # blktrace - 块设备IO延迟跟踪
 跟踪块设备上的IO延迟，分析从IO请求创建到完成的整个生命周期。
 

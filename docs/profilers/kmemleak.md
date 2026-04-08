@@ -1,3 +1,8 @@
+---
+layout: default
+title: "kmemleak - 内存泄漏"
+---
+
 # kmemleak - 内存泄漏分析器
 用于检测用户态和内核态内存分配器的内存泄漏问题。
 

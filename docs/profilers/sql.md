@@ -1,3 +1,8 @@
+---
+layout: default
+title: "sql - SQL聚合分析"
+---
+
 # sql - SQL聚合分析
 
 将采样事件存储为SQL表并执行聚合查询分析。

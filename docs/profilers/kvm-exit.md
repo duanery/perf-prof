@@ -1,3 +1,8 @@
+---
+layout: default
+title: "kvm-exit - KVM分析"
+---
+
 # kvm-exit - KVM虚拟化退出延迟分析
 
 kvm-exit 统计从虚拟机退出(VM-Exit)到重新进入(VM-Entry)之间的延迟，用于分析虚拟化性能开销。

@@ -1,3 +1,8 @@
+---
+layout: default
+title: "perf 时钟转换"
+---
+
 # perf clock convert to guest clock
 
 在虚拟化场景，经常需要同时跟踪，host发生的事件和guest发生的事件。但由于kvm模块存在tsc-offset、tsc-scaling，host事件和guest事件的时间戳是不对应的。
