@@ -253,19 +253,19 @@
       <table>
         <thead><tr><th>分析器</th><th>功能</th><th>领域</th></tr></thead>
         <tbody>
-          <tr><td>profile</td><td>CPU 采样：热点函数定位、火焰图，支持内核/用户态</td><td><span class="tag tag-cpu">CPU</span></td></tr>
-          <tr><td>trace</td><td>通用事件跟踪：打印事件与调用栈，支持 kprobe / uprobe</td><td><span class="tag tag-trace">跟踪</span></td></tr>
-          <tr><td>multi-trace</td><td>多事件关系：延迟分析、事件配对、<code>--detail</code> 还原中间细节</td><td><span class="tag tag-sched">延迟</span></td></tr>
-          <tr><td>top</td><td>键值聚合统计：按进程/线程/自定义键排序</td><td><span class="tag tag-trace">统计</span></td></tr>
-          <tr><td>sql</td><td>SQL 聚合查询：基于 SQLite 的灵活事件分析</td><td><span class="tag tag-trace">统计</span></td></tr>
-          <tr><td>task-state</td><td>进程状态监控：R/S/D/T 耗时分布与根因分析</td><td><span class="tag tag-sched">调度</span></td></tr>
-          <tr><td>oncpu</td><td>CPU 运行监控：实时显示各 CPU 运行进程及时间</td><td><span class="tag tag-cpu">CPU</span></td></tr>
-          <tr><td>blktrace</td><td>块设备 IO：全生命周期延迟、毛刺检测</td><td><span class="tag tag-io">IO</span></td></tr>
-          <tr><td>kvm-exit</td><td>KVM VM-Exit/Entry 延迟分析与退出原因统计</td><td><span class="tag tag-vm">虚拟化</span></td></tr>
-          <tr><td>kmemleak</td><td>内存泄漏检测：内核/用户态分配追踪</td><td><span class="tag tag-mem">内存</span></td></tr>
-          <tr><td>python</td><td>Python 脚本：自定义脚本处理 perf 事件</td><td><span class="tag tag-trace">脚本</span></td></tr>
-          <tr><td>syscalls</td><td>系统调用延迟：完整生命周期分析</td><td><span class="tag tag-sched">延迟</span></td></tr>
-          <tr><td>rundelay</td><td>调度延迟：唤醒到实际运行的延迟</td><td><span class="tag tag-sched">调度</span></td></tr>
+          <tr><td><a href="profilers/profile.md">profile</a></td><td>CPU 采样：热点函数定位、火焰图，支持内核/用户态</td><td><span class="tag tag-cpu">CPU</span></td></tr>
+          <tr><td><a href="profilers/trace.md">trace</a></td><td>通用事件跟踪：打印事件与调用栈，支持 kprobe / uprobe</td><td><span class="tag tag-trace">跟踪</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md">multi-trace</a></td><td>多事件关系：延迟分析、事件配对、<code>--detail</code> 还原中间细节</td><td><span class="tag tag-sched">延迟</span></td></tr>
+          <tr><td><a href="profilers/top.md">top</a></td><td>键值聚合统计：按进程/线程/自定义键排序</td><td><span class="tag tag-trace">统计</span></td></tr>
+          <tr><td><a href="profilers/sql.md">sql</a></td><td>SQL 聚合查询：基于 SQLite 的灵活事件分析</td><td><span class="tag tag-trace">统计</span></td></tr>
+          <tr><td><a href="profilers/task-state.md">task-state</a></td><td>进程状态监控：R/S/D/T 耗时分布与根因分析</td><td><span class="tag tag-sched">调度</span></td></tr>
+          <tr><td><a href="profilers/oncpu.md">oncpu</a></td><td>CPU 运行监控：实时显示各 CPU 运行进程及时间</td><td><span class="tag tag-cpu">CPU</span></td></tr>
+          <tr><td><a href="profilers/blktrace.md">blktrace</a></td><td>块设备 IO：全生命周期延迟、毛刺检测</td><td><span class="tag tag-io">IO</span></td></tr>
+          <tr><td><a href="profilers/kvm-exit.md">kvm-exit</a></td><td>KVM VM-Exit/Entry 延迟分析与退出原因统计</td><td><span class="tag tag-vm">虚拟化</span></td></tr>
+          <tr><td><a href="profilers/kmemleak.md">kmemleak</a></td><td>内存泄漏检测：内核/用户态分配追踪</td><td><span class="tag tag-mem">内存</span></td></tr>
+          <tr><td><a href="profilers/python.md">python</a></td><td>Python 脚本：自定义脚本处理 perf 事件</td><td><span class="tag tag-trace">脚本</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md#syscalls---系统调用耗时分析">syscalls</a></td><td>系统调用延迟：完整生命周期分析</td><td><span class="tag tag-sched">延迟</span></td></tr>
+          <tr><td><a href="profilers/multi-trace.md#rundelay---调度延迟分析">rundelay</a></td><td>调度延迟：唤醒到实际运行的延迟</td><td><span class="tag tag-sched">调度</span></td></tr>
           <tr><td>kmemprof</td><td>内存分配统计：分配器热点与大小分布</td><td><span class="tag tag-mem">内存</span></td></tr>
           <tr><td>bpf:kvm_exit</td><td>基于 eBPF 的 KVM 退出事件生成</td><td><span class="tag tag-vm">虚拟化</span></td></tr>
           <tr><td>watchdog</td><td>硬锁/软锁检测：预测 lockup 并输出内核栈</td><td><span class="tag tag-cpu">调试</span></td></tr>
