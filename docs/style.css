@@ -75,7 +75,7 @@ td:first-child{font-weight:600;white-space:nowrap;color:var(--lk)}
 
 /* ---- Workflow ---- */
 .workflows{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
-.wf{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:24px;transition:border-color .2s}
+.wf{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:24px;transition:border-color .2s;min-width:0;overflow:hidden}
 .wf:hover{border-color:var(--ac)}
 .wf h3{font-size:16px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px;color:var(--tx)}
 .wf pre{margin:0;font-size:.85em;border-radius:8px}
