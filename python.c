@@ -2437,6 +2437,8 @@ static void python_script_exit(struct python_ctx *ctx)
      * commit 78a6066 "tep: Add refcount for source_dev to control release order"),
      * guaranteeing it outlives the tp that references it.
      */
+    if (!ctx->tp_list)
+        goto skip_dev_tp;
     for_each_dev_tp(ctx->tp_list, tp, i) {
         struct prof_dev *source_dev = tp->source_dev;
         struct perf_evlist *evlist;
@@ -2456,6 +2458,7 @@ static void python_script_exit(struct python_ctx *ctx)
             }
         }
     }
+skip_dev_tp:
 
     /* Free common key cache */
     free_key_cache(&ctx->key_cache);
