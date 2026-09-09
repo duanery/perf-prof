@@ -145,14 +145,6 @@ $(OUTPUT)%-flex.o: $(OUTPUT)%-flex.c FORCE
 	$(call rule_mkdir)
 	$(call if_changed_dep,$(host)cc_o_c)
 
-$(OUTPUT)%.bpf.o: %.bpf.c $(dir)/vmlinux.h FORCE
-	$(call rule_mkdir)
-	$(call if_changed_dep,bpf_o_c)
-
-$(OUTPUT)%.skel.h: %.bpf.o FORCE
-	$(call rule_mkdir)
-	$(call if_changed,bpf_skel_h)
-
 $(dir)/vmlinux.h: /sys/kernel/btf/vmlinux FORCE
 	$(call rule_mkdir)
 	$(call if_changed,vmlinux_h)
@@ -173,8 +165,54 @@ subdir-obj-y := $(addprefix $(objprefix),$(subdir-obj-y))
 
 # Final '$(obj)-in.o' object
 in-target := $(objprefix)$(obj)-in.o
-bpf-target := $(patsubst %.skel.h, %.bpf.o, $(filter %.skel.h,$(obj-y)))
+skel-target := $(filter %.skel.h,$(obj-y))
+# A .bpf.o normally comes from a declared .skel.h, but Makefile.config's BPF
+# slot check builds src/bpf-skel/slot_check.bpf.o as a direct goal and lists
+# it in no Build file. Pick it up from $(MAKECMDGOALS) as well, or the static
+# pattern rule below would not cover it and it would fall through to the
+# generic '%.o: %.c' rule -- compiled by $(CC) instead of $(CLANG), failing on
+# '#include "vmlinux.h"' and silently degrading the probe to its fallback.
+bpf-target := $(sort $(patsubst %.skel.h, %.bpf.o, $(skel-target)) \
+                     $(filter %.bpf.o,$(MAKECMDGOALS)))
 vmlinux-target := $(if $(bpf-target), $(dir)/vmlinux.h)
+
+# Static pattern rules, so they only ever apply to the .bpf.o / .skel.h that
+# this directory's Build file declares.
+#
+# They used to be plain pattern rules ('$(OUTPUT)%.skel.h: %.bpf.o'), which
+# are global: make tries them against any file it has to evaluate, whether or
+# not that file is in this directory's $(obj-y). And 'include $(cmd_files)'
+# below pulls in fixdep's header lists, one of which reads
+#
+#     src/bpf_kvm_exit.o: ... src/bpf-skel/kvm_exit.skel.h ...
+#
+# so in the dir=./src instance that .skel.h became a prerequisite make had to
+# evaluate. It has no explicit rule there, the pattern matched ('%' spans '/',
+# giving %=src/bpf-skel/kvm_exit), and that instance rebuilt the skeleton
+# itself instead of leaving it to the sub-make -- every BPF/GEN-SKL ran twice.
+# The chained $(dir)/vmlinux.h prerequisite was resolved against the *parent's*
+# $(dir), so it also dumped a stray src/vmlinux.h that nothing includes.
+#
+# With the static form, skel-target is empty in dir=./src, no rule matches the
+# skeleton, and make treats it as a plain existing file: mtime only.
+$(bpf-target): $(objprefix)%.bpf.o: $(dir)/%.bpf.c $(vmlinux-target) FORCE
+	$(call rule_mkdir)
+	$(call if_changed_dep,bpf_o_c)
+
+$(skel-target): $(objprefix)%.skel.h: $(objprefix)%.bpf.o FORCE
+	$(call rule_mkdir)
+	$(call if_changed,bpf_skel_h)
+
+# A generated skeleton header has no dependency edge to the objects that
+# #include it -- being listed earlier in the same Build file only happens
+# to work under -j1. Order every compile here after the skeletons of this
+# directory and after every subdirectory, which may generate headers too.
+#
+# Order-only ('|') on purpose: a normal prerequisite would land in $?, which
+# if_changed_dep tests, and rebuild every object whenever a skeleton is
+# regenerated. Ordering is all that is needed -- once the header exists,
+# fixdep has recorded the real content dependency in the .cmd file.
+$(filter-out $(subdir-obj-y),$(filter %.o,$(obj-y))): | $(skel-target) $(subdir-y)
 
 # $(bpf-target) and $(vmlinux-target) are not intermediate file
 .PRECIOUS: $(bpf-target) $(vmlinux-target)
