@@ -14,6 +14,7 @@
 #include <stack_helpers.h>
 #include <latency_helpers.h>
 #include <tp_struct.h>
+#include <time.h>
 
 #define TASK_RUNNING		0
 #define TASK_INTERRUPTIBLE	1
@@ -171,6 +172,7 @@ static struct rb_node *task_state_node_new(struct rblist *rlist, const void *new
     struct task_state_node *b = malloc(sizeof(*b));
     if (b) {
         b->pid = -1;
+        b->state = 0;
         b->time = 0;
         b->event = NULL;
         RB_CLEAR_NODE(&b->rbnode);
@@ -623,8 +625,33 @@ static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
 
     tmp.pid = pid;
     rbn = rblist__find(&ctx->task_states, &tmp);
-    if (rbn)
+    if (rbn) {
+        struct task_state_node *task = rb_entry(rbn, struct task_state_node, rbnode);
+        int state = task->pid != -1 ? (task->state & ctx->task_report) : 0;
+
+        /*
+         * The last sched_wakeup of the dying thread may still be queued
+         * in the order window and will be processed after this node is
+         * removed, losing its pending S/D/T/t/I latency. Account it now,
+         * using the del time as the end. The event timestamps live in
+         * the perf clock domain (not necessarily CLOCK_MONOTONIC), so
+         * convert the node time to realtime via evclock_to_realtime_ns()
+         * and compare it against CLOCK_REALTIME. Negative deltas are
+         * clamped to 0.
+         */
+        if (state) {
+            struct timespec ts;
+            evclock_t evtime = {.clock = task->time};
+            u64 start, end, delta;
+
+            clock_gettime(CLOCK_REALTIME, &ts);
+            end = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+            start = evclock_to_realtime_ns(dev, evtime);
+            delta = end > start ? end - start : 0;
+            latency_dist_input(ctx->lat_dist, task->pid, state, delta, dev->env->greater_than);
+        }
         rblist__remove_node(&ctx->task_states, rbn);
+    }
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
