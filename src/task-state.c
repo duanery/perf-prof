@@ -68,6 +68,20 @@
 #define TASK_REPORT_IDLE  0x80 // kernel 4.14 and later.
 #define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 
+/*
+ * Tombstones: recently deleted threads. Their tail events (the exit
+ * ptrace-stop, the release wakeup and the dead switch) are still queued
+ * in the order window when del_thread() runs. Keep the pid tracked until
+ * the order window has drained them, so the precise S latency and the
+ * tail R/t can be accounted. Tombstones expire after one -i interval.
+ */
+struct task_state_tombstone {
+    int pid;
+    u64 del_time; // CLOCK_REALTIME ns
+};
+
+#define TOMBSTONE_MAX 64
+
 struct task_state_ctx {
     struct callchain_ctx *cc;
     struct flame_graph *flame;
@@ -109,6 +123,10 @@ struct task_state_ctx {
         u64 freed;
         u64 mem_bytes;
     } stat;
+
+    // tombstones
+    struct task_state_tombstone tombstones[TOMBSTONE_MAX];
+    int nr_tombstones;
 };
 
 struct task_state_node {
@@ -444,13 +462,19 @@ failed:
     return -1;
 }
 
+static int task_state_tombstone_find(struct task_state_ctx *ctx, int pid);
+static void task_state_tombstone_del(struct task_state_ctx *ctx, int idx);
+
 static int task_state_tracked(struct task_state_ctx *ctx, int pid)
 {
     if (!ctx->thread_map || !ctx->dynamic_threads)
         return 1;
     if (pid <= 0)
         return 0;
-    return perf_thread_map__idx(ctx->thread_map, pid) >= 0;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return 1;
+    /* The pid was deleted recently, its tail events are still in flight. */
+    return task_state_tombstone_find(ctx, pid) >= 0;
 }
 
 static int task_state_filter(struct prof_dev *dev)
@@ -577,6 +601,23 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
     if (task_state_threads_cow(ctx) < 0)
         return -1;
 
+    /*
+     * The pid may be reused by a new thread while its tombstone is still
+     * alive. Drop the tombstone and any leftover node of the old thread,
+     * otherwise the new thread would reuse the stale state machine.
+     */
+    {
+        int t = task_state_tombstone_find(ctx, pid);
+        if (t >= 0) {
+            struct task_state_node tmp = {.pid = pid};
+            struct rb_node *rbn = rblist__find(&ctx->task_states, &tmp);
+
+            if (rbn)
+                rblist__remove_node(&ctx->task_states, rbn);
+            task_state_tombstone_del(ctx, t);
+        }
+    }
+
     threads = ctx->thread_map;
     for (i = 0; i < threads->nr; i++) {
         if (threads->map[i].pid == PERF_THREAD_MAP_HOLE)
@@ -603,11 +644,98 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
     return task_state_filter(dev);
 }
 
-static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
+static int task_state_tombstone_find(struct task_state_ctx *ctx, int pid)
+{
+    int i;
+
+    for (i = 0; i < ctx->nr_tombstones; i++) {
+        if (ctx->tombstones[i].pid == pid)
+            return i;
+    }
+    return -1;
+}
+
+static void task_state_tombstone_add(struct task_state_ctx *ctx, int pid)
+{
+    struct timespec ts;
+    int slot;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    if (ctx->nr_tombstones < TOMBSTONE_MAX)
+        slot = ctx->nr_tombstones++;
+    else
+        slot = 0; // full: overwrite the oldest one, it should have expired.
+    ctx->tombstones[slot].pid = pid;
+    ctx->tombstones[slot].del_time = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+}
+
+static void task_state_tombstone_del(struct task_state_ctx *ctx, int idx)
+{
+    ctx->tombstones[idx] = ctx->tombstones[--ctx->nr_tombstones];
+}
+
+/*
+ * Force-settle a node whose thread is gone: account the pending
+ * S/D/T/t/I latency and remove the node. Used when a tombstone expires
+ * (tail events lost) and when a pid is reused.
+ */
+static void task_state_settle_node(struct prof_dev *dev, int pid)
 {
     struct task_state_ctx *ctx = dev->private;
     struct task_state_node tmp;
     struct rb_node *rbn;
+
+    tmp.pid = pid;
+    rbn = rblist__find(&ctx->task_states, &tmp);
+    if (rbn) {
+        struct task_state_node *task = rb_entry(rbn, struct task_state_node, rbnode);
+        int state = task->pid != -1 ? (task->state & ctx->task_report) : 0;
+
+        if (state) {
+            struct timespec ts;
+            evclock_t evtime = {.clock = task->time};
+            u64 start, end, delta;
+
+            clock_gettime(CLOCK_REALTIME, &ts);
+            end = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+            start = evclock_to_realtime_ns(dev, evtime);
+            delta = end > start ? end - start : 0;
+            latency_dist_input(ctx->lat_dist, task->pid, state, delta, dev->env->greater_than);
+        }
+        rblist__remove_node(&ctx->task_states, rbn);
+    }
+}
+
+/*
+ * Expire tombstones: after one -i interval the order window has drained
+ * all queued events of the deleted thread. If its node is still pending
+ * (tail events lost, e.g. ring buffer overrun), settle it now.
+ */
+static void task_state_tombstone_expire(struct prof_dev *dev)
+{
+    struct task_state_ctx *ctx = dev->private;
+    struct timespec ts;
+    u64 now;
+    int i;
+
+    if (ctx->nr_tombstones == 0)
+        return;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    now = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+
+    for (i = 0; i < ctx->nr_tombstones; ) {
+        if (now - ctx->tombstones[i].del_time > (u64)dev->env->interval * NSEC_PER_MSEC) {
+            task_state_settle_node(dev, ctx->tombstones[i].pid);
+            task_state_tombstone_del(ctx, i);
+        } else
+            i++;
+    }
+}
+
+static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct task_state_ctx *ctx = dev->private;
     int i;
 
     if (!ctx->thread_map || pid < 0)
@@ -623,35 +751,15 @@ static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
     ctx->thread_map->map[i].cgroup = 0;
     ctx->thread_map->map[i].pid = PERF_THREAD_MAP_HOLE;
 
-    tmp.pid = pid;
-    rbn = rblist__find(&ctx->task_states, &tmp);
-    if (rbn) {
-        struct task_state_node *task = rb_entry(rbn, struct task_state_node, rbnode);
-        int state = task->pid != -1 ? (task->state & ctx->task_report) : 0;
-
-        /*
-         * The last sched_wakeup of the dying thread may still be queued
-         * in the order window and will be processed after this node is
-         * removed, losing its pending S/D/T/t/I latency. Account it now,
-         * using the del time as the end. The event timestamps live in
-         * the perf clock domain (not necessarily CLOCK_MONOTONIC), so
-         * convert the node time to realtime via evclock_to_realtime_ns()
-         * and compare it against CLOCK_REALTIME. Negative deltas are
-         * clamped to 0.
-         */
-        if (state) {
-            struct timespec ts;
-            evclock_t evtime = {.clock = task->time};
-            u64 start, end, delta;
-
-            clock_gettime(CLOCK_REALTIME, &ts);
-            end = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
-            start = evclock_to_realtime_ns(dev, evtime);
-            delta = end > start ? end - start : 0;
-            latency_dist_input(ctx->lat_dist, task->pid, state, delta, dev->env->greater_than);
-        }
-        rblist__remove_node(&ctx->task_states, rbn);
-    }
+    /*
+     * Tombstone the dying thread: its tail events (the exit ptrace-stop,
+     * the release wakeup and the dead switch) are still queued in the
+     * order window. Keep the pid tracked (see task_state_tracked()) and
+     * keep the task_state_node, so the precise S latency and the tail
+     * R/t are accounted and the node is removed by the dead switch.
+     * task_state_tombstone_expire() settles anything left over.
+     */
+    task_state_tombstone_add(ctx, pid);
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
@@ -713,6 +821,8 @@ static void task_state_interval(struct prof_dev *dev)
 {
     struct task_state_ctx *ctx = dev->private;
 
+    task_state_tombstone_expire(dev);
+
     if (!prof_dev_at_top(dev))
         return;
 
@@ -737,7 +847,15 @@ static void task_state_interval(struct prof_dev *dev)
 
 static void task_state_deinit(struct prof_dev *dev)
 {
+    struct task_state_ctx *ctx = dev->private;
+    int i;
+
     task_state_interval(dev);
+
+    /* Settle the tombstones whose tail events never arrived. */
+    for (i = 0; i < ctx->nr_tombstones; i++)
+        task_state_settle_node(dev, ctx->tombstones[i].pid);
+
     monitor_ctx_exit(dev);
 }
 
