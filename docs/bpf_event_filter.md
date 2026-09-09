@@ -7,12 +7,12 @@
 一句话概括机制：**表达式就是 `expr_filter()` 这个函数的函数体**。
 
 ```c
---filter 'exit_reason == 12 && latency > 1000000'
+--filter 'exit_reason == 12 && exit_latency > 1000000'
 
 /* 等价于让 BPF 程序里的 expr_filter() 变成： */
 int expr_filter(struct kvm_vcpu_event *event)
 {
-    return event->exit_reason == 12 && event->latency > 1000000;
+    return event->exit_reason == 12 && event->exit_latency > 1000000;
 }
 ```
 
@@ -25,7 +25,7 @@ BPF 程序里预留了一个 `expr_filter()` 占位符（默认恒返回 1，即
 
 > **本文的示例全部以 `src/bpf-skel/kvm_exit.bpf.c`（`bpf:kvm_exit` 分析器）为例**，它是目前
 > 唯一接入这套机制的 BPF 程序，事件结构体是 `src/bpf-skel/kvm_exit.h` 里的
-> `struct kvm_vcpu_event`。文中出现的字段名（`exit_reason`、`latency`、`sched_latency` 等）
+> `struct kvm_vcpu_event`。文中出现的字段名（`exit_reason`、`exit_latency`、`offcpu_wait` 等）
 > 和字段偏移都来自它；换成别的 BPF 程序时，字段由该程序自己的事件结构体决定——机制本身
 > 与事件结构体无关，布局是运行时从 BTF 读出来的（见 5.3）。
 >
@@ -276,7 +276,7 @@ verifier 还会再兜一层：`clear_caller_saved_regs()` 在每个 subprog 调�
 这一半反而不需要验证。栈槽从 r2 起编号，深度超过 4 就用到 r6，而占位符里这些寄存器根本不出现：
 
 ```
---filter 'latency > (run_delay + (sched_latency + (exit_reason + (isa + (switches + (pid + tgid))))))'
+--filter 'exit_latency > (runq_delay + (offcpu_wait + (exit_reason + (isa + (switches + (pid + tgid))))))'
 
     1: (bf) r2 = r0                 ← 栈槽 0，caller-saved 区
     3: (bf) r3 = r0
@@ -515,9 +515,9 @@ invalid access to map value, value_size=299080 off=561116 size=4
 低 32 位在第一个槽的 `imm`，高 32 位在第二个槽的 `imm`。
 
 ```
---filter 'latency > 10000000000'          10000000000 = 0x2_540BE400
+--filter 'exit_latency > 10000000000'          10000000000 = 0x2_540BE400
 
-    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    0: r0 = *(u64 *)(r1 + 16)             ← exit_latency
     1: r2 = r0
     2: code=0x18  imm=1410065408          ← ld_imm64 低半：0x540BE400
     3: code=0x00  imm=2                   ← 高半；opcode 为 0，不是独立指令
@@ -536,9 +536,9 @@ BPF 指令集第 4 版（clang 的 `-mcpu=v4`，内核 6.6）没有为有符号�
 因此后端不能用 `BPF_ALU64_REG()`——它把 `off` 写死成 0——只能用 `BPF_RAW_INSN()`。
 
 ```
---filter 'latency / 1000 > 5'
+--filter 'exit_latency / 1000 > 5'
 
-    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    0: r0 = *(u64 *)(r1 + 16)             ← exit_latency
     1: r2 = r0
     2: r0 = 1000
     3: code=0x3f dst=r2 src=r0 off=1      ← BPF_ALU64|BPF_DIV|BPF_X，off=1 即有符号
@@ -559,7 +559,7 @@ else          scalar_min_max_udiv(dst_reg, &src_reg);
 BPF_ALU uses reserved fields
 ```
 
-所以版本判断必须在生成指令**之前**做（`--filter 'latency / 1000 > 5'` 在低版本内核上直接报
+所以版本判断必须在生成指令**之前**做（`--filter 'exit_latency / 1000 > 5'` 在低版本内核上直接报
 `signed division requires a 6.6+ kernel`），否则错误会推迟到 verifier，且信息晦涩。
 
 > 版本判断是**运行时**的：perf-prof 编译一次、可能跑在任意内核上，过滤器是为"即将加载进去的
@@ -610,9 +610,9 @@ EMIT(BPF_ALU64_IMM(BPF_ARSH, BPF_ACC, bits));
 ```
 
 两个加载点共用 `emit_load()`：5.3 里折叠成一条的字段读，以及 `LI` 单独出现、地址已经在累加器
-里的情况（`*(char *)((char *)&latency + 1)` 这种先算地址的形式）。
+里的情况（`*(char *)((char *)&exit_latency + 1)` 这种先算地址的形式）。
 
-以 `*(char *)((char *)&latency + 1) < 0` 为例，`latency` 偏移 16，取第 1 个字节：
+以 `*(char *)((char *)&exit_latency + 1) < 0` 为例，`exit_latency` 偏移 16，取第 1 个字节：
 
 ```
     5: r0 = r2                        ← 地址算完在累加器里
@@ -657,11 +657,17 @@ Available variables:
 后端**支持** `SI`（赋值），这是有意的，两个理由：
 
 1. **就地修正/标注要输出的事件**——掩码某个字段、缩放一个延迟，比送到用户态再改便宜；
-2. **表达式语言没有自己的变量**，闲置的事件字段是唯一能放临时值的地方：
-   `sched_latency = latency / switches, sched_latency > 100` 必须有处安放那个商。
+2. **表达式语言没有自己的变量**，事件字段是唯一能放临时值的地方：
+   `offcpu_wait = exit_latency / switches, offcpu_wait > 100` 必须有处安放那个商。
+
+⚠️ **注意**：`struct kvm_vcpu_event` 里**没有闲置字段**——每个字段都会被输出。上面那个例子
+把商写进 `offcpu_wait`，代价是这条事件报出的 `offcpu_wait` 不再是"非就绪等待时间"，而是那个
+商。拿字段当临时变量，就是拿输出的准确性换的。
 
 ⚠️ **注意**：事件可能是 BPF 程序**跨事件保留**的存储，而不是一份临时副本。写掉程序后续
-还要用的字段，会扰动之后的事件，不只是当前这一个。
+还要用的字段，会扰动之后的事件，不只是当前这一个。`bpf:kvm_exit` 就是这样：
+`percpu_event[]` 和 `kvm_vcpu` hashmap 里的条目在 `kvm_exit → kvm_entry` 之间持续存活
+（见 `src/bpf-skel/kvm_exit.h` 里的 `EXIT_TIME()` / `OFFCPU_ACC()` 等暂存宏）。
 
 ## 六、占位符为什么要写成那样
 
@@ -700,9 +706,31 @@ static __noinline int expr_filter(event_type *event)
 | `isa` | 8 | 2 |
 | `switches` | 10 | 2 |
 | `exit_reason` | 12 | 4 |
-| `latency` | 16 | 8 |
-| `run_delay` | 24 | 8 |
-| `sched_latency` | 32 | 8 |
+| `exit_latency` | 16 | 8 |
+| `runq_delay` | 24 | 8 |
+| `offcpu_wait` | 32 | 8 |
+
+三个时间字段的含义（`exit_latency` 之内的分解）：
+
+```
+exit_latency   kvm:kvm_exit -> kvm:kvm_entry
+  ├─ runq_delay    已就绪、在运行队列上等 CPU（sched_info.run_delay 增量）
+  ├─ offcpu_wait   切出后非就绪的等待（halt-poll、阻塞、睡眠）
+  └─ (其余)        vcpu 在 CPU 上、跑在宿主机里
+```
+
+报出的分解**恒满足** `0 <= runq_delay + offcpu_wait <= exit_latency`。这一点需要专门保证：
+`exit_latency` 和 off-CPU 时间都是 `bpf_ktime_get_ns()` 的差值，而 `runq_delay` 来自
+`sched_info.run_delay`，内核用 **`rq_clock()`** 记账——`sched_info_queued()` 记的是**切出**
+那个 rq 的时钟，`sched_info_arrive()` 用的是**切入**那个 rq 的时钟，两者都是 per-CPU
+`sched_clock()`、未经 NTP 校正且互不同步。vcpu 一旦迁移，这个差值可以偏大到超过
+`exit_latency`（曾出现 `lat 15108 runq_delay 15131` 这样的输出）。因此 `kvm_entry()` 把
+`runq_delay` 夹到 `[0, off-CPU 时间]`——就绪等待本就是 off-CPU 时间的一部分，off-CPU 是它
+真正的上界。
+
+过滤器看到的全部是**最终值**：BPF 程序在 `expr_filter()` 之前就把这三个字段从暂存的时间戳/
+快照换算成了时长（`kvm_entry()` 里完成）。`switches`、`runq_delay`、`offcpu_wait` 只在
+`-C cpus` 系统全局模式下解析——只有该模式挂 `sched:sched_switch`；`-p pid` 模式下三者恒为 0。
 
 ### 7.1 简单比较
 
@@ -731,23 +759,23 @@ BPF: 0: r0 = *(u32 *)(r1 + 12)      ← IMM+LI 折叠，偏移 12 = exit_reason
 ### 7.2 逻辑与（含跳转回填）
 
 ```
---filter 'exit_reason == 12 && latency > 1000000'
+--filter 'exit_reason == 12 && exit_latency > 1000000'
 
 等价于 expr_filter() 被实现成：
 
     int expr_filter(struct kvm_vcpu_event *event)
     {
-        return event->exit_reason == 12 && event->latency > 1000000;
+        return event->exit_reason == 12 && event->exit_latency > 1000000;
     }
 
 VM:  ... EQ; BZ 0x1472098; IMM 0x1458410; LI 0x3; PSH; IMM 0xf4240; GT; EXIT
 
 BPF: 0-6: 同上，exit_reason == 12 的结果在 r0
      7: if r0 == 0 goto +7           ← BZ 短路，回填后指向 15
-     8: r0 = *(u64 *)(r1 + 16)       ← latency，偏移 16，BPF_DW
+     8: r0 = *(u64 *)(r1 + 16)       ← exit_latency，偏移 16，BPF_DW
      9: r2 = r0
     10: r0 = 1000000
-    11: if r2 > r0 goto +2           ← 有符号 JSGT（latency 是 int64_t）
+    11: if r2 > r0 goto +2           ← 有符号 JSGT（exit_latency 是 int64_t）
     12: r0 = 0
     13: goto +1
     14: r0 = 1
@@ -756,25 +784,28 @@ BPF: 0-6: 同上，exit_reason == 12 的结果在 r0
 
 ### 7.3 赋值 + 用字段当临时变量
 
+⚠️ 这个例子只为展示 `SI` 的代码生成。`offcpu_wait` 是会被输出的字段，写它就是改输出——
+真要这么用，先接受 5.10 里那两条代价。
+
 ```
---filter 'sched_latency = latency, sched_latency > 1000'
+--filter 'offcpu_wait = exit_latency, offcpu_wait > 1000'
 
 等价于 expr_filter() 被实现成（逗号运算符：求值全部，返回最后一个）：
 
     int expr_filter(struct kvm_vcpu_event *event)
     {
-        event->sched_latency = event->latency;      /* 赋值，写回事件 */
-        return event->sched_latency > 1000;
+        event->offcpu_wait = event->exit_latency;      /* 赋值，写回事件 */
+        return event->offcpu_wait > 1000;
     }
 
 VM:  IMM 0x14f8420; PSH; IMM 0x14f8410; LI 0x3; SI 0x3; ...
 
 BPF: 0: r0 = r1
-     1: r0 += 32                     ← &sched_latency，取址（IMM 无 LI）
+     1: r0 += 32                     ← &offcpu_wait，取址（IMM 无 LI）
      2: r2 = r0                      ← PSH，目标地址进栈槽
-     3: r0 = *(u64 *)(r1 + 16)       ← latency
+     3: r0 = *(u64 *)(r1 + 16)       ← exit_latency
      4: *(u64 *)(r2 + 0) = r0        ← SI：赋值
-     5: r0 = *(u64 *)(r1 + 32)       ← 回读 sched_latency
+     5: r0 = *(u64 *)(r1 + 32)       ← 回读 offcpu_wait
      6: r2 = r0
      7: r0 = 1000
      8: if r2 > r0 goto +2
