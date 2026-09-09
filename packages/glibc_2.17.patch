@@ -6,8 +6,8 @@ index 57dec64..328fd40 100644
  
  #endif
  
-+asm (".symver fmemopen, fmemopen@GLIBC_");
-+asm (".symver fcntl64, fcntl@GLIBC_");
++asm (".symver fmemopen, fmemopen@GLIBC_2.2.5");
++asm (".symver fcntl64, fcntl@GLIBC_2.2.5");
 +
  extern void libbpf_print(enum libbpf_print_level level,
  			 const char *format, ...)
@@ -16,6 +16,6 @@ diff --git a/src/sqlite/sqlite3.c b/src/sqlite/sqlite3.c
 --- a/src/sqlite/sqlite3.c
 +++ b/src/sqlite/sqlite3.c
 @@ -1,2 +1,3 @@
-+asm (".symver fcntl64, fcntl@GLIBC_");
++asm (".symver fcntl64, fcntl@GLIBC_2.2.5");
  /******************************************************************************
  ** This file is an amalgamation of many separate C source files from SQLite

@@ -154,12 +154,28 @@ static void split_lock_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
+static int split_lock_grow(struct prof_dev *dev)
+{
+    struct split_lock_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->p, ctx->nr_ins, n, sizeof(*ctx->p)))
+        return -1;
+    ctx->nr_ins = n;
+    return 0;
+}
+
 static int split_lock_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
 {
     struct split_lock_ctx *ctx = dev->private;
     uint64_t counter = 0;
     uint64_t enabled = 0;
     uint64_t running = 0;
+
+    if (instance < 0 || split_lock_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return 0;
 
     if (count->val > ctx->p[instance].polling) {
         counter = count->val - ctx->p[instance].polling;
@@ -215,6 +231,8 @@ static void split_lock_interval(struct prof_dev *dev)
     if (ctx->print) {
         printf(" CPU  SPLIT_LOCKS  RUN%%\n");
         for (i = 0; i < ctx->nr_ins; i++) {
+            if (!prof_dev_ins_valid(dev, i))
+                continue;
             if (ctx->p[i].interval_counter)
                 printf(" %3d  %11lu  %4u\n", prof_dev_ins_cpu(dev, i), ctx->p[i].interval_counter,
                         ctx->p[i].interval_run);
@@ -242,7 +260,7 @@ struct sample_type_data {
     struct callchain callchain;
 };
 
-static void print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags, uint64_t counter)
+static void print_event(struct prof_dev *dev, union perf_event *event, int flags, uint64_t counter)
 {
     struct split_lock_ctx *ctx = dev->private;
     struct sample_type_data *data = (void *)event->sample.array;
@@ -262,18 +280,22 @@ static void print_event(struct prof_dev *dev, union perf_event *event, int insta
     }
 }
 
-static void split_lock_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void split_lock_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct sample_type_data *data = (void *)event->sample.array;
-    print_event(dev, event, instance, flags, data->counter);
+    print_event(dev, event, flags, data->counter);
 }
 
-static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct split_lock_ctx *ctx = dev->private;
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
     struct misc_ip_key key = {2, event->header.misc, data->ip};
+
+    if (instance < 0 || split_lock_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     keyvalue_pairs_add_key(ctx->ips, (struct_key *)&key);
 
@@ -282,7 +304,7 @@ static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int
         ctx->p[instance].counter = data->counter;
     }
     if ((dev->env->verbose || dev->env->callchain) && counter) {
-        print_event(dev, event, instance, 0, counter);
+        print_event(dev, event, 0, counter);
     }
 }
 

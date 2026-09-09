@@ -157,6 +157,9 @@ static inline bool str_has_sfx(const char *str, const char *sfx)
 
 #endif
 
+asm (".symver fmemopen, fmemopen@GLIBC_2.2.5");
+asm (".symver fcntl64, fcntl@GLIBC_2.2.5");
+
 extern void libbpf_print(enum libbpf_print_level level,
 			 const char *format, ...)
 	__attribute__((format(printf, 2, 3)));

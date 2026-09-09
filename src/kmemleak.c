@@ -318,7 +318,12 @@ static inline void lost_reclaim(struct prof_dev *dev)
         };
         if (!RB_EMPTY_ROOT(&ctx->alloc))
             dev->lost_print_time = 0; // force print lost now
-        print_lost_fn(dev, (union perf_event *)&lost_event, lost->ins);
+        {
+            int lost_cpu, lost_tid;
+
+            prof_dev_ins_pair(dev, lost->ins, &lost_cpu, &lost_tid);
+            print_lost_fn(dev, (union perf_event *)&lost_event, lost_cpu, lost_tid);
+        }
     }
 
     if (!RB_EMPTY_ROOT(&ctx->alloc)) {
@@ -329,8 +334,10 @@ static inline void lost_reclaim(struct prof_dev *dev)
     }
 }
 
-static void kmemleak_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void kmemleak_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
+
     struct kmemleak_ctx *ctx = dev->private;
     struct kmemleak_lost_node *pos;
     struct kmemleak_lost_node *lost;
@@ -659,7 +666,7 @@ static inline int kmemleak_event_lost(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
-static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kmemleak_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -684,7 +691,7 @@ static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event
     return err;
 }
 
-static void kmemleak_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void kmemleak_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kmemleak_ctx *ctx = dev->private;
     // in linux/perf_event.h

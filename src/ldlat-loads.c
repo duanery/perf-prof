@@ -403,7 +403,7 @@ static void ldlat_loads_interval(struct prof_dev *dev)
     return ;
 }
 
-static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct ldlat_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -431,15 +431,17 @@ static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *even
     print_callchain(ctx->ccx, (struct callchain *)&callchain, data->tid_entry.pid);
 }
 
-static void ldlat_loads_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void ldlat_loads_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    int instance = prof_dev_ins(dev, cpu, tid);
+
     struct env *env = dev->env;
     struct ldlat_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
 
     if (env->verbose || (env->greater_than &&
         data->weight.full > env->greater_than))
-        ldlat_loads_print_event(dev, event, instance, 0);
+        ldlat_loads_print_event(dev, event, cpu, tid, 0);
 
     latency_dist_input(ctx->lat_dist, instance, data->data_src, data->weight.full, env->greater_than);
 }

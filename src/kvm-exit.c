@@ -298,11 +298,18 @@ static void kvm_exit_deinit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void kvm_exit_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static int kvm_exit_grow(struct prof_dev *dev);
+
+static void kvm_exit_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
+
     struct kvmexit_ctx *ctx = dev->private;
 
-    print_lost_fn(dev, event, ins);
+    if (ins < 0 || kvm_exit_grow(dev) < 0 || ins >= ctx->nr_ins)
+        return;
+
+    print_lost_fn(dev, event, cpu, tid);
 
     if (using_order(dev)) {
         fprintf(stderr, "%s: the correctness when lost cannot be guaranteed.\n", dev->prof->name);
@@ -397,16 +404,33 @@ static void __process_fast(struct prof_dev *dev, struct sample_type_raw *rkvm_ex
     }
 }
 
-static void kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int kvm_exit_grow(struct prof_dev *dev)
 {
     struct kvmexit_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW
+    int n = prof_dev_nr_ins(dev);
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->perins_kvm_exit, ctx->nr_ins, n, ctx->sample_size) ||
+        mem_grow_zero((void **)&ctx->perins_kvm_exit_valid, ctx->nr_ins, n, sizeof(int)))
+        return -1;
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
+    struct kvmexit_ctx *ctx = dev->private;
+    /* PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW */
     struct sample_type_raw *raw = (void *)event->sample.array;
     unsigned short common_type = raw->raw.common_type;
     unsigned int exit_reason;
     u32 isa;
     unsigned long guest_rip;
+
+    if (instance < 0 || kvm_exit_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     if (dev->env->verbose >= VERBOSE_EVENT) {
         if (dev->print_title) prof_dev_print_time(dev, raw->time, stdout);

@@ -222,6 +222,7 @@ static int test_mmap_thread(void)
 	char path[PATH_MAX];
 	int id, err, pid, go_pipe[2];
 	union perf_event *event;
+	bool writable;
 	int count = 0;
 
 	snprintf(path, PATH_MAX, "%s/kernel/debug/tracing/events/syscalls/sys_enter_prctl/id",
@@ -294,8 +295,9 @@ static int test_mmap_thread(void)
 		if (perf_mmap__read_init(map) < 0)
 			continue;
 
-		while ((event = perf_mmap__read_event(map)) != NULL) {
-			count++;
+		while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+			if (event->header.type == PERF_RECORD_SAMPLE)
+				count++;
 			perf_mmap__consume(map);
 		}
 
@@ -333,6 +335,7 @@ static int test_mmap_cpus(void)
 	char path[PATH_MAX];
 	int id, err, cpu, tmp;
 	union perf_event *event;
+	bool writable;
 	int count = 0;
 
 	snprintf(path, PATH_MAX, "%s/kernel/debug/tracing/events/syscalls/sys_enter_prctl/id",
@@ -391,8 +394,9 @@ static int test_mmap_cpus(void)
 		if (perf_mmap__read_init(map) < 0)
 			continue;
 
-		while ((event = perf_mmap__read_event(map)) != NULL) {
-			count++;
+		while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+			if (event->header.type == PERF_RECORD_SAMPLE)
+				count++;
 			perf_mmap__consume(map);
 		}
 

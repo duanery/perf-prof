@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <linux/rblist.h>
 #include "monitor.h"
 #include "trace_helpers.h"
@@ -220,6 +221,31 @@ static void percpu_stat_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
+static int percpu_stat_grow(struct prof_dev *dev)
+{
+    struct percpu_stat_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
+    struct evsel_node *e;
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    for (e = ctx->first; e; e = e->next) {
+        struct swevent_stat *s, total;
+
+        total = *e->total_stats;
+        s = calloc(n + 1, sizeof(*s));
+        if (!s)
+            return -1;
+        memcpy(s, e->perins_stats, ctx->nr_ins * sizeof(*s));
+        s[n] = total;
+        free(e->perins_stats);
+        e->perins_stats = s;
+        e->total_stats = s + n;
+    }
+    ctx->nr_ins = n;
+    return 0;
+}
+
 static int percpu_stat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
 {
     struct percpu_stat_ctx *ctx = dev->private;
@@ -228,6 +254,8 @@ static int percpu_stat_read(struct prof_dev *dev, struct perf_evsel *evsel, stru
     struct evsel_node *e = rbn ? container_of(rbn, struct evsel_node, rbnode) : NULL;
 
     if (e == NULL)
+        return 0;
+    if (instance < 0 || percpu_stat_grow(dev) < 0 || instance >= ctx->nr_ins)
         return 0;
 
     e->perins_stats[instance].diff = 0;
@@ -258,6 +286,8 @@ static void percpu_stat_interval(struct prof_dev *dev)
 
     if (dev->env->perins)
     for (ins = 0; ins < ctx->nr_ins; ins ++) {
+        if (!prof_dev_ins_valid(dev, ins))
+            continue;
         printf("\n[%03d] ", prof_dev_ins_cpu(dev, ins));
         next = ctx->first;
         while (next) {
@@ -276,7 +306,7 @@ static void percpu_stat_interval(struct prof_dev *dev)
     printf("\n");
 }
 
-static void percpu_stat_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void percpu_stat_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
 }
 

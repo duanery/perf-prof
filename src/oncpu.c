@@ -405,11 +405,31 @@ static void oncpu_exit(struct prof_dev *dev)
     free(ctx);
 }
 
-static void oncpu_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static int oncpu_grow(struct prof_dev *dev)
 {
     struct oncpu_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
 
-    print_lost_fn(dev, event, ins);
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->switch_time, ctx->nr_ins, n, sizeof(*ctx->switch_time)))
+        return -1;
+    if (ctx->perins_vmf_sib &&
+        mem_grow_zero((void **)&ctx->perins_vmf_sib, ctx->nr_ins, n, sizeof(int)))
+        return -1;
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void oncpu_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
+{
+    int ins = prof_dev_ins(dev, cpu, tid);
+
+    struct oncpu_ctx *ctx = dev->private;
+    if (ins < 0 || oncpu_grow(dev) < 0 || ins >= ctx->nr_ins)
+        return;
+
+    print_lost_fn(dev, event, cpu, tid);
 
     if (using_order(dev)) {
         fprintf(stderr, "%s: the correctness when lost cannot be guaranteed.\n", dev->prof->name);
@@ -569,8 +589,9 @@ static void oncpu_interval(struct prof_dev *dev)
         rblist__exit(&ctx->runtimes);
 }
 
-static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int bind_cpu, int bind_tid)
 {
+    int instance = prof_dev_ins(dev, bind_cpu, bind_tid);
     struct oncpu_ctx *ctx = dev->private;
     struct env *env = dev->env;
     struct sample_type_data *data = (void *)event->sample.array;
@@ -580,6 +601,9 @@ static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int inst
     int tid, cpu;
     u64 runtime;
     char *comm;
+
+    if (instance < 0 || oncpu_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     if (env->verbose >= VERBOSE_EVENT)
         tep__print_event(data->time, data->cpu_entry.cpu, data->raw.data, data->raw.size);

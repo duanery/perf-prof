@@ -136,6 +136,9 @@ static void hwstat_interval(struct prof_dev *dev)
     for (ins = 0; ins < ctx->nr_ins; ins ++) {
         float ipc = 0.0;
         float run = 0.0;
+
+        if (!prof_dev_ins_valid(dev, ins))
+            continue;
         ipc = ctx->hwc[ins].insns.increased * 1.0 / ctx->hwc[ins].cycles.increased;
         run = ctx->hwc[ins].total_time_running.increased * 100.0 / ctx->hwc[ins].total_time_enabled.increased;
         printf("[%03d] %10lu %10lu   %4.2f  %6.2f%%\n", prof_dev_ins_cpu(dev, ins),

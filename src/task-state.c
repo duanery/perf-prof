@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <linux/rblist.h>
 #include <linux/thread_map.h>
+#include <internal/threadmap.h>
 #include <monitor.h>
 #include <trace_helpers.h>
 #include <stack_helpers.h>
@@ -92,6 +93,8 @@ struct task_state_ctx {
         };
     };
     bool dup;
+    /* thread_map grows via ptrace; pid is matched in sample(), not SET_FILTER. */
+    bool dynamic_threads;
 
     // lost
     struct list_head lost_list; // struct task_lost_node
@@ -306,6 +309,15 @@ static int task_state_init(struct prof_dev *dev)
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
         dev->threads = perf_thread_map__new_dummy();
+        /*
+         * SET_FILTER cannot be replaced on an enabled tracepoint here
+         * (EEXIST). With ptrace the pid set changes, so match in
+         * sample() instead of pinning a kernel pid filter.
+         */
+        if (!env->filter && (env->using_ptrace || env->workload.pid > 0 ||
+                             (dev->links.parent &&
+                              dev->links.parent->env->using_ptrace)))
+            ctx->dynamic_threads = true;
     }
 
     ctx->task_report = TASK_REPORT;
@@ -430,6 +442,15 @@ failed:
     return -1;
 }
 
+static int task_state_tracked(struct task_state_ctx *ctx, int pid)
+{
+    if (!ctx->thread_map || !ctx->dynamic_threads)
+        return 1;
+    if (pid <= 0)
+        return 0;
+    return perf_thread_map__idx(ctx->thread_map, pid) >= 0;
+}
+
 static int task_state_filter(struct prof_dev *dev)
 {
     struct perf_evlist *evlist = dev->evlist;
@@ -439,11 +460,17 @@ static int task_state_filter(struct prof_dev *dev)
     struct perf_evsel *evsel;
     int err = 0;
 
+    free(ctx->filter_switch);
+    free(ctx->filter_switch_next);
+    free(ctx->filter_wakeup);
+    ctx->filter_switch = ctx->filter_switch_next = ctx->filter_wakeup = NULL;
+
     perf_evlist__for_each_evsel(evlist, evsel) {
         if (evsel == ctx->sched_switch) {
             struct tp_filter *prev_filter = NULL;
 
-            prev_filter = tp_filter_new(ctx->thread_map, "prev_pid", env->filter, "prev_comm");
+            prev_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                        "prev_pid", env->filter, "prev_comm");
 
             if (env->interruptible && env->uninterruptible) {
                 if (prev_filter) {
@@ -486,7 +513,8 @@ static int task_state_filter(struct prof_dev *dev)
         } else if (evsel == ctx->sched_switch_next) {
             struct tp_filter *next_filter = NULL;
 
-            next_filter = tp_filter_new(ctx->thread_map, "next_pid", env->filter, "next_comm");
+            next_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                        "next_pid", env->filter, "next_comm");
             if (next_filter) {
                 err = perf_evsel__apply_filter(evsel, next_filter->filter);
                 if (!err)
@@ -501,7 +529,8 @@ static int task_state_filter(struct prof_dev *dev)
         } else if (evsel == ctx->sched_wakeup || evsel == ctx->sched_wakeup_new) {
             struct tp_filter *tp_filter = NULL;
 
-            tp_filter = tp_filter_new(ctx->thread_map, "pid", env->filter, "comm");
+            tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                      "pid", env->filter, "comm");
             if (tp_filter) {
                 err = perf_evsel__apply_filter(evsel, tp_filter->filter);
                 if (!err && !ctx->filter_wakeup)
@@ -517,6 +546,93 @@ static int task_state_filter(struct prof_dev *dev)
         }
     }
     return 0;
+}
+
+static int task_state_threads_cow(struct task_state_ctx *ctx)
+{
+    struct perf_thread_map *priv;
+
+    if (refcount_read(&ctx->thread_map->refcnt) == 1)
+        return 0;
+    priv = perf_thread_map__dup(ctx->thread_map);
+    if (!priv)
+        return -1;
+    perf_thread_map__put(ctx->thread_map);
+    ctx->thread_map = priv;
+    return 0;
+}
+
+static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct task_state_ctx *ctx = dev->private;
+    struct perf_thread_map *threads;
+    int i, nr;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return 0;
+    if (task_state_threads_cow(ctx) < 0)
+        return -1;
+
+    threads = ctx->thread_map;
+    for (i = 0; i < threads->nr; i++) {
+        if (threads->map[i].pid == PERF_THREAD_MAP_HOLE)
+            break;
+    }
+    if (i == threads->nr) {
+        nr = threads->nr + 1;
+        threads = perf_thread_map__realloc(threads, nr);
+        if (!threads)
+            return -1;
+        threads->nr = nr;
+        ctx->thread_map = threads;
+        threads->map[i].pid = PERF_THREAD_MAP_HOLE;
+    }
+    threads->map[i].pid = pid;
+    threads->map[i].cgroup = 0;
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("task-state: add thread %d\n", pid);
+    }
+    if (ctx->dynamic_threads)
+        return 0;
+    return task_state_filter(dev);
+}
+
+static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct task_state_ctx *ctx = dev->private;
+    struct task_state_node tmp;
+    struct rb_node *rbn;
+    int i;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    i = perf_thread_map__idx(ctx->thread_map, pid);
+    if (i < 0)
+        return 0;
+    if (task_state_threads_cow(ctx) < 0)
+        return -1;
+
+    free(ctx->thread_map->map[i].comm);
+    ctx->thread_map->map[i].comm = NULL;
+    ctx->thread_map->map[i].cgroup = 0;
+    ctx->thread_map->map[i].pid = PERF_THREAD_MAP_HOLE;
+
+    tmp.pid = pid;
+    rbn = rblist__find(&ctx->task_states, &tmp);
+    if (rbn)
+        rblist__remove_node(&ctx->task_states, rbn);
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("task-state: del thread %d\n", pid);
+    }
+    if (ctx->dynamic_threads)
+        return 0;
+    return task_state_filter(dev);
 }
 
 static void task_state_enabled(struct prof_dev *dev)
@@ -621,13 +737,15 @@ static u64 task_state_minevtime(struct prof_dev *dev)
     return minevtime;
 }
 
-static void task_state_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void task_state_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
+
     struct task_state_ctx *ctx = dev->private;
     struct task_lost_node *pos;
     struct task_lost_node *lost;
 
-    print_lost_fn(dev, event, ins);
+    print_lost_fn(dev, event, cpu, tid);
 
     // task-state serves as the forwarding source device.
     if (unlikely(!prof_dev_is_final(dev)))
@@ -731,7 +849,7 @@ static inline int task_state_event_lost(struct prof_dev *dev, union perf_event *
     return 0;
 }
 
-static void task_state_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void task_state_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct task_state_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -751,7 +869,7 @@ static void task_state_print_event(struct prof_dev *dev, union perf_event *event
     }
 }
 
-static void task_state_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void task_state_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct env *env = dev->env;
     struct task_state_ctx *ctx = dev->private;
@@ -770,7 +888,7 @@ static void task_state_sample(struct prof_dev *dev, union perf_event *event, int
         ctx->recent_time = data->time;
 
     if (unlikely(env->verbose >= VERBOSE_EVENT))
-        task_state_print_event(dev, event, instance, 0);
+        task_state_print_event(dev, event, cpu, tid, 0);
 
     if (unlikely(task_state_event_lost(dev, event) < 0))
         goto free_event;
@@ -809,7 +927,7 @@ static void task_state_sample(struct prof_dev *dev, union perf_event *event, int
     if (evsel == ctx->sched_switch) {
         sw = &sched_event->sched_switch;
 
-        if (sw->prev_pid > 0) {
+        if (sw->prev_pid > 0 && task_state_tracked(ctx, sw->prev_pid)) {
             tmp.pid = sw->prev_pid;
             rbn = rblist__findnew(&ctx->task_states, &tmp);
             task = rb_entry_safe(rbn, struct task_state_node, rbnode);
@@ -846,7 +964,7 @@ static void task_state_sample(struct prof_dev *dev, union perf_event *event, int
     } else if (evsel == ctx->sched_switch_next) {
         sw = &sched_event->sched_switch;
 parse_next:
-        if (sw->next_pid > 0) {
+        if (sw->next_pid > 0 && task_state_tracked(ctx, sw->next_pid)) {
             tmp.pid = sw->next_pid;
             rbn = rblist__findnew(&ctx->task_states, &tmp);
             task = rb_entry_safe(rbn, struct task_state_node, rbnode);
@@ -883,6 +1001,8 @@ parse_next:
     } else if (evsel == ctx->sched_wakeup || evsel == ctx->sched_wakeup_new) {
         struct sched_wakeup *wakeup = &sched_event->sched_wakeup;
 
+        if (!task_state_tracked(ctx, wakeup->pid))
+            goto free_event;
         tmp.pid = wakeup->pid;
         if (ctx->SD)
              rbn = rblist__find(&ctx->task_states, &tmp);
@@ -1009,6 +1129,8 @@ struct monitor task_state = {
     .order = 1,
     .init = task_state_init,
     .filter = task_state_filter,
+    .add_thread = task_state_add_thread,
+    .del_thread = task_state_del_thread,
     .enabled = task_state_enabled,
     .deinit = task_state_deinit,
     .sigusr = task_state_sigusr,

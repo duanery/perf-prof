@@ -1,3 +1,4 @@
+asm (".symver fcntl64, fcntl@GLIBC_2.2.5");
 /******************************************************************************
 ** This file is an amalgamation of many separate C source files from SQLite
 ** version 3.53.2.  By combining all the individual C code files into this

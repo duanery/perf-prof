@@ -42,6 +42,43 @@ int prof_dev_ins_cpu(struct prof_dev *dev, int ins);
 int prof_dev_ins_thread(struct prof_dev *dev, int ins);
 int prof_dev_ins_oncpu(struct prof_dev *dev);
 
+/*
+ * Profiler callbacks say where an event came from as a (cpu, tid) pair, taken
+ * from the binding of the ring buffer it was read from. Exactly one of the two
+ * is valid: an event out of a cpu-bound ring buffer has no thread of its own
+ * (tid == -1), and one out of a thread-bound ring buffer has no cpu
+ * (cpu == -1).
+ *
+ * prof_dev_ins() folds the pair into a stable slot. Profiler per-stream
+ * arrays are indexed by that slot. Deleted streams leave a hole (the number
+ * does not move); a later add appends a new slot so leftover counters are
+ * not reused. Iterate with prof_dev_for_each_ins() so print loops skip holes.
+ */
+int prof_dev_ins(struct prof_dev *dev, int cpu, int tid);
+void prof_dev_ins_pair(struct prof_dev *dev, int ins, int *cpu, int *tid);
+bool prof_dev_ins_valid(struct prof_dev *dev, int ins);
+int prof_dev_ins_add(struct prof_dev *dev, int cpu, int tid);
+int prof_dev_ins_del(struct prof_dev *dev, int cpu, int tid);
+int prof_dev_add_thread(struct prof_dev *dev, pid_t pid);
+int prof_dev_del_thread(struct prof_dev *dev, pid_t pid);
+void *mem_realloc_zero(void *p, int old_n, int new_n, size_t elem);
+static inline int mem_grow_zero(void **p, int old_n, int new_n, size_t elem)
+{
+    void *n;
+
+    if (new_n <= old_n)
+        return 0;
+    n = mem_realloc_zero(*p, old_n, new_n, elem);
+    if (!n)
+        return -1;
+    *p = n;
+    return 0;
+}
+
+#define prof_dev_for_each_ins(dev, ins) \
+    for ((ins) = 0; (ins) < prof_dev_nr_ins(dev); (ins)++) \
+        if (prof_dev_ins_valid((dev), (ins)))
+
 int main_epoll_add(int fd, unsigned int events, void *ptr, handle_event handle);
 int main_epoll_del(int fd);
 
@@ -77,9 +114,9 @@ int callchain_flags(struct prof_dev *dev, int default_flags);
 int exclude_callchain_user(struct prof_dev *dev, int dflt_flags);
 int exclude_callchain_kernel(struct prof_dev *dev, int dflt_flags);
 
-void print_lost_fn(struct prof_dev *dev, union perf_event *event, int ins);
+void print_lost_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
-int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int instance, bool writable, bool converted);
+int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int cpu, int tid, bool writable, bool converted);
 
 
 #define PROFILER_REGISTER_NAME(p, name) \
@@ -246,6 +283,9 @@ typedef struct monitor {
     int (*init)(struct prof_dev *dev);
     int (*reinit)(struct prof_dev *dev, int err);
     int (*filter)(struct prof_dev *dev);
+    /* ptrace added or removed a thread; update profiler-side filters. */
+    int (*add_thread)(struct prof_dev *dev, pid_t pid);
+    int (*del_thread)(struct prof_dev *dev, pid_t pid);
     void (*enabled)(struct prof_dev *dev);
     void (*deinit)(struct prof_dev *dev);
     void (*flush)(struct prof_dev *dev, enum profdev_flush how);
@@ -268,52 +308,52 @@ typedef struct monitor {
 
     //PERF_RECORD_MMAP             = 1,
     //PERF_RECORD_MMAP2            = 10,
-    void (*mmap)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*mmap2)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*mmap)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*mmap2)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_LOST             = 2,
     // lost_start: evclock_t, lost_end: evclock_t.
-    void (*lost)(struct prof_dev *dev, union perf_event *event, int instance, u64 lost_start, u64 lost_end);
+    void (*lost)(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end);
 
     //PERF_RECORD_COMM             = 3,
-    void (*comm)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*comm)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_EXIT             = 4,
-    void (*exit)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*exit)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_THROTTLE         = 5,
     //PERF_RECORD_UNTHROTTLE       = 6,
-    void (*throttle)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*unthrottle)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*throttle)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*unthrottle)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_FORK             = 7,
-    void (*fork)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*fork)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_SAMPLE           = 9,
     // userspace ftrace filter: return >0: sample; <=0: drop.
-    long (*ftrace_filter)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*print_event)(struct prof_dev *dev, union perf_event *event, int instance, int flags);
-    void (*sample)(struct prof_dev *dev, union perf_event *event, int instance);
+    long (*ftrace_filter)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*print_event)(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags);
+    void (*sample)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_SWITCH           = 14,
     //PERF_RECORD_SWITCH_CPU_WIDE  = 15,
-    void (*context_switch)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*context_switch_cpu)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*context_switch)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*context_switch_cpu)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_NAMESPACES       = 16,
-    void (*namespaces)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*namespaces)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_KSYMBOL          = 17,
-    void (*ksymbol)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*ksymbol)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_BPF_EVENT        = 18,
-    void (*bpf_event)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*bpf_event)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_CGROUP           = 19,
-    void (*cgroup)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*cgroup)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_TEXT_POKE        = 20,
-    void (*text_poke)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*text_poke)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 } profiler;
 
 enum prof_dev_state {
@@ -361,6 +401,17 @@ struct prof_dev {
     struct list_head dev_link;
     struct perf_cpu_map *cpus;
     struct perf_thread_map *threads;
+    /*
+     * Dense (cpu, tid) -> slot table. Built from @cpus/@threads and then
+     * grown by prof_dev_ins_add() when threads come and go.
+     */
+    struct {
+        struct hlist_head *hash;
+        void **slots;
+        int nr, cap;
+        struct perf_cpu_map *built_cpus;
+        struct perf_thread_map *built_threads;
+    } ins_tab;
     struct perf_evlist *evlist;
     struct timer timer;  // interval
     struct env *env;
@@ -426,7 +477,8 @@ struct prof_dev {
         u64 wakeup_watermark;
         heapclock_t prev_lost_time;
         heapclock_t heap_popped_time;
-        int heap_popped_ins;
+        int heap_popped_cpu;
+        int heap_popped_tid;
         u8 break_reason; // enum order_break_reason
         bool enabled;
         bool inprocess;
@@ -538,7 +590,7 @@ int prof_dev_disable(struct prof_dev *dev);
 int prof_dev_forward(struct prof_dev *dev, struct prof_dev *target);
 void prof_dev_flush(struct prof_dev *dev, enum profdev_flush how);
 void prof_dev_print_time(struct prof_dev *dev, u64 evtime, FILE *fp);
-void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags);
+void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags);
 int prof_dev_reopen_output(struct prof_dev *dev);
 
 /*
@@ -652,6 +704,8 @@ int order_together(struct prof_dev *main_dev, struct prof_dev *dev);
 typedef union perf_event *read_event(void *stream, bool init, int *ins, bool *writable, bool *converted);
 int order_register(struct prof_dev *dev, read_event *read_event, void *stream);
 void order_unregister(struct prof_dev *dev, void *stream);
+int order_mmap_add(struct prof_dev *dev, struct perf_mmap *map);
+void order_mmap_del(struct prof_dev *dev, struct perf_mmap *map);
 void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock_t target_tm);
 static inline void order_mmap(struct prof_dev *dev, struct perf_mmap *map) { order_process(dev, map, 0); }
 static inline void order_stream(struct prof_dev *dev) { order_process(dev, NULL, 0); }
@@ -797,7 +851,7 @@ void print_tracepoint_events(tracepoint_cb cb, void *opaque);
 //perfeval.c
 int perfeval_init(struct prof_dev *dev);
 void perfeval_free(struct prof_dev *dev);
-void perfeval_sample(struct prof_dev *dev, union perf_event *event, int instance);
+void perfeval_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 void perfeval_evaluate(struct prof_dev *dev);
 
 

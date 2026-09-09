@@ -260,7 +260,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
         static int once = 0;
         if (once == 0) {
             once = 1;
-            printf("The partial events pulled by %s:%s//pull=\"%s\"/ cannot be switched to instances of '%s'.\n",
+            printf("The partial events pulled by %s:%s//pull=\"%s\"/ cannot be switched to the cpus/threads of '%s'.\n",
                     tp->sys, tp->name, block->block_def, tp->dev->prof->name);
         }
     }
@@ -271,6 +271,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
 static int block_process_event(struct event_block *block, union perf_event *event)
 {
     struct tp *tp = block->eb_list->tp;
+    int cpu, tid;
     int ins = 0;
 
     switch (event->header.type) {
@@ -325,7 +326,8 @@ static int block_process_event(struct event_block *block, union perf_event *even
             break;
     }
 
-    perf_event_process_record(tp->dev, event, ins, true, true);
+    prof_dev_ins_pair(tp->dev, ins, &cpu, &tid);
+    perf_event_process_record(tp->dev, event, cpu, tid, true, true);
     return 0;
 }
 
@@ -1054,7 +1056,7 @@ failed:
     return -1;
 }
 
-static void perf_clock_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void perf_clock_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct prof_dev *main_dev;
     struct event_block_list *eb_list;

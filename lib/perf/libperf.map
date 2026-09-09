@@ -23,6 +23,7 @@ LIBPERF_0.0.1 {
 		perf_thread_map__get;
 		perf_thread_map__put;
 		perf_thread_map__idx;
+		perf_thread_map__valid;
 		perf_evsel__new;
 		perf_evsel__delete;
 		perf_evsel__enable;
@@ -45,6 +46,9 @@ LIBPERF_0.0.1 {
 		perf_evsel__apply_filter_cpu;
 		perf_evsel__set_bpf;
 		perf_evsel__set_own_cpus;
+		perf_evsel__set_own_threads;
+		perf_evsel__add_thread;
+		perf_evsel__del_thread;
 		perf_evsel__cpus;
 		perf_evsel__threads;
 		perf_evsel__attr;
@@ -66,11 +70,18 @@ LIBPERF_0.0.1 {
 		perf_evlist__poll;
 		perf_evlist__mmap;
 		perf_evlist__munmap;
+		perf_evlist__add_thread;
+		perf_evlist__del_thread;
 		perf_evlist__id_to_evsel;
+		perf_evlist__find_mmap;
 		perf_evlist__next_mmap;
 		perf_evlist__set_leader;
+		perf_evlist__nr_groups;
 		perf_evlist__max_read_size;
 		perf_mmap__idx;
+		perf_mmap__cpu;
+		perf_mmap__tid;
+		perf_mmap__oncpu;
 		perf_mmap__consume;
 		perf_mmap__read_init;
 		perf_mmap__read_done;

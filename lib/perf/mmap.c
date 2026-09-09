@@ -20,11 +20,21 @@ void perf_mmap__init(struct perf_mmap *map, struct perf_mmap *prev,
 		     bool overwrite, libperf_unmap_cb_t unmap_cb)
 {
 	map->fd = -1;
+	map->cpu = -1;
+	map->tid = -1;
 	map->overwrite = overwrite;
 	map->unmap_cb  = unmap_cb;
+	INIT_LIST_HEAD(&map->list);
+	INIT_HLIST_NODE(&map->hnode);
 	refcount_set(&map->refcnt, 0);
 	if (prev)
 		prev->next = map;
+}
+
+void perf_mmap__set_bind(struct perf_mmap *map, int cpu, pid_t tid)
+{
+	map->cpu = cpu;
+	map->tid = tid;
 }
 
 size_t perf_mmap__mmap_len(struct perf_mmap *map)
@@ -47,6 +57,21 @@ int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp,
 	map->fd  = fd;
 	map->cpu = cpu;
 	return 0;
+}
+
+int perf_mmap__cpu(struct perf_mmap *map)
+{
+	return map ? map->cpu : -1;
+}
+
+pid_t perf_mmap__tid(struct perf_mmap *map)
+{
+	return map ? map->tid : -1;
+}
+
+bool perf_mmap__oncpu(struct perf_mmap *map)
+{
+	return map && map->cpu != -1;
 }
 
 void perf_mmap__munmap(struct perf_mmap *map)
@@ -109,8 +134,11 @@ void perf_mmap__consume(struct perf_mmap *map)
 		perf_mmap__write_tail(map, old);
 	}
 
-	if (refcount_read(&map->refcnt) == 1 && perf_mmap__empty(map))
+	if (map->extra_ref && refcount_read(&map->refcnt) == 1 &&
+	    perf_mmap__empty(map)) {
+		map->extra_ref = false;
 		perf_mmap__put(map);
+	}
 }
 
 static int overwrite_rb_find_range(void *buf, int mask, u64 *start, u64 *end)

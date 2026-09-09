@@ -821,7 +821,7 @@ static void evtime_deinit(struct prof_dev *dev)
 {
 }
 
-static void evtime_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void evtime_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct prof_dev *pdev = dev->private;
     // PERF_SAMPLE_TIME

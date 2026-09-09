@@ -5,6 +5,7 @@
 #include <perf/core.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 struct perf_evlist;
 struct perf_evsel;
@@ -45,6 +46,18 @@ LIBPERF_API struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evli
 LIBPERF_API int perf_evlist__mmap(struct perf_evlist *evlist, int pages);
 LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
 
+/*
+ * Add/remove a thread on every evsel that follows the evlist thread map.
+ * Evsels bound to their own thread map (perf_evsel__set_own_threads()) are
+ * left alone; drive those with perf_evsel__add_thread() directly.
+ */
+LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
+LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid);
+
+/* Look up the ring buffer of a binding; see perf_mmap__cpu()/perf_mmap__tid(). */
+LIBPERF_API struct perf_mmap *perf_evlist__find_mmap(struct perf_evlist *evlist,
+						     int cpu, pid_t tid,
+						     bool overwrite);
 LIBPERF_API struct perf_mmap *perf_evlist__next_mmap(struct perf_evlist *evlist,
 						     struct perf_mmap *map,
 						     bool overwrite);

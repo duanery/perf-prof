@@ -17,7 +17,7 @@ struct pystack_node {
 
 struct pystack_lost_node {
     struct list_head lost_link;
-    int ins;
+    int cpu;
     bool reclaim;
     u64 start_time;
     u64 end_time;
@@ -161,18 +161,18 @@ deinit:
     return -1;
 }
 
-static void pystack_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void pystack_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
     struct pystack_ctx *ctx = dev->private;
     struct pystack_lost_node *pos;
     struct pystack_lost_node *lost;
 
-    print_lost_fn(dev, event, ins);
+    print_lost_fn(dev, event, cpu, tid);
 
     // Thread loss event: just remove the thread itself.
-    if (!prof_dev_ins_oncpu(dev)) {
+    if (tid != -1) {
         struct pystack_node tmp;
-        tmp.pid = prof_dev_ins_thread(dev, ins);
+        tmp.pid = tid;
         rblist__find_remove(&ctx->pystack, &tmp);
         return;
     }
@@ -182,7 +182,7 @@ static void pystack_lost(struct prof_dev *dev, union perf_event *event, int ins,
     // needs to be processed later.
     lost = malloc(sizeof(*lost));
     if (lost) {
-        lost->ins = ins;
+        lost->cpu = cpu;
         lost->reclaim = false;
         lost->start_time = lost_start;
         lost->end_time = lost_end;
@@ -232,7 +232,7 @@ static inline int pystack_event_lost(struct prof_dev *dev, union perf_event *eve
     return 0;
 }
 
-static void pystack_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void pystack_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct pystack_ctx *ctx = dev->private;
     // PERF_SAMPLE_TIME | PERF_SAMPLE_RAW

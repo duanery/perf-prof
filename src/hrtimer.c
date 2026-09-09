@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "monitor.h"
 #include "trace_helpers.h"
 #include "stack_helpers.h"
@@ -22,6 +23,8 @@ struct hrtimer_ctx {
     analyzer analyzer;
     struct bpf_filter filter;
     struct prof_dev *dev;
+    int nr_ins;
+    int width;
 };
 
 static int __analyzer(struct hrtimer_ctx *ctx, int instance, int nr_tp, u64 *counters)
@@ -56,7 +59,9 @@ static int monitor_ctx_init(struct prof_dev *dev)
         if (!ctx->tp_list)
             goto failed;
 
-        ctx->counters = calloc(1, prof_dev_nr_ins(dev) * (ctx->tp_list->nr_real_tp + 1) * sizeof(u64));
+        ctx->nr_ins = prof_dev_nr_ins(dev);
+        ctx->width = ctx->tp_list->nr_real_tp + 1;
+        ctx->counters = calloc(1, ctx->nr_ins * ctx->width * sizeof(u64));
         if (!ctx->counters)
             goto failed;
 
@@ -71,7 +76,9 @@ static int monitor_ctx_init(struct prof_dev *dev)
 
         ctx->expression = expression;
     } else if (env->greater_than) {
-        ctx->counters = calloc(1, prof_dev_nr_ins(dev) * sizeof(u64));
+        ctx->nr_ins = prof_dev_nr_ins(dev);
+        ctx->width = 1;
+        ctx->counters = calloc(1, ctx->nr_ins * ctx->width * sizeof(u64));
         if (!ctx->counters)
             goto failed;
 
@@ -268,12 +275,30 @@ static void hrtimer_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int hrtimer_grow(struct prof_dev *dev)
 {
+    struct hrtimer_ctx *ctx = dev->private;
+    int nr = prof_dev_nr_ins(dev);
+    u64 *c;
+
+    if (!ctx->counters || nr <= ctx->nr_ins)
+        return 0;
+    c = calloc(nr, ctx->width * sizeof(u64));
+    if (!c)
+        return -1;
+    memcpy(c, ctx->counters, ctx->nr_ins * ctx->width * sizeof(u64));
+    free(ctx->counters);
+    ctx->counters = c;
+    ctx->nr_ins = nr;
+    return 0;
+}
+
+static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct env *env = dev->env;
     struct hrtimer_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ | PERF_SAMPLE_CALLCHAIN
+    /* PERF_SAMPLE_TID | TIME | CPU | READ | CALLCHAIN */
     struct sample_type_data {
         struct {
             __u32    pid;
@@ -293,12 +318,16 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
         } groups;
     } *data = (void *)event->sample.array;
     int n = env->event ? ctx->tp_list->nr_real_tp : 0;
-    u64 *jcounter = ctx->counters + instance * (n + 1);
+    u64 *jcounter;
     u64 counter, cpu_clock = 0;
     u64 i, j = 0, print = BREAK;
     int verbose = env->verbose;
     int header_end = 0;
     struct tp *tp;
+
+    if (instance < 0 || hrtimer_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
+    jcounter = ctx->counters + instance * (n + 1);
 
     if (verbose) {
         if (dev->print_title) prof_dev_print_time(dev, data->time, stdout);

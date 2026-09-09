@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>
 #include <perf/core.h>
 
 struct perf_evsel;
@@ -45,6 +46,16 @@ LIBPERF_API int perf_evsel__apply_filter(struct perf_evsel *evsel, const char *f
 LIBPERF_API int perf_evsel__apply_filter_cpu(struct perf_evsel *evsel, const char *filter, int cpu);
 LIBPERF_API int perf_evsel__set_bpf(struct perf_evsel *evsel, unsigned int prog_fd);
 LIBPERF_API void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_cpu_map *own_cpus);
+LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads);
+/*
+ * Add/remove a thread on an already open evsel. The fds are opened/closed and
+ * the ring buffer of the thread is created/dropped accordingly.
+ *
+ * The caller must drain the ring buffer of @pid before removing it: the last
+ * reference going away destroys the mapping immediately.
+ */
+LIBPERF_API int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
+LIBPERF_API int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API struct perf_cpu_map *perf_evsel__cpus(struct perf_evsel *evsel);
 LIBPERF_API struct perf_thread_map *perf_evsel__threads(struct perf_evsel *evsel);
 LIBPERF_API struct perf_event_attr *perf_evsel__attr(struct perf_evsel *evsel);

@@ -402,6 +402,8 @@ static void __hrcount_interval(struct prof_dev *dev)
 
     // Determine if all instances are complete
     for (i = 0; i < ctx->nr_ins; i++) {
+        if (!prof_dev_ins_valid(dev, i))
+            continue;
         if (ctx->perins_pos[i] < print_pos)
             return ;
         if (ctx->perins_pos[i] > max_pos)
@@ -454,11 +456,38 @@ static void hrcount_interval(struct prof_dev *dev)
     }
 }
 
-static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int hrcount_grow(struct prof_dev *dev)
 {
     struct hrcount_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ
+    int n = prof_dev_nr_ins(dev);
+    int width;
+    u64 *counters, *pos;
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    width = ctx->tp_list->nr_tp + 1;
+    counters = calloc(n, width * sizeof(u64));
+    pos = calloc(n, sizeof(u64));
+    if (!counters || !pos) {
+        free(counters);
+        free(pos);
+        return -1;
+    }
+    memcpy(counters, ctx->counters, ctx->nr_ins * width * sizeof(u64));
+    memcpy(pos, ctx->perins_pos, ctx->nr_ins * sizeof(u64));
+    free(ctx->counters);
+    free(ctx->perins_pos);
+    ctx->counters = counters;
+    ctx->perins_pos = pos;
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
+    struct hrcount_ctx *ctx = dev->private;
+    /* PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ */
     struct sample_type_data {
         struct {
             __u32    pid;
@@ -478,11 +507,15 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int in
         } groups;
     } *data = (void *)event->sample.array;
     int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter = ctx->counters + instance * (n + 1);
+    u64 *ins_counter;
     u64 counter, cpu_clock = 0;
     u64 i, j;
     int verbose = dev->env->verbose;
     u64 print_pos = (ctx->rounds + 1) * ctx->hist_size;
+
+    if (instance < 0 || hrcount_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
+    ins_counter = ctx->counters + instance * (n + 1);
 
     for (i = 0; i < data->groups.nr; i++) {
         struct perf_evsel *evsel;
@@ -634,12 +667,15 @@ static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct per
         } ctnr[0];
     } *groups = (void *)count;
     int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter = ctx->counters + instance * (n + 1);
+    u64 *ins_counter;
     u64 counter, cpu_clock;
     u64 i, j;
 
     if (leader != ctx->leader)
         return 0;
+    if (instance < 0 || hrcount_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return 0;
+    ins_counter = ctx->counters + instance * (n + 1);
 
     for (i = 0; i < groups->nr; i++) {
         struct perf_evsel *evsel;

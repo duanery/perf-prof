@@ -209,6 +209,8 @@ static void profile_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
+static int profile_grow(struct prof_dev *dev);
+
 static int profile_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
 {
     struct profile_ctx *ctx = dev->private;
@@ -216,6 +218,9 @@ static int profile_read(struct prof_dev *dev, struct perf_evsel *evsel, struct p
     const char *str_in[] = {"host,guest", "host", "guest", "error"};
     const char *str_mode[] = {"all", "usr", "sys", "error"};
     int in, mode, oncpu;
+
+    if (instance < 0 || profile_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return 0;
 
     if (count->val > ctx->cycles[instance]) {
         cycles = count->val - ctx->cycles[instance];
@@ -240,11 +245,30 @@ static int profile_read(struct prof_dev *dev, struct perf_evsel *evsel, struct p
     return 0;
 }
 
-static void profile_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static int profile_grow(struct prof_dev *dev)
 {
+    struct profile_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->counter, ctx->nr_ins, n, sizeof(*ctx->counter)) ||
+        mem_grow_zero((void **)&ctx->cycles, ctx->nr_ins, n, sizeof(*ctx->cycles)) ||
+        mem_grow_zero((void **)&ctx->stat, ctx->nr_ins, n, sizeof(*ctx->stat)))
+        return -1;
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void profile_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct profile_ctx *ctx = dev->private;
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
+
+    if (instance < 0 || profile_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     if (data->counter > ctx->counter[instance])
         counter = data->counter - ctx->counter[instance];
@@ -264,12 +288,16 @@ static void profile_print_event(struct prof_dev *dev, union perf_event *event, i
     }
 }
 
-static void profile_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void profile_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct profile_ctx *ctx = dev->private;
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
     int print = 1;
+
+    if (instance < 0 || profile_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     if (data->counter > ctx->counter[instance])
         counter = data->counter - ctx->counter[instance];

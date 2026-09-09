@@ -28,10 +28,12 @@
 #ifdef HAVE_RPMALLOC
 #include <rpmalloc.h>
 #endif
+#include <linux/hashtable.h>
 #include <linux/thread_map.h>
 #include <linux/cgroup.h>
 #include <trace_helpers.h>
 #include <monitor.h>
+#include <internal/evlist.h>
 #include <tep.h>
 #include <timer.h>
 #include <stack_helpers.h>
@@ -73,30 +75,265 @@ struct monitor *monitor_next(struct monitor *m)
         return m->next;
 }
 
+#define PROF_DEV_INS_HASHBITS	8
+
+struct prof_dev_ins_node {
+    struct hlist_node hnode;
+    int cpu;
+    int tid;
+    int slot;
+    bool valid;
+};
+
+static inline u64 prof_dev_ins_key(int cpu, int tid)
+{
+    return ((u64)(u32)cpu << 32) | (u32)tid;
+}
+
+static void prof_dev_ins_tab_exit(struct prof_dev *dev)
+{
+    int i;
+
+    if (dev->ins_tab.slots) {
+        for (i = 0; i < dev->ins_tab.nr; i++)
+            free(dev->ins_tab.slots[i]);
+        free(dev->ins_tab.slots);
+        dev->ins_tab.slots = NULL;
+    }
+    free(dev->ins_tab.hash);
+    dev->ins_tab.hash = NULL;
+    dev->ins_tab.nr = 0;
+    dev->ins_tab.cap = 0;
+    dev->ins_tab.built_cpus = NULL;
+    dev->ins_tab.built_threads = NULL;
+}
+
+static int prof_dev_ins_tab_ensure_hash(struct prof_dev *dev)
+{
+    if (dev->ins_tab.hash)
+        return 0;
+    dev->ins_tab.hash = calloc(1 << PROF_DEV_INS_HASHBITS, sizeof(struct hlist_head));
+    return dev->ins_tab.hash ? 0 : -1;
+}
+
+static struct prof_dev_ins_node *prof_dev_ins_lookup(struct prof_dev *dev, int cpu, int tid)
+{
+    struct prof_dev_ins_node *node;
+    u64 key = prof_dev_ins_key(cpu, tid);
+
+    if (!dev->ins_tab.hash)
+        return NULL;
+    hlist_for_each_entry(node, &dev->ins_tab.hash[hash_min(key, PROF_DEV_INS_HASHBITS)], hnode)
+        if (node->cpu == cpu && node->tid == tid)
+            return node;
+    return NULL;
+}
+
+/* Append, or reuse the first hole. Returns the slot, or -1. */
+static int prof_dev_ins_occupy(struct prof_dev *dev, int cpu, int tid,
+			      bool valid, bool reuse_hole)
+{
+    struct prof_dev_ins_node *node;
+    int slot;
+
+    if (prof_dev_ins_tab_ensure_hash(dev) < 0)
+        return -1;
+
+    slot = dev->ins_tab.nr;
+    if (reuse_hole) {
+        for (slot = 0; slot < dev->ins_tab.nr; slot++) {
+            if (!((struct prof_dev_ins_node *)dev->ins_tab.slots[slot])->valid)
+                break;
+        }
+    }
+    if (slot == dev->ins_tab.nr) {
+        if (dev->ins_tab.nr == dev->ins_tab.cap) {
+            int cap = dev->ins_tab.cap ? dev->ins_tab.cap * 2 : 8;
+            void **p = realloc(dev->ins_tab.slots, cap * sizeof(*p));
+
+            if (!p)
+                return -1;
+            dev->ins_tab.slots = p;
+            dev->ins_tab.cap = cap;
+        }
+        node = zalloc(sizeof(*node));
+        if (!node)
+            return -1;
+        INIT_HLIST_NODE(&node->hnode);
+        node->slot = slot;
+        dev->ins_tab.slots[slot] = node;
+        dev->ins_tab.nr++;
+    } else {
+        node = dev->ins_tab.slots[slot];
+        node->slot = slot;
+    }
+
+    node->cpu = cpu;
+    node->tid = tid;
+    node->valid = valid;
+    if (valid) {
+        u64 key = prof_dev_ins_key(cpu, tid);
+
+        hlist_add_head(&node->hnode,
+                       &dev->ins_tab.hash[hash_min(key, PROF_DEV_INS_HASHBITS)]);
+    }
+    return slot;
+}
+
+/*
+ * Rebuild from the device maps when they are replaced (profiler init is
+ * allowed to reassign cpus/threads). Same pointer means the table already
+ * matches, including any slots added later by prof_dev_ins_add().
+ */
+static void prof_dev_ins_tab_rebuild(struct prof_dev *dev)
+{
+    int i, n;
+
+    if (dev->ins_tab.built_cpus == dev->cpus &&
+        dev->ins_tab.built_threads == dev->threads)
+        return;
+
+    prof_dev_ins_tab_exit(dev);
+    if (!dev->cpus || !dev->threads)
+        return;
+
+    if (!perf_cpu_map__empty(dev->cpus)) {
+        n = perf_cpu_map__nr(dev->cpus);
+        for (i = 0; i < n; i++)
+            if (prof_dev_ins_occupy(dev, perf_cpu_map__cpu(dev->cpus, i), -1, true, false) < 0)
+                goto fail;
+    } else {
+        n = perf_thread_map__nr(dev->threads);
+        for (i = 0; i < n; i++) {
+            pid_t tid = perf_thread_map__pid(dev->threads, i);
+            bool valid = perf_thread_map__valid(dev->threads, i);
+
+            /* Keep the slot aligned with the thread-map index, holes included. */
+            if (prof_dev_ins_occupy(dev, -1, tid, valid, false) < 0)
+                goto fail;
+        }
+    }
+    dev->ins_tab.built_cpus = dev->cpus;
+    dev->ins_tab.built_threads = dev->threads;
+    return;
+
+fail:
+    prof_dev_ins_tab_exit(dev);
+}
+
 int prof_dev_nr_ins(struct prof_dev *dev)
 {
-    int nr_ins;
-
-    nr_ins = perf_cpu_map__nr(dev->cpus);
-    if (perf_cpu_map__empty(dev->cpus))
-        nr_ins = perf_thread_map__nr(dev->threads);
-
-    return nr_ins;
+    prof_dev_ins_tab_rebuild(dev);
+    return dev->ins_tab.nr;
 }
 
 int prof_dev_ins_cpu(struct prof_dev *dev, int ins)
 {
-    return perf_cpu_map__cpu(dev->cpus, ins);
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    if (ins < 0 || ins >= dev->ins_tab.nr)
+        return -1;
+    node = dev->ins_tab.slots[ins];
+    return node->valid ? node->cpu : -1;
 }
 
 int prof_dev_ins_thread(struct prof_dev *dev, int ins)
 {
-    return perf_thread_map__pid(dev->threads, ins);
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    if (ins < 0 || ins >= dev->ins_tab.nr)
+        return -1;
+    node = dev->ins_tab.slots[ins];
+    return node->valid ? node->tid : -1;
 }
 
 int prof_dev_ins_oncpu(struct prof_dev *dev)
 {
     return !perf_cpu_map__empty(dev->cpus);
+}
+
+int prof_dev_ins(struct prof_dev *dev, int cpu, int tid)
+{
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    node = prof_dev_ins_lookup(dev, cpu, tid);
+    return node ? node->slot : -1;
+}
+
+void prof_dev_ins_pair(struct prof_dev *dev, int ins, int *cpu, int *tid)
+{
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    if (ins < 0 || ins >= dev->ins_tab.nr) {
+        *cpu = -1;
+        *tid = -1;
+        return;
+    }
+    node = dev->ins_tab.slots[ins];
+    if (!node->valid) {
+        *cpu = -1;
+        *tid = -1;
+        return;
+    }
+    *cpu = node->cpu;
+    *tid = node->tid;
+}
+
+bool prof_dev_ins_valid(struct prof_dev *dev, int ins)
+{
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    if (ins < 0 || ins >= dev->ins_tab.nr)
+        return false;
+    node = dev->ins_tab.slots[ins];
+    return node->valid;
+}
+
+int prof_dev_ins_add(struct prof_dev *dev, int cpu, int tid)
+{
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    node = prof_dev_ins_lookup(dev, cpu, tid);
+    if (node)
+        return node->slot;
+    /*
+     * Append only. Reusing a hole would hand a new thread the leftover
+     * counters of the previous occupant; profilers grow their arrays to
+     * the new high-water mark instead.
+     */
+    return prof_dev_ins_occupy(dev, cpu, tid, true, false);
+}
+
+int prof_dev_ins_del(struct prof_dev *dev, int cpu, int tid)
+{
+    struct prof_dev_ins_node *node;
+
+    prof_dev_ins_tab_rebuild(dev);
+    node = prof_dev_ins_lookup(dev, cpu, tid);
+    if (!node)
+        return -1;
+    hlist_del_init(&node->hnode);
+    node->valid = false;
+    return node->slot;
+}
+
+void *mem_realloc_zero(void *p, int old_n, int new_n, size_t elem)
+{
+    void *n;
+
+    if (new_n <= old_n)
+        return p;
+    n = realloc(p, (size_t)new_n * elem);
+    if (!n)
+        return NULL;
+    memset((char *)n + (size_t)old_n * elem, 0, (size_t)(new_n - old_n) * elem);
+    return n;
 }
 
 int main_epoll_add(int fd, unsigned int events, void *ptr, handle_event handle)
@@ -1810,16 +2047,15 @@ static inline void print_lost_events(struct prof_dev *dev)
     }
 }
 
-void print_lost_fn(struct prof_dev *dev, union perf_event *event, int ins)
+void print_lost_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct env *env = dev->env;
     if (env->exit_n) return;
     if (unlikely(env->verbose >= VERBOSE_NOTICE)) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         print_time(stderr);
         fprintf(stderr, "%s: lost %llu events on %s #%d\n", dev->prof->name, event->lost.lost,
-                        oncpu ? "CPU" : "thread",
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+                        cpu != -1 ? "CPU" : "thread",
+                        cpu != -1 ? cpu : tid);
     } else {
         dev->lost_events += event->lost.lost;
         if (!env->interval) {
@@ -1832,65 +2068,60 @@ void print_lost_fn(struct prof_dev *dev, union perf_event *event, int ins)
     }
 }
 
-static void print_fork_exit_fn(struct prof_dev *dev, union perf_event *event, int ins, int exit)
+static void print_fork_exit_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int exit)
 {
     if (dev->env->verbose >= VERBOSE_ALL) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         print_time(stderr);
         fprintf(stderr, "%s: %s ppid %u ptid %u pid %u tid %u on %s #%d\n", dev->prof->name,
                         exit ? "exit" : "fork",
                         event->fork.ppid, event->fork.ptid,
                         event->fork.pid,  event->fork.tid,
-                        oncpu ? "CPU" : "thread",
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+                        cpu != -1 ? "CPU" : "thread",
+                        cpu != -1 ? cpu : tid);
     }
 }
 
-static void print_comm_fn(struct prof_dev *dev, union perf_event *event, int ins)
+static void print_comm_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     if (dev->env->verbose >= VERBOSE_ALL) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         print_time(stderr);
         fprintf(stderr, "%s: comm pid %u tid %u %s on %s #%d\n", dev->prof->name,
                         event->comm.pid,  event->comm.tid,
                         event->comm.comm,
-                        oncpu ? "CPU" : "thread",
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+                        cpu != -1 ? "CPU" : "thread",
+                        cpu != -1 ? cpu : tid);
     }
 }
 
-static void print_throttle_unthrottle_fn(struct prof_dev *dev, union perf_event *event, int ins, int unthrottle)
+static void print_throttle_unthrottle_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int unthrottle)
 {
     if (dev->env->verbose >= VERBOSE_NOTICE) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         prof_dev_print_time(dev, event->throttle.time, stderr);
         fprintf(stderr, "%s: %llu.%06llu: %s events on %s #%d\n", dev->prof->name,
                         event->throttle.time / NSEC_PER_SEC, (event->throttle.time % NSEC_PER_SEC)/1000,
                         unthrottle ? "unthrottle" : "throttle",
-                        oncpu ? "CPU" : "thread",
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+                        cpu != -1 ? "CPU" : "thread",
+                        cpu != -1 ? cpu : tid);
     }
 }
 
-static void print_context_switch_fn(struct prof_dev *dev, union perf_event *event, int ins)
+static void print_context_switch_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     if (dev->env->verbose >= VERBOSE_ALL) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         print_time(stderr);
-        fprintf(stderr, "%s: switch on %s #%d\n", oncpu ? "CPU" : "thread", dev->prof->name,
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+        fprintf(stderr, "%s: switch on %s #%d\n", dev->prof->name,
+                        cpu != -1 ? "CPU" : "thread", cpu != -1 ? cpu : tid);
     }
 }
 
-static void print_context_switch_cpu_fn(struct prof_dev *dev, union perf_event *event, int ins)
+static void print_context_switch_cpu_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     if (dev->env->verbose >= VERBOSE_ALL) {
-        int oncpu = prof_dev_ins_oncpu(dev);
         print_time(stderr);
         fprintf(stderr, "%s: switch next pid %u tid %u on %s #%d\n", dev->prof->name,
                         event->context_switch.next_prev_pid, event->context_switch.next_prev_tid,
-                        oncpu ? "CPU" : "thread",
-                        oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins));
+                        cpu != -1 ? "CPU" : "thread",
+                        cpu != -1 ? cpu : tid);
     }
 }
 
@@ -1911,7 +2142,7 @@ static void print_context_switch_cpu_fn(struct prof_dev *dev, union perf_event *
  * Returns the wrapped PERF_RECORD_DEV event, or NULL if the event should be skipped.
  */
 static inline union perf_event *
-perf_event_forward(struct prof_dev *dev, union perf_event *event, int *instance, bool *writable, bool *converted)
+perf_event_forward(struct prof_dev *dev, union perf_event *event, int *cpu, int *tid, bool *writable, bool *converted)
 {
     struct perf_record_dev *event_dev = (void *)dev->forward.event_dev;
     void *data;
@@ -1920,7 +2151,7 @@ perf_event_forward(struct prof_dev *dev, union perf_event *event, int *instance,
 
     // 1. Userspace ftrace filter: skip events that don't match the filter expression.
     if (unlikely(dev->ftrace_filter &&
-                 dev->prof->ftrace_filter(dev, event, *instance) <= 0))
+                 dev->prof->ftrace_filter(dev, event, *cpu, *tid) <= 0))
         return NULL;
 
     // 2. Python stack: attach Python callchain to the event if enabled.
@@ -1944,8 +2175,9 @@ perf_event_forward(struct prof_dev *dev, union perf_event *event, int *instance,
     event_dev->tid = *(u32 *)(data + dev->pos.tid_pos + sizeof(u32));
     if (dev->pos.id_pos >= 0)
         event_dev->id = *(u64 *)(data + dev->pos.id_pos);
-    event_dev->cpu = dev->pos.cpu_pos >= 0 ? *(u32 *)(data + dev->pos.cpu_pos) : perf_cpu_map__cpu(dev->cpus, *instance);
-    event_dev->instance = *instance;
+    event_dev->cpu = dev->pos.cpu_pos >= 0 ? *(u32 *)(data + dev->pos.cpu_pos) : *cpu;
+    event_dev->bind_cpu = *cpu;
+    event_dev->bind_tid = *tid;
     event_dev->dev = dev;
     event_dev->event = event;
 
@@ -1973,8 +2205,13 @@ perf_event_forward(struct prof_dev *dev, union perf_event *event, int *instance,
         return NULL;
     }
 
+    /*
+     * The source binding means nothing to the target when the two devices
+     * disagree on how they are bound: hand over the target's first stream
+     * instead, the original is kept in the wrapper.
+     */
     if (dev->forward.ins_reset)
-        *instance = 0;
+        prof_dev_ins_pair(dev->forward.target, 0, cpu, tid);
 
     // Mark event as writable (copied to event_dev buffer) and converted.
     *writable = 1;
@@ -1982,7 +2219,7 @@ perf_event_forward(struct prof_dev *dev, union perf_event *event, int *instance,
     return (union perf_event *)event_dev;
 }
 
-int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int instance, bool writable, bool converted)
+int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int cpu, int tid, bool writable, bool converted)
 {
     profiler *prof;
     struct env *env;
@@ -1990,7 +2227,7 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
     if (dev->forward.target) {
         // Forward upward.
         if (event->header.type == PERF_RECORD_SAMPLE) {
-            event = perf_event_forward(dev, event, &instance, &writable, &converted);
+            event = perf_event_forward(dev, event, &cpu, &tid, &writable, &converted);
             if (event == NULL)
                 return 0;
         }
@@ -2002,7 +2239,8 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
         struct perf_record_dev *event_dev = (void *)event;
         event = event_dev->event;
         dev = event_dev->dev;
-        instance = event_dev->instance;
+        cpu = event_dev->bind_cpu;
+        tid = event_dev->bind_tid;
         converted = true;
     } else if (unlikely(dev->links.pystack) &&
                event->header.type == PERF_RECORD_SAMPLE)
@@ -2014,55 +2252,55 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
     switch (event->header.type) {
     case PERF_RECORD_MMAP:
         if (prof->mmap)
-            prof->mmap(dev, event, instance);
+            prof->mmap(dev, event, cpu, tid);
         break;
     case PERF_RECORD_MMAP2:
         if (prof->mmap2)
-            prof->mmap2(dev, event, instance);
+            prof->mmap2(dev, event, cpu, tid);
         break;
     case PERF_RECORD_LOST:
         if (prof->lost)
-            prof->lost(dev, event, instance, 0, 0);
+            prof->lost(dev, event, cpu, tid, 0, 0);
         else
-            print_lost_fn(dev, event, instance);
+            print_lost_fn(dev, event, cpu, tid);
         break;
     case PERF_RECORD_FORK:
         if (prof->fork)
-            prof->fork(dev, event, instance);
+            prof->fork(dev, event, cpu, tid);
         else
-            print_fork_exit_fn(dev, event, instance, 0);
+            print_fork_exit_fn(dev, event, cpu, tid, 0);
         break;
     case PERF_RECORD_COMM:
         if (prof->comm)
-            prof->comm(dev, event, instance);
+            prof->comm(dev, event, cpu, tid);
         else
-            print_comm_fn(dev, event, instance);
+            print_comm_fn(dev, event, cpu, tid);
         break;
     case PERF_RECORD_EXIT:
         if (prof->exit)
-            prof->exit(dev, event, instance);
+            prof->exit(dev, event, cpu, tid);
         else
-            print_fork_exit_fn(dev, event, instance, 1);
+            print_fork_exit_fn(dev, event, cpu, tid, 1);
         break;
     case PERF_RECORD_THROTTLE:
         if (prof->throttle)
-            prof->throttle(dev, event, instance);
+            prof->throttle(dev, event, cpu, tid);
         else
-            print_throttle_unthrottle_fn(dev, event, instance, 0);
+            print_throttle_unthrottle_fn(dev, event, cpu, tid, 0);
         break;
     case PERF_RECORD_UNTHROTTLE:
         if (prof->unthrottle)
-            prof->unthrottle(dev, event, instance);
+            prof->unthrottle(dev, event, cpu, tid);
         else
-            print_throttle_unthrottle_fn(dev, event, instance, 1);
+            print_throttle_unthrottle_fn(dev, event, cpu, tid, 1);
         break;
     case PERF_RECORD_DEV:
     case PERF_RECORD_SAMPLE:
-        perfeval_sample(dev, event, instance);
+        perfeval_sample(dev, event, cpu, tid);
         if (likely(!env->exit_n) || ++dev->sampled_events <= env->exit_n) {
             if (prof->sample) {
                 if (unlikely(dev->ftrace_filter && event->header.type == PERF_RECORD_SAMPLE &&
-                             prof->ftrace_filter(dev, event, instance) <= 0))
+                             prof->ftrace_filter(dev, event, cpu, tid) <= 0))
                     goto __break;
 
                 if (likely(!converted))
@@ -2078,7 +2316,7 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
                     }
                 }
 
-                prof->sample(dev, event, instance);
+                prof->sample(dev, event, cpu, tid);
             }
         }
         if (unlikely(env->exit_n) && dev->sampled_events >= env->exit_n)
@@ -2086,35 +2324,35 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
         break;
     case PERF_RECORD_SWITCH:
         if (prof->context_switch)
-            prof->context_switch(dev, event, instance);
+            prof->context_switch(dev, event, cpu, tid);
         else
-            print_context_switch_fn(dev, event, instance);
+            print_context_switch_fn(dev, event, cpu, tid);
         break;
     case PERF_RECORD_SWITCH_CPU_WIDE:
         if (prof->context_switch_cpu)
-            prof->context_switch_cpu(dev, event, instance);
+            prof->context_switch_cpu(dev, event, cpu, tid);
         else
-            print_context_switch_cpu_fn(dev, event, instance);
+            print_context_switch_cpu_fn(dev, event, cpu, tid);
         break;
     case PERF_RECORD_NAMESPACES:
         if (prof->namespaces)
-            prof->namespaces(dev, event, instance);
+            prof->namespaces(dev, event, cpu, tid);
         break;
     case PERF_RECORD_KSYMBOL:
         if (prof->ksymbol)
-            prof->ksymbol(dev, event, instance);
+            prof->ksymbol(dev, event, cpu, tid);
         break;
     case PERF_RECORD_BPF_EVENT:
         if (prof->bpf_event)
-            prof->bpf_event(dev, event, instance);
+            prof->bpf_event(dev, event, cpu, tid);
         break;
     case PERF_RECORD_CGROUP:
         if (prof->cgroup)
-            prof->cgroup(dev, event, instance);
+            prof->cgroup(dev, event, cpu, tid);
         break;
     case PERF_RECORD_TEXT_POKE:
         if (prof->text_poke)
-            prof->text_poke(dev, event, instance);
+            prof->text_poke(dev, event, cpu, tid);
         break;
     case PERF_RECORD_ORDER_TIME:
         break;
@@ -2132,7 +2370,7 @@ static void perf_event_handle_mmap(struct prof_dev *dev, struct perf_mmap *map)
 {
     union perf_event *event;
     bool writable = false;
-    int idx;
+    int cpu, tid;
 
     if (dev->order.enabled) {
         order_mmap(dev, map);
@@ -2142,33 +2380,111 @@ static void perf_event_handle_mmap(struct prof_dev *dev, struct perf_mmap *map)
     if (perf_mmap__read_init(map) < 0)
         return;
 
-    idx = perf_mmap__idx(map);
+    /* Every event in this ring buffer comes from the cpu/thread it is bound to. */
+    cpu = perf_mmap__cpu(map);
+    tid = perf_mmap__tid(map);
     perf_event_convert_read_tsc_conversion(dev, map);
     while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
         /* process event */
-        perf_event_process_record(dev, event, idx, writable, false);
+        perf_event_process_record(dev, event, cpu, tid, writable, false);
         perf_mmap__consume(map);
     }
     perf_mmap__read_done(map);
+}
+
+static void prof_dev_consume_mmap(struct prof_dev *dev, struct perf_mmap *map)
+{
+    struct prof_dev *main_dev = order_main_dev(dev);
+
+    if (dev->order.enabled && !main_dev->order.inprocess)
+        order_mmap(dev, map);
+    else if (!dev->order.enabled || main_dev->order.inprocess) {
+        union perf_event *event;
+        bool writable = false;
+        int cpu = perf_mmap__cpu(map);
+        int tid = perf_mmap__tid(map);
+
+        if (perf_mmap__read_init(map) < 0)
+            return;
+        while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+            perf_event_process_record(dev, event, cpu, tid, writable, false);
+            perf_mmap__consume(map);
+        }
+        perf_mmap__read_done(map);
+    }
+}
+
+int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct perf_mmap *map;
+    int err;
+
+    err = perf_evlist__add_thread(dev->evlist, pid);
+    if (err)
+        return err;
+    if (prof_dev_ins_add(dev, -1, pid) < 0)
+        return -1;
+    map = perf_evlist__find_mmap(dev->evlist, -1, pid, dev->env->overwrite);
+    if (map && dev->order.enabled && order_mmap_add(dev, map) < 0)
+        return -1;
+    return 0;
+}
+
+int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct perf_mmap *map;
+
+    map = perf_evlist__find_mmap(dev->evlist, -1, pid, dev->env->overwrite);
+    if (map) {
+        prof_dev_consume_mmap(dev, map);
+        if (dev->order.enabled)
+            order_mmap_del(dev, map);
+    }
+    perf_evlist__del_thread(dev->evlist, pid);
+    prof_dev_ins_del(dev, -1, pid);
+    return 0;
+}
+
+static void prof_dev_pollfd_gone(struct prof_dev *dev, int fd, bool hangup)
+{
+    if (main_epoll_del(fd) == 0 && dev->nr_pollfd > 0)
+        dev->nr_pollfd--;
+    /*
+     * Only POLLHUP means "this fd's task exited". del_thread also
+     * removes fds; closing from there re-enters ptrace_detach.
+     *
+     * With --ptrace the workload's first thread can exit (HUP) while
+     * later threads are still attached. Those threads keep the device
+     * via ptrace_list; the last unlink's unuse() closes it.
+     */
+    if (hangup && dev->nr_pollfd == 0 &&
+        dev->state == PROF_DEV_STATE_ACTIVE && !dev->inclose &&
+        list_empty(&dev->ptrace_list)) {
+        if (dev->prof->hangup)
+            dev->prof->hangup(dev);
+        prof_dev_close(dev);
+    }
 }
 
 static void perf_event_handle(int fd, unsigned int revents, void *ptr)
 {
     struct prof_dev *dev = perf_evlist_poll__get_external(NULL, ptr);
 
+    if (!dev)
+        return;
+    /*
+     * -N / hangup may close the device while later fds from the same
+     * epoll_wait batch are still being dispatched. Those mmaps and
+     * poll nodes may already be gone; do not touch them.
+     */
+    if (dev->inclose || dev->state != PROF_DEV_STATE_ACTIVE)
+        return;
     prof_dev_get(dev);
-    perf_event_handle_mmap(dev, ptr);
-    if (revents & EPOLLHUP) {
-        main_epoll_del(fd);
-        dev->nr_pollfd --;
-        // dev->nr_pollfd == 0, All attached processes exit.
-        if (dev->nr_pollfd == 0) {
-            // In hangup(), you can call prof_dev_close() as well.
-            if (dev->prof->hangup)
-                dev->prof->hangup(dev);
-            prof_dev_close(dev);
-        }
-    }
+    if (!dev->inclose && dev->state == PROF_DEV_STATE_ACTIVE)
+        perf_event_handle_mmap(dev, ptr);
+    if ((revents & EPOLLHUP) && !dev->inclose &&
+        dev->state == PROF_DEV_STATE_ACTIVE)
+        prof_dev_pollfd_gone(dev, fd, true);
     prof_dev_put(dev);
 }
 
@@ -2183,6 +2499,20 @@ static int __delfn(int fd, unsigned events, struct perf_mmap *mmap)
 {
     main_epoll_del(fd);
     return 0;
+}
+
+static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap *mmap)
+{
+    struct prof_dev *dev = external;
+
+    dev->nr_pollfd++;
+    return main_epoll_add(fd, events, mmap, perf_event_handle);
+}
+
+static void __poll_del(void *external, int fd, struct perf_mmap *mmap)
+{
+    (void)mmap;
+    prof_dev_pollfd_gone(external, fd, false);
 }
 
 static void interval_handle(struct timer *timer)
@@ -2237,20 +2567,45 @@ static void interval_handle(struct timer *timer)
 
     if (prof->read && dev->values) {
         struct perf_evsel *evsel;
-        int cpu, ins, tins;
-        perf_cpu_map__for_each_cpu(cpu, ins, cpus) {
-            for (tins = 0; tins < perf_thread_map__nr(threads); tins++) {
+        int cpu, ins, tins, tid;
+
+        if (prof_dev_ins_oncpu(dev)) {
+            perf_cpu_map__for_each_cpu(cpu, ins, cpus) {
+                if (!prof_dev_ins_valid(dev, ins))
+                    continue;
+                for (tins = 0; tins < perf_thread_map__nr(threads); tins++) {
+                    if (!perf_thread_map__valid(threads, tins))
+                        continue;
+                    perf_evlist__for_each_evsel(evlist, evsel) {
+                        struct perf_counts_values *count = dev->values;
+                        struct perf_cpu_map *evsel_cpus = perf_evsel__cpus(evsel);
+
+                        if (unlikely(evsel_cpus != cpus) &&
+                            perf_cpu_map__idx(evsel_cpus, cpu) < 0)
+                            continue;
+
+                        if (perf_evsel__read(evsel, ins, tins, count) == 0 &&
+                            prof->read(dev, evsel, count, ins))
+                            break;
+                    }
+                }
+            }
+        } else {
+            /*
+             * `dev->threads` is the original attach set. New ptrace
+             * threads live on each evsel's private map and in ins_tab.
+             * Pass the slot so profiler arrays match sample().
+             */
+            prof_dev_for_each_ins(dev, ins) {
+                tid = prof_dev_ins_thread(dev, ins);
                 perf_evlist__for_each_evsel(evlist, evsel) {
                     struct perf_counts_values *count = dev->values;
-                    struct perf_cpu_map *evsel_cpus = perf_evsel__cpus(evsel);
 
-                    if (unlikely(evsel_cpus != cpus) &&
-                        perf_cpu_map__idx(evsel_cpus, cpu) < 0) {
+                    tins = perf_thread_map__idx(perf_evsel__threads(evsel), tid);
+                    if (tins < 0)
                         continue;
-                    }
-
-                    if (perf_evsel__read(evsel, ins, tins, count) == 0 &&
-                        prof->read(dev, evsel, count, cpu != -1 ? ins : tins))
+                    if (perf_evsel__read(evsel, 0, tins, count) == 0 &&
+                        prof->read(dev, evsel, count, ins))
                         break;
                 }
             }
@@ -2472,8 +2827,10 @@ reinit:
 
 out_disable:
     list_del(&dev->dev_link);
-    if (dev->pages)
+    if (dev->pages) {
+        perf_evlist_poll__set_ops(evlist, NULL, NULL);
         perf_evlist_poll__foreach_fd(evlist, __delfn);
+    }
 
 out_del_timer:
     if (dev->env->interval) {
@@ -2506,6 +2863,7 @@ out_delete:
     perf_cpu_map__put(cpus);
     perf_cpu_map__put(online);
     perf_thread_map__put(threads);
+    prof_dev_ins_tab_exit(dev);
     perf_cpu_map__put(dev->cpus);
     perf_thread_map__put(dev->threads);
     dev->cpus = NULL;
@@ -2689,6 +3047,11 @@ int prof_dev_enable(struct prof_dev *dev)
         fprintf(stderr, "monitor(%s) poll failed\n", prof->name);
         return -1;
     }
+    /*
+     * After the initial fds are in main_epoll, track fds created or
+     * destroyed by later add_thread/del_thread.
+     */
+    perf_evlist_poll__set_ops(evlist, __poll_add, __poll_del);
 
     prof_dev_get(dev);
 
@@ -2752,8 +3115,10 @@ int prof_dev_disable(struct prof_dev *dev)
     perf_evlist__disable(evlist);
 
     // Disable subsequent perf_event_handle() calls.
-    if (dev->pages)
+    if (dev->pages) {
+        perf_evlist_poll__set_ops(evlist, NULL, NULL);
         perf_evlist_poll__foreach_fd(evlist, __delfn);
+    }
 
     if (dev->pages) {
         // Flush the ringbuffer and submit the remaining perf events.
@@ -2884,6 +3249,7 @@ static void prof_dev_free(struct prof_dev *dev)
 
     perf_evlist__set_maps(evlist, NULL, NULL);
     perf_evlist__delete(evlist);
+    prof_dev_ins_tab_exit(dev);
     perf_cpu_map__put(dev->cpus);
     perf_thread_map__put(dev->threads);
 
@@ -3059,17 +3425,18 @@ void prof_dev_print_time(struct prof_dev *dev, u64 evtime, FILE *fp)
     fprintf(fp, "%s.%06u ", timebuff, (unsigned int)tv.tv_usec);
 }
 
-void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     if (unlikely(event->header.type == PERF_RECORD_DEV)) {
         struct perf_record_dev *event_dev = (void *)event;
         event = event_dev->event;
         dev = event_dev->dev;
-        instance = event_dev->instance;
+        cpu = event_dev->bind_cpu;
+        tid = event_dev->bind_tid;
     }
 
     if (dev->prof->print_event) {
-        dev->prof->print_event(dev, event, instance, flags);
+        dev->prof->print_event(dev, event, cpu, tid, flags);
     } else {
         fprintf(stderr, "No print_event() for %s\n", dev->prof->name);
     }
@@ -3123,7 +3490,8 @@ static perfclock_t prof_dev_minevtime(struct prof_dev *dev)
         perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite) {
             union perf_event *event;
             bool writable = false;
-            int idx = perf_mmap__idx(map);
+            int cpu = perf_mmap__cpu(map);
+            int tid = perf_mmap__tid(map);
 
             if (perf_mmap__read_init(map) < 0)
                 continue;
@@ -3138,7 +3506,7 @@ static perfclock_t prof_dev_minevtime(struct prof_dev *dev)
                     perf_mmap__unread_event(map, event);
                     break;
                 } else {
-                    perf_event_process_record(dev, event, idx, writable, false);
+                    perf_event_process_record(dev, event, cpu, tid, writable, false);
                     perf_mmap__consume(map);
                 }
             }

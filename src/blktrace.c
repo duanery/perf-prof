@@ -373,13 +373,15 @@ static void blktrace_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void blktrace_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void blktrace_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
+
     struct blktrace_ctx *ctx = dev->private;
     struct block_lost_node *pos;
     struct block_lost_node *lost;
 
-    print_lost_fn(dev, event, ins);
+    print_lost_fn(dev, event, cpu, tid);
 
     // Order is enabled by default.
     // When order is enabled, event loss will be sensed in advance, but it
@@ -443,7 +445,7 @@ if (common_type == ctx->stats[i].type) { \
     r.nr_sector = data->raw.trace.nr_sector; \
 }
 
-static void blktrace_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void blktrace_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct env *env = dev->env;
     struct blktrace_ctx *ctx = dev->private;

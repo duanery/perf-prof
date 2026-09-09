@@ -36,10 +36,17 @@ struct perf_sample_id {
 
 struct perf_evsel {
 	struct list_head	 node;
+	struct perf_evlist	*evlist;
 	struct perf_event_attr	 attr;
+	/*
+	 * @cpus/@threads are the bindings in effect. @own_cpus/@own_threads are
+	 * the bindings this evsel asked for; when NULL the evlist default is
+	 * used. See __perf_evlist__propagate_maps().
+	 */
 	struct perf_cpu_map	*cpus;
 	struct perf_cpu_map	*own_cpus;
 	struct perf_thread_map	*threads;
+	struct perf_thread_map	*own_threads;
 	struct xyarray		*fd;
 	struct xyarray		*mmap;
 	struct xyarray		*sample_id;
@@ -49,6 +56,23 @@ struct perf_evsel {
 	void			*external;
 	bool			 keep_disable;
 	bool			 init_enabled;
+	/* Set once the evsel is open: the cpu binding no longer changes. */
+	bool			 cpus_bound;
+	/* Set once perf_evlist__mmap() has run over this evsel. */
+	bool			 mmaped;
+	bool			 enabled;
+	/*
+	 * @own_threads is a private copy made for perf_evsel__add_thread(),
+	 * not a map the caller pinned with perf_evsel__set_own_threads().
+	 * perf_evlist__add_thread() still drives such an evsel.
+	 */
+	bool			 threads_cow;
+	/*
+	 * Remembered so that threads added after perf_evlist__open() get the
+	 * same filter and bpf program as the fds opened up front.
+	 */
+	char			*filter;
+	int			 bpf_prog_fd;
 
 	/* parse modifier helper */
 	int			 nr_members;
@@ -74,5 +98,17 @@ void perf_evsel__close_fd(struct perf_evsel *evsel);
 void perf_evsel__free_fd(struct perf_evsel *evsel);
 int perf_evsel__alloc_id(struct perf_evsel *evsel, int ncpus, int nthreads);
 void perf_evsel__free_id(struct perf_evsel *evsel);
+
+/*
+ * The binding dimension of an evsel. A non-empty cpu map means one ring buffer
+ * per cpu (all of the evsel's threads write into the ring buffer of the cpu
+ * they run on); an empty (dummy) cpu map means one ring buffer per thread.
+ */
+bool perf_evsel__oncpu(struct perf_evsel *evsel);
+/* Resolve the (cpu, tid) ring buffer key for one fd of the evsel. */
+void perf_evsel__mmap_bind(struct perf_evsel *evsel, int cpu, int thread,
+			   int *bind_cpu, pid_t *bind_tid);
+int perf_evsel__open_one(struct perf_evsel *evsel, int cpu, int thread);
+int perf_evsel__make_threads_private(struct perf_evsel *evsel);
 
 #endif /* __LIBPERF_INTERNAL_EVSEL_H */

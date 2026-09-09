@@ -102,7 +102,7 @@ struct multi_trace_ctx {
 
     /* syscalls: exit, exit_group */
     struct perf_evsel *extra_evsel;
-    void (*extra_sample)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*extra_sample)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     /* stat */
     struct timeline_stat tl_stat;
@@ -950,14 +950,20 @@ static inline void lost_reclaim(struct prof_dev *dev, int ins)
     }
 }
 
-static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event, int ins)
+static int multi_trace_grow(struct prof_dev *dev);
+
+static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
+
     struct multi_trace_ctx *ctx = dev->private;
     struct lost_node *lost;
     struct env *env;
 
     if (event)
-        return print_lost_fn(dev, event, ins);
+        return print_lost_fn(dev, event, cpu, tid);
+    if (ins < 0 || multi_trace_grow(dev) < 0 || ins >= ctx->nr_ins)
+        return;
 
     if (ctx->lost_affect == LOST_AFFECT_INS_EVENT)
         lost = list_first_entry(&ctx->perins_lost_list[ins], struct lost_node, lost_link);
@@ -981,20 +987,29 @@ static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event
             .id = lost->lost_id,
             .lost = lost->lost,
         };
-        print_lost_fn(dev, (union perf_event *)&lost_event, lost->ins);
+        {
+            int lost_cpu, lost_tid;
+
+            prof_dev_ins_pair(dev, lost->ins, &lost_cpu, &lost_tid);
+            print_lost_fn(dev, (union perf_event *)&lost_event, lost_cpu, lost_tid);
+        }
     }
 }
 
-static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    int ins = prof_dev_ins(dev, cpu, tid);
     struct multi_trace_ctx *ctx = dev->private;
     struct lost_node *pos;
     struct lost_node *lost;
 
+    if (ins < 0 || multi_trace_grow(dev) < 0 || ins >= ctx->nr_ins)
+        return;
+
     // Without order, events are processed in the order within the ringbuffer.
     // When lost, all previous events have been processed and only need to reclaim.
     if (!using_order(dev) && !dev->env->after_event2) {
-        multi_trace_print_lost(dev, event, ins);
+        multi_trace_print_lost(dev, event, cpu, tid);
         lost_reclaim(dev, ins);
         if (ctx->need_timeline)
             timeline_free_unneeded(dev);
@@ -1059,7 +1074,7 @@ void multi_trace_print_title(union perf_event *event, struct tp *tp, const char 
     }
 
     if (event->header.type == PERF_RECORD_DEV) {
-        prof_dev_print_event(dev, event, 0, OMIT_TIMESTAMP);
+        prof_dev_print_event(dev, event, -1, -1, OMIT_TIMESTAMP);
         return;
     }
 
@@ -1565,7 +1580,12 @@ static inline void multi_trace_event_lost(struct prof_dev *dev, struct timeline_
             u64 recent_time = ctx->recent_time;
             // Ensure that the output of multi_trace_call_remaining() is also correct.
             ctx->recent_time = lost->start_time;
-            multi_trace_print_lost(dev, NULL, tl_event->ins);
+            {
+                int lost_cpu, lost_tid;
+
+                prof_dev_ins_pair(dev, tl_event->ins, &lost_cpu, &lost_tid);
+                multi_trace_print_lost(dev, NULL, lost_cpu, lost_tid);
+            }
             // delete A
             lost_reclaim(dev, tl_event->ins);
             ctx->recent_time = recent_time;
@@ -1596,7 +1616,7 @@ static inline void multi_trace_event_lost(struct prof_dev *dev, struct timeline_
     }
 }
 
-static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
@@ -1621,8 +1641,32 @@ static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
-static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int multi_trace_grow(struct prof_dev *dev)
 {
+    struct multi_trace_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
+    int i;
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->perins_list, ctx->nr_ins, n, sizeof(*ctx->perins_list)))
+        return -1;
+    for (i = ctx->nr_ins; i < n; i++)
+        INIT_LIST_HEAD(&ctx->perins_list[i]);
+    if (ctx->perins_lost_list) {
+        if (mem_grow_zero((void **)&ctx->perins_lost_list, ctx->nr_ins, n,
+                          sizeof(*ctx->perins_lost_list)))
+            return -1;
+        for (i = ctx->nr_ins; i < n; i++)
+            INIT_LIST_HEAD(&ctx->perins_lost_list[i]);
+    }
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct env *env = dev->env;
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
@@ -1635,6 +1679,9 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     int i, j;
     bool need_find_prev, need_backup, need_remove_from_backup;
     u64 key;
+
+    if (instance < 0 || multi_trace_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     if (hdr->time > ctx->recent_time)
         ctx->recent_time = hdr->time;
@@ -1659,7 +1706,7 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     }
 
     if (evsel == ctx->extra_evsel) {
-        ctx->extra_sample(dev, event, instance);
+        ctx->extra_sample(dev, event, cpu, tid);
     }
 
 not_found:
@@ -2094,7 +2141,7 @@ static profiler kmemprof = {
 PROFILER_REGISTER(kmemprof);
 
 
-static void syscalls_extra_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void syscalls_extra_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct multi_trace_type_raw *raw = (void *)event->sample.array;
     struct sched_process_free *proc_free = (void *)raw->raw.data;

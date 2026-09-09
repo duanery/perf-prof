@@ -8,6 +8,7 @@
 
 struct event_care_ctx {
     struct tp_list *tp_list;
+    int nr_ins;
 
     // detect out-of-order
     struct {
@@ -36,7 +37,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx->tp_list)
         goto failed;
 
-    ctx->perins_info = calloc(prof_dev_nr_ins(dev), sizeof(*ctx->perins_info));
+    ctx->nr_ins = prof_dev_nr_ins(dev);
+    ctx->perins_info = calloc(ctx->nr_ins, sizeof(*ctx->perins_info));
     if (!ctx->perins_info)
         goto free_tp_list;
 
@@ -61,7 +63,7 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     struct event_care_ctx *ctx = dev->private;
 
     if (dev->env->callchain) {
-        int i, nr_ins = prof_dev_nr_ins(dev);
+        int i, nr_ins = ctx->nr_ins;
 
         for (i = 0; i < nr_ins; i++)
             if (ctx->perins_info[i].event)
@@ -106,7 +108,7 @@ static int event_care_init(struct prof_dev *dev)
     prof_dev_env2attr(dev, &attr);
 
     for_each_real_tp(tp_list, tp, i) {
-        tp->private = calloc(prof_dev_nr_ins(dev), sizeof(unsigned long));
+        tp->private = calloc(ctx->nr_ins, sizeof(unsigned long));
         if (!tp->private)
             goto failed;
 
@@ -192,8 +194,28 @@ found:
         print_callchain_common(ctx->cc, &hdr->callchain, 0);
 }
 
-static void event_care_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int event_care_grow(struct prof_dev *dev)
 {
+    struct event_care_ctx *ctx = dev->private;
+    int n = prof_dev_nr_ins(dev);
+    struct tp *tp;
+    int i;
+
+    if (n <= ctx->nr_ins)
+        return 0;
+    if (mem_grow_zero((void **)&ctx->perins_info, ctx->nr_ins, n, sizeof(*ctx->perins_info)))
+        return -1;
+    for_each_real_tp(ctx->tp_list, tp, i) {
+        if (mem_grow_zero(&tp->private, ctx->nr_ins, n, sizeof(unsigned long)))
+            return -1;
+    }
+    ctx->nr_ins = n;
+    return 0;
+}
+
+static void event_care_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    int instance = prof_dev_ins(dev, cpu, tid);
     struct event_care_ctx *ctx = dev->private;
     struct tp_list *tp_list = ctx->tp_list;
     struct sample_type_header *hdr = (void *)event->sample.array;
@@ -201,6 +223,9 @@ static void event_care_sample(struct prof_dev *dev, union perf_event *event, int
     struct tp *tp = NULL;
     unsigned long *counters;
     int i;
+
+    if (instance < 0 || event_care_grow(dev) < 0 || instance >= ctx->nr_ins)
+        return;
 
     evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
     if (!evsel) {

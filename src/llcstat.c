@@ -266,6 +266,9 @@ static void llcstat_interval(struct prof_dev *dev)
     for (ins = 0; ins < ctx->nr_ins; ins ++) {
         float hit = 0.0;
         float run = 0.0;
+
+        if (!prof_dev_ins_valid(dev, ins))
+            continue;
         if (ctx->l3_cache_references[ins].incremental > ctx->l3_cache_misses[ins].incremental)
             hit = (ctx->l3_cache_references[ins].incremental - ctx->l3_cache_misses[ins].incremental) * 100.0 /
                    ctx->l3_cache_references[ins].incremental;

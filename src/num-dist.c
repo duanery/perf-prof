@@ -271,7 +271,7 @@ static void __print_callchain(struct num_dist_ctx *ctx, union perf_event *event,
     print_callchain_data(ctx->cc, &cd);
 }
 
-static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct num_dist_ctx *ctx = dev->private;
     struct sample_type_header *hdr = (void *)event->sample.array;
@@ -287,8 +287,10 @@ static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event
     return tp_prog_run(tp, tp->ftrace_filter, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
 }
 
-static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    int instance = prof_dev_ins(dev, cpu, tid);
+
     struct num_dist_ctx *ctx = dev->private;
     struct env *env = dev->env;
     struct sample_type_header *hdr = (void *)event->sample.array;

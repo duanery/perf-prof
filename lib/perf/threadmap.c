@@ -32,6 +32,37 @@ struct perf_thread_map *perf_thread_map__realloc(struct perf_thread_map *map, in
 
 #define thread_map__alloc(__nr) perf_thread_map__realloc(NULL, __nr)
 
+struct perf_thread_map *perf_thread_map__dup(struct perf_thread_map *orig)
+{
+	struct perf_thread_map *map;
+	int i;
+
+	if (!orig)
+		return NULL;
+
+	map = thread_map__alloc(orig->nr);
+	if (!map)
+		return NULL;
+
+	map->nr = orig->nr;
+	map->err_thread = orig->err_thread;
+	refcount_set(&map->refcnt, 1);
+
+	for (i = 0; i < orig->nr; i++) {
+		map->map[i].pid = orig->map[i].pid;
+		map->map[i].cgroup = orig->map[i].cgroup;
+		if (orig->map[i].comm) {
+			map->map[i].comm = strdup(orig->map[i].comm);
+			if (!map->map[i].comm) {
+				perf_thread_map__put(map);
+				return NULL;
+			}
+		}
+	}
+
+	return map;
+}
+
 void perf_thread_map__set_pid(struct perf_thread_map *map, int thread, pid_t pid)
 {
 	map->map[thread].pid = pid;
@@ -102,10 +133,21 @@ int perf_thread_map__idx(struct perf_thread_map *map, int pid)
 {
     int i;
 
+    if (!map || pid == PERF_THREAD_MAP_HOLE)
+        return -1;
+
     for (i = 0; i < map->nr; i++) {
         if (map->map[i].pid == pid)
             return i;
     }
 	return -1;
+}
+
+bool perf_thread_map__valid(struct perf_thread_map *map, int thread)
+{
+	if (!map)
+		return thread == 0;
+
+	return thread < map->nr && map->map[thread].pid != PERF_THREAD_MAP_HOLE;
 }
 

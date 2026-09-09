@@ -9,16 +9,33 @@
 #define PERF_EVLIST__HLIST_BITS 8
 #define PERF_EVLIST__HLIST_SIZE (1 << PERF_EVLIST__HLIST_BITS)
 
+#define PERF_EVLIST__MMAP_HLIST_BITS 6
+#define PERF_EVLIST__MMAP_HLIST_SIZE (1 << PERF_EVLIST__MMAP_HLIST_BITS)
+
 struct perf_cpu_map;
 struct perf_thread_map;
 struct perf_mmap_param;
+
+struct perf_mmap;
+
+/*
+ * @add/@del let the owner of an external poll loop track fds that appear or go
+ * away after perf_evlist__mmap(), i.e. when threads are added or removed.
+ */
+typedef int (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
+				      struct perf_mmap *map);
+typedef void (*perf_evlist_poll_del_t)(void *external, int fd,
+				       struct perf_mmap *map);
 
 struct perf_evlist_poll {
 	int epfd;
 	int maxevents;
 	struct epoll_event *events;
 	void *external;
-	int nr;
+	perf_evlist_poll_add_t add;
+	perf_evlist_poll_del_t del;
+	int nr;		/* high water mark of used slots */
+	int nr_live;	/* slots currently holding an fd */
 	int nr_alloc;
 	struct perf_evlist_poll_data {
 		int fd;
@@ -45,22 +62,23 @@ struct perf_evlist {
 	size_t			 mmap_len;
 	struct perf_evlist_poll epoll;
 	struct hlist_head	 heads[PERF_EVLIST__HLIST_SIZE];
-	struct perf_mmap	*mmap;
-	struct perf_mmap	*mmap_ovw;
-	struct perf_mmap	*mmap_first;
-	struct perf_mmap	*mmap_ovw_first;
+	/*
+	 * Ring buffers are allocated on demand and shared by every evsel with
+	 * the same (cpu, tid, overwrite) binding. @mmap_list/@mmap_ovw_list keep
+	 * them in creation order for perf_evlist__for_each_mmap(), @mmap_heads
+	 * indexes them by binding for perf_evlist__find_mmap().
+	 */
+	struct list_head	 mmap_list;
+	struct list_head	 mmap_ovw_list;
+	struct hlist_head	 mmap_heads[PERF_EVLIST__MMAP_HLIST_SIZE];
+	int			 next_mmap_idx;
+	bool			 mmaped;
 };
 
-typedef void
-(*perf_evlist_mmap__cb_idx_t)(struct perf_evlist*, struct perf_mmap_param*, int, bool);
-typedef struct perf_mmap*
-(*perf_evlist_mmap__cb_get_t)(struct perf_evlist*, bool, int);
 typedef int
 (*perf_evlist_mmap__cb_mmap_t)(struct perf_mmap*, struct perf_mmap_param*, int, int);
 
 struct perf_evlist_mmap_ops {
-	perf_evlist_mmap__cb_idx_t	idx;
-	perf_evlist_mmap__cb_get_t	get;
 	perf_evlist_mmap__cb_mmap_t	mmap;
 };
 
@@ -69,7 +87,11 @@ int perf_evlist_poll__alloc(struct perf_evlist *evlist);
 void perf_evlist_poll__free(struct perf_evlist *evlist);
 int perf_evlist_poll__add(struct perf_evlist *evlist, int fd,
 			  struct perf_mmap *mmap, unsigned revent);
-int perf_evlist_poll__del(struct perf_evlist *evlist, int fd);
+int perf_evlist_poll__del(struct perf_evlist *evlist, int n);
+int perf_evlist_poll__del_fd(struct perf_evlist *evlist, int fd);
+void perf_evlist_poll__set_ops(struct perf_evlist *evlist,
+			       perf_evlist_poll_add_t add,
+			       perf_evlist_poll_del_t del);
 
 
 int perf_evlist__mmap_ops(struct perf_evlist *evlist,
@@ -78,6 +100,18 @@ int perf_evlist__mmap_ops(struct perf_evlist *evlist,
 
 void perf_evlist__init(struct perf_evlist *evlist);
 void perf_evlist__exit(struct perf_evlist *evlist);
+
+/*
+ * Attach one already open fd of @evsel to the ring buffer of its binding,
+ * creating the ring buffer if this is the first fd to use it. Used both by
+ * perf_evlist__mmap() and by the dynamic thread path.
+ */
+int perf_evlist__mmap_evsel_fd(struct perf_evlist *evlist,
+			       struct perf_evsel *evsel,
+			       int cpu, int thread);
+void perf_evlist__unmap_evsel_fd(struct perf_evlist *evlist,
+				 struct perf_evsel *evsel,
+				 int cpu, int thread);
 
 /**
  * __perf_evlist__for_each_entry - iterate thru all the evsels

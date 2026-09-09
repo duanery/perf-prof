@@ -226,6 +226,9 @@ static void tlbstat_interval(struct prof_dev *dev)
         float load_hit = 0.0;
         float store_hit = 0.0;
         float run = 0.0;
+
+        if (!prof_dev_ins_valid(dev, ins))
+            continue;
         if (ctx->dTLB_loads[ins].incremental > ctx->dTLB_load_misses[ins].incremental)
             load_hit = (ctx->dTLB_loads[ins].incremental - ctx->dTLB_load_misses[ins].incremental) * 100.0 /
                         ctx->dTLB_loads[ins].incremental;
