@@ -37,7 +37,7 @@ static __always_inline int kvm_exit_oncpu(u32 exit_reason, u32 isa)
 
     data = &percpu_event[cpu];
     data->exit_reason = exit_reason;
-    data->latency = bpf_ktime_get_ns();
+    EXIT_TIME(data) = bpf_ktime_get_ns();
 
     if (!data->pid) {
         u64 id = bpf_get_current_pid_tgid();
@@ -87,27 +87,63 @@ int BPF_PROG(kvm_entry) // int vcpu_id | unsigned long vcpu_pc
         return 0;
 
     data = &percpu_event[cpu];
-    data->latency = bpf_ktime_get_ns() - (u64)data->latency;
+    data->exit_latency = bpf_ktime_get_ns() - EXIT_TIME(data);
     /*
      * A vcpu first seen at sched_switch has no kvm_exit to pair with and gets
-     * an INT64_MAX latency, which comes out negative here. Drop those before
+     * an INT64_MAX exit time, which comes out negative here. Drop those before
      * the filter runs, so an expression never sees a bogus first event.
      */
-    if (data->latency > 0) {
+    if (data->exit_latency > 0) {
         /*
-         * Resolve run_delay and sched_latency before filtering, not just
-         * before output: until this runs, run_delay still holds the raw
-         * sched_info.run_delay snapshot taken at sched_switch rather than the
-         * delta, and sched_latency is stale. An expression referring to either
-         * would otherwise see a meaningless value.
+         * Turn the scratch values into the final runq_delay and offcpu_wait
+         * before filtering, not just before output: until this runs,
+         * RUNQ_DELAY_SNAP() is the raw sched_info.run_delay snapshot taken at
+         * sched_switch rather than a delta, and OFFCPU_ACC() is the total
+         * off-CPU time, which still includes the runqueue wait. An expression
+         * referring to either field would otherwise see an intermediate.
          */
         if (data->switches) {
             struct task_struct *task = (void *)bpf_get_current_task();
             u64 run_delay = BPF_CORE_READ(task, sched_info.run_delay);
-            data->run_delay = run_delay - data->run_delay;
+            s64 offcpu = OFFCPU_ACC(data);
+            s64 runq = run_delay - RUNQ_DELAY_SNAP(data);
+
+            /*
+             * Both values below must fit inside exit_latency, but only one of
+             * them is measured on the same clock as exit_latency.
+             *
+             * offcpu is a sum of bpf_ktime_get_ns() deltas, so it cannot
+             * exceed exit_latency. runq comes from sched_info.run_delay, which
+             * the kernel accumulates in rq_clock() units: sched_info_queued()
+             * timestamps against the rq the vcpu switched *out* on, and
+             * sched_info_arrive() against the rq it switched *in* on. Those are
+             * per-CPU sched_clock() reads, not NTP-corrected and not mutually
+             * synchronised, so once the vcpu migrates the delta can come out
+             * either short or long -- long enough to exceed exit_latency and
+             * print a runqueue wait longer than the exit that contains it.
+             *
+             * Clamping runq into [0, offcpu] is not just cosmetic: time spent
+             * runnable-but-waiting is by definition part of the time spent
+             * off-CPU, so offcpu is the true upper bound. That keeps the
+             * reported breakdown self-consistent,
+             *
+             *     0 <= runq_delay + offcpu_wait == offcpu <= exit_latency
+             *
+             * and makes offcpu_wait exact rather than something that needed a
+             * negative-value guard of its own.
+             */
+            if (offcpu < 0)
+                offcpu = 0;
+            if (runq < 0)
+                runq = 0;
+            else if (runq > offcpu)
+                runq = offcpu;
+
+            data->runq_delay = runq;
+            data->offcpu_wait = offcpu - runq;
         } else {
-            data->run_delay = 0;
-            data->sched_latency = 0;
+            data->runq_delay = 0;
+            data->offcpu_wait = 0;
         }
         if (expr_filter(data))
             perf_output(ctx, data, sizeof(*data));
@@ -136,33 +172,33 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_s
         prev_event = bpf_map_lookup_elem(&kvm_vcpu, &curr->pid);
         if (!prev_event) {
             curr->switches = 0;
-            curr->sched_latency = time;
-            curr->run_delay = run_delay;
+            OFFCPU_TS(curr) = time;
+            RUNQ_DELAY_SNAP(curr) = run_delay;
             bpf_map_update_elem(&kvm_vcpu, &curr->pid, curr, BPF_ANY);
         } else {
             prev_event->exit_reason = curr->exit_reason;
-            prev_event->latency = curr->latency;
+            EXIT_TIME(prev_event) = EXIT_TIME(curr);
             /*
              * From kvm_exit to kvm_entry, the vcpu may have multiple sched_switches
              * and sched_migrations.
              *
-             * run_delay: Save it here, use it in kvm_entry and clean it up.
+             * RUNQ_DELAY_SNAP(): Save it here, use it in kvm_entry and clean it up.
              *            Depends on CONFIG_SCHED_INFO, CONFIG_SCHEDSTATS
              *
              * curr->switches: Keeps the number of switches since kvm_exit.
-             * curr->sched_latency: Cumulative value, the delay between vcpu switching
+             * OFFCPU_ACC(curr): Cumulative value, the delay between vcpu switching
              *     out and switching in, since kvm_exit.
              *
-             * prev_event->sched_latency: Contains the current time and historical
-             *     latency. In the kvm_vcpu hashmap.
+             * OFFCPU_TS(prev_event): The switch-out timestamp, biased by the
+             *     off-CPU time already accumulated. In the kvm_vcpu hashmap.
              */
             if (curr->switches == 0) {
                 prev_event->switches = 0;
-                prev_event->sched_latency = time;
-                prev_event->run_delay = run_delay;
+                OFFCPU_TS(prev_event) = time;
+                RUNQ_DELAY_SNAP(prev_event) = run_delay;
             } else {
                 prev_event->switches = curr->switches;
-                prev_event->sched_latency = time - curr->sched_latency;
+                OFFCPU_TS(prev_event) = time - OFFCPU_ACC(curr);
             }
         }
         /*
@@ -172,7 +208,7 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_s
          *  (2) awk =>idle       vcpu=>idle(update kvm_vcpu)
          *      idle=>vcpu
          *
-         * Assigning pid = 0 can avoid (1) (2) setting the old exit_reason/latency
+         * Assigning pid = 0 can avoid (1) (2) setting the old exit_reason/exit time
          * to the kvm_vcpu hashmap.
          */
         curr->pid = 0;
@@ -186,18 +222,18 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_s
             curr->pid = next_event->pid;
             curr->isa = next_event->isa;
             curr->exit_reason = next_event->exit_reason;
-            curr->latency = next_event->latency;
+            EXIT_TIME(curr) = EXIT_TIME(next_event);
             curr->switches = next_event->switches + 1;
-            curr->run_delay = next_event->run_delay;
-            curr->sched_latency = (time ?: bpf_ktime_get_ns()) - (u64)next_event->sched_latency;
+            RUNQ_DELAY_SNAP(curr) = RUNQ_DELAY_SNAP(next_event);
+            OFFCPU_ACC(curr) = (time ?: bpf_ktime_get_ns()) - OFFCPU_TS(next_event);
         } else {
             /*
              * A newly generated vCPU has no kvm_exit to pair with, so give it
-             * a latency far in the future: kvm_entry subtracts it from the
+             * an exit time far in the future: kvm_entry subtracts it from the
              * current time, and the resulting negative value is what marks the
              * event as bogus for anything that looks at it.
              */
-            curr->latency = INT64_MAX;
+            EXIT_TIME(curr) = INT64_MAX;
         }
     }
     return 0;
@@ -226,7 +262,7 @@ static __always_inline int kvm_exit_track_pid(u32 exit_reason, u32 isa)
             return 0;
     }
     data->exit_reason = exit_reason;
-    data->latency = bpf_ktime_get_ns();
+    EXIT_TIME(data) = bpf_ktime_get_ns();
     return 0;
 }
 
@@ -264,15 +300,16 @@ int BPF_PROG(kvm_entry_pid) // int vcpu_id | unsigned long vcpu_pc
     pid = (u32)id;
     data = bpf_map_lookup_elem(&kvm_vcpu, &pid);
     if (data) {
-        data->latency = bpf_ktime_get_ns() - data->latency;
+        data->exit_latency = bpf_ktime_get_ns() - EXIT_TIME(data);
         /*
-         * This path reports only up to run_delay, and never computes
-         * run_delay/sched_latency, so a filter must not rely on them here.
+         * This path never attaches to sched_switch, so switches, runq_delay
+         * and offcpu_wait are always 0 and the event is truncated before
+         * runq_delay on output. A filter must not rely on them here.
          * The map entry only exists once kvm_exit_track_pid() has run, which
-         * is why no latency validity check is needed.
+         * is why no exit-time validity check is needed.
          */
         if (expr_filter(data))
-            perf_output(ctx, data, offsetof(struct kvm_vcpu_event, run_delay));
+            perf_output(ctx, data, offsetof(struct kvm_vcpu_event, runq_delay));
     }
     return 0;
 }

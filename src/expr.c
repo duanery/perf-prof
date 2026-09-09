@@ -1389,10 +1389,11 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
              * is about to emit -- masking a field, rescaling a latency -- and
              * doing that here is cheaper than shipping the event to userspace
              * only to rewrite it. Second, the expression language has no
-             * variables of its own, so an otherwise unused event field is the
-             * only place to keep a temporary: `sched_latency = latency /
-             * switches, sched_latency > 100' has to put the quotient
-             * somewhere.
+             * variables of its own, so an event field is the only place to
+             * keep a temporary: `offcpu_wait = exit_latency /
+             * switches, offcpu_wait > 100' has to put the quotient
+             * somewhere -- at the cost of whatever that field would have
+             * reported, since an event source need not have a spare one.
              *
              * This requires the event to live in writable memory, which holds
              * for the .bss and map-value storage event sources use, and the
