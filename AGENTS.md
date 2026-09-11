@@ -89,7 +89,8 @@ perf-prof/
 |-----|-----|
 | `src/comm.c` | pid → 进程名映射，跟踪进程创建/改名 |
 | `src/convert.c` | 时间戳转换（perf → tsc / kvmclock / monotonic） |
-| `src/expr.c` | 基于 c4 的表达式编译器（事件属性 EXPR、trace event 用户态过滤器 fallback） |
+| `src/expr.c` | 基于 c4 的表达式编译器（事件属性 EXPR、trace event 用户态过滤器 fallback）；`CONFIG_LIBBPF` 下还含 `expr_to_bpf()` 后端 |
+| `src/bpf_expr_filter.c` | BPF 事件源的内核态过滤器：把编译好的表达式装进 BPF 程序 |
 | `src/event-spread.c` | 事件传播：Guest → Host 联合分析 |
 | `src/net.c` | 事件传播的 TCP 承载 |
 | `src/pystack.c` | 持续跟踪 Python 堆栈 |
@@ -128,8 +129,24 @@ perf-prof/
 ### `src/bpf-skel/` — BPF Skeleton
 
 - `kvm_exit.bpf.c`：目前唯一的 BPF 程序（`bpf:kvm_exit` 分析器用）
+- `expr_filter.bpf.h`：`DEFINE_EXPR_FILTER()` 占位符宏（见"BPF 事件源的内核态过滤"）
+- `slot_check.bpf.c`：构建期寄存器自检的被测样本，不链接进 perf-prof
 - `vmlinux.h`：内核类型定义（构建时通过 `bpftool btf dump` 生成）
 - `kvm_exit.skel.h`：libbpf 生成的 skeleton 头文件（构建时生成）
+
+### BPF 事件源的内核态过滤
+
+BPF 程序生成的事件也能做**内核态**过滤：用户给的表达式被当作 `expr_filter()` 的函数体，编译成eBPF 指令后替换掉 BPF 程序里的占位符，不满足条件的事件根本不会输出到用户态。
+涉及的文件、指令映射表、实例见 [docs/bpf_event_filter.md](docs/bpf_event_filter.md)。
+
+改动时的硬约束：
+
+- **注入窗口**：必须在 `bpf_object__open()` 之后、`bpf_object__load()` 之前替换。subprog 是在 load 内部才被复制进各调用点的，所以替换后的指令数**可以**和占位符不同，不需要预留补丁区。
+- **占位符不能随便改**：`__noinline` + `asm volatile` 消费 `event`、不引用任何全局变量，  这几条缺一不可（各自去掉后的失败方式见该文档第六节）。
+- **给新 BPF 程序加过滤**：`.bpf.c` 里写 `DEFINE_EXPR_FILTER(struct 你的事件类型)`、在输出前 `if (expr_filter(data))`。
+  事件结构体须为定长 struct、成员是标量或标量数组，且位于可写内存（`.bss` 或 map value，因为表达式允许赋值）。
+- **不支持的构造要在编译期报错**，别把问题留给 verifier 报晦涩信息。
+- **内核版本判断放在生成指令之前**，且是运行时的（如有符号 `/` `%` 需 6.6+）—— perf-prof 编译一次、可能跑在任意内核上。
 
 ### `src/sqlite/` — SQL 引擎
 
@@ -165,13 +182,33 @@ perf-prof/
 
 ### `tools/` — 独立工具集
 
-基于 perf-prof 构建的独立分析工具，每个工具自包含（脚本 + python 模块 + 设计文档），不编译进主二进制。
+基于 perf-prof 构建的独立分析工具，每个工具自包含（脚本 + 可选 python 模块 + 设计文档），不编译进主二进制。
 
-- `func_latency.sh` + `func_latency.py`：uprobe/kprobe 函数调用路径延迟分析
-- `*.py`：各类专项分析脚本（kmemleak、rundelay、syscall_latency、softirq 等）
-- `*.bt`：bpftrace 脚本（hw_irq、sched_switch、task_state 等）
+**仓库现有工具**（git 跟踪的全部内容）：
 
-**提交规则**：每个工具的源码、脚本、设计文档作为一个整体一起提交（见"提交拆分"第 4 条）。
+| 工具 | 文件 | 说明 |
+|-----|-----|-----|
+| func_latency | `func_latency.sh` + `func_latency.py` + `func_latency_design.md` | uprobe/kprobe 函数调用路径延迟分析：shell 组装事件串，python 按完整调用路径聚合耗时 |
+| exec_trace | `exec_trace.py` + `exec_trace_design.md` | 事件触发时的进程上下文快照：默认挂 `sched:sched_process_exec`，覆盖 `-e` 可用于任意事件 |
+| kvm_userspace_exit_latency | `kvm_userspace_exit_latency.py` + `kvm_userspace_exit_latency_design.md` | QEMU 处理 KVM userspace exit 的耗时统计 |
+
+**可以新增工具**，三种形态都接受：
+
+| 形态 | 依赖 | 适用 |
+|-----|-----|-----|
+| `*.py`（基于 perf-prof python） | perf-prof 自身 | 首选。兼容 3.10 老内核，事件采集交给 perf-prof，脚本只写聚合与输出逻辑 |
+| `*.bt`（bpftrace 脚本） | bpftrace，4.1+ 内核 | 高频事件、需要内核态聚合 |
+| bcc 脚本 | bcc，4.1+ 内核 | 需要 eBPF 完整能力（map、栈聚合等） |
+
+新增工具的约定：
+
+- **命名成套**：`<name>.py`（或 `.sh` + `.py`、`.bt`）+ `<name>_design.md`，同目录、独立自洽。
+- **设计文档放 `tools/` 内**（不是 `docs/plans/`），与脚本同名加 `_design` 后缀；`docs/plans/` 只放框架/分析器的设计稿。
+- **python 工具带 shebang**：`chmod +x` 后可直接执行。被别的脚本 import 的纯模块（如 `func_latency.py`）保持 0644、不加 shebang。
+- **RPM 会自动打包**：`packages/perf-prof.spec` 内会把工具安装到 `/usr/share/perf-prof/tools/`，新增脚本无需改 spec；`*.md` 设计文档不打包。
+- **同步 skill 文档**：新增/修改 tools 下的工具，需同步 `skills/perf-prof/references/tools.md` 和 `skills/perf-prof/SKILL.md` 的工具索引。
+
+**提交规则**：每个工具的源码、脚本、设计文档作为一个整体一起提交（见"提交拆分"第 4 条）；配套的 `skills/` 文档更新按文档提交单独成 commit。
 
 ### `docs/` — 项目文档
 
@@ -282,6 +319,14 @@ Makefile (主入口)
 - `HAVE_LIBUNWIND`：DWARF 栈回溯代码分支（`src/monitor.c`、`src/trace_helpers.c` 里可见）
 - `HAVE_LIBPYTHON`：python 分析器代码
 - `HAVE_CXA_DEMANGLE_SUPPORT`：C++ 符号 demangle
+- `BPF_SLOT_FIRST_R6`：BPF 表达式过滤器的栈槽基址从 r2 降级到 r6，见下
+
+**`BPF_SLOT_FIRST_R6` — 构建期的寄存器自检：**
+
+BPF 过滤器的表达式栈槽默认映射到 r2–r9（8 个槽），其中 r2–r5 那半只靠 clang 守 BPF 调用约定，
+所以每次 configure 实测一遍。不通过、或任何"没法确认"都追加 `-DBPF_SLOT_FIRST_R6`，把槽位降到
+只依赖内核机制的 r6–r9（4 个）。这个检查**只降级、不报错**，不要改成 build failure。
+细节见 [docs/bpf_event_filter.md](docs/bpf_event_filter.md) 5.2。
 
 ## 测试
 
@@ -436,11 +481,12 @@ Signed-off-by: 你的姓名 <邮箱>
 3. **文档提交** — 所有 `.md` 独立成一个 commit：
    - `README.md`、`README_CN.md`
    - `docs/**`（`main_options.md`、`profilers/*.md`、设计文档等）
-   - `skills/perf-prof/**`（SKILL.md 与 `references/profilers/*.md`）
+   - `skills/perf-prof/**`（SKILL.md、`references/profilers/*.md`、`references/tools.md`）
 
 4. **tools/ 提交** — `tools/` 下每个独立工具的源码、文档、配套脚本作为一个整体一起提交，不按上面三类拆分：
    - 例如 `tools/func_latency.sh` + `tools/func_latency.py` + `tools/func_latency_design.md` 合为一个 commit
    - 原因：tools/ 里的工具相互独立、自包含，拆开提交反而割裂了工具的完整性
+   - `tools/` 下未跟踪的本地实验脚本不要顺手带进 commit，只 `git add` 属于本工具的文件
 
 **其他约定：**
 - **测试暴露源码 bug 时，修补源码要合入到原源码 patch 里，不要另开一个"fix xxx"的补丁**：
@@ -453,7 +499,8 @@ Signed-off-by: 你的姓名 <邮箱>
 
 ### 未跟踪文件
 - `docs/thread-tracking-design.md`、`docs/plans/*.md` 目前是 untracked（不在 git 版本库里）。改动它们不需要 `git add`，除非用户明确要求入库。
-- `git add -A` 会一起吞掉临时构建产物（`.o.cmd`、`*.o`、`perf-prof` 二进制），务必用具体路径 `git add file1 file2 ...`。
+- `tools/` 下有大量未跟踪的本地实验脚本。写文档、答复用户、列举已有功能时以 `git ls-files tools/` 为准，不要把未跟踪脚本算进来。
+- `git add -A` 会一起吞掉临时构建产物（`.o.cmd`、`*.o`、`perf-prof` 二进制）和 `tools/` 的未跟踪脚本，务必用具体路径 `git add file1 file2 ...`。
 
 
 ## 相关文档
@@ -462,6 +509,7 @@ Signed-off-by: 你的姓名 <邮箱>
 - [docs/main_options.md](docs/main_options.md) — 完整选项参数字典
 - [docs/expr.md](docs/expr.md) — 表达式系统
 - [docs/Event_filtering.md](docs/Event_filtering.md) — trace event 过滤器语法
+- [docs/bpf_event_filter.md](docs/bpf_event_filter.md) — BPF 事件源的内核态过滤（表达式 → eBPF 指令）
 - [docs/profilers/](docs/profilers/) — 各分析器详细说明
 - [skills/perf-prof/SKILL.md](skills/perf-prof/SKILL.md) — 面向问题分析的工作流程
 
