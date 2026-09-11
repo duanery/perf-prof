@@ -215,3 +215,33 @@ def test_filter_reject_cpu_global():
 
 def test_filter_reject_pid_global():
     bpf_filter_reject('_pid == 0', 'undefined variable', stderr=False)
+
+
+#
+# The kvm_vcpu map is reclaimed by the BPF sched_process_free program, so the
+# global_comm service is only needed to turn a pid into a name, and only in
+# oncpu mode. It is a system-wide service (task_newtask, task_rename,
+# sched_process_free on every CPU), so it must stay off unless an option that
+# prints a name is given.
+#
+def test_no_comm_service_without_name_options(runtime, memleak_check):
+    prof = PerfProf(["bpf:kvm_exit", "-i", "1000"])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)
+
+def test_comm_service_with_than(runtime, memleak_check):
+    prof = PerfProf(["bpf:kvm_exit", "-i", "1000", "--than", "10ms"])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)
+
+def test_comm_service_with_perins_detail(runtime, memleak_check):
+    prof = PerfProf(["bpf:kvm_exit", "-i", "1000", "--perins", "--detail"])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)
+
+# --perins without --detail aggregates per process (tgid) and prints no name,
+# so it must not pull the service in either.
+def test_no_comm_service_with_perins_only(runtime, memleak_check):
+    prof = PerfProf(["bpf:kvm_exit", "-i", "1000", "--perins"])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)

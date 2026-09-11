@@ -19,7 +19,6 @@
 struct kvmexit_ctx {
     struct kvm_exit_bpf *obj;
     struct perf_evsel *evsel;
-    struct comm_notify notify;
     struct latency_dist *lat_dist;
     struct latency_dist *lat_dist2; // non-HLT, per process.
     FILE *output2;
@@ -28,6 +27,7 @@ struct kvmexit_ctx {
     bool print_header;
     bool oncpu;
     bool thread;
+    bool comm_ref;
 };
 
 struct extra_rundelay {
@@ -37,6 +37,22 @@ struct extra_rundelay {
 };
 
 #if defined(__i386__) || defined(__x86_64__)
+/*
+ * Whether exit_reason is still a kvm:kvm_exit tracepoint argument, and so
+ * readable by a raw_tp program.
+ *
+ * It stopped being one in 0a62a0319abb ("KVM: x86: Get exit_reason as part of
+ * kvm_x86_ops.get_exit_info"), in v5.16, which dropped it from TP_PROTO() and
+ * moved it into TP_fast_assign(). From there on only the trace entry has it,
+ * so the tp/kvm/kvm_exit program must be used instead. See the comment above
+ * kvm_exit() in bpf-skel/kvm_exit.bpf.c.
+ *
+ * This is the one place a kernel version is compared rather than probed: the
+ * two programs read the same tracepoint, so neither one's absence marks the
+ * change, and the field is not in BTF to be looked up. That makes it blind to
+ * a backport of the commit into a pre-5.16 kernel -- which would be reported
+ * as a verifier failure on the raw_tp program at startup, not as bad data.
+ */
 static int kvm_exit_reason_in_args(void)
 {
     int version = kernel_release();
@@ -72,15 +88,6 @@ static int kvm_exit_select_prog(struct kvm_exit_bpf *obj)
 }
 #endif
 
-static int comm_notify(struct comm_notify *notify, int pid, int state, u64 free_time)
-{
-    if (state == NOTIFY_COMM_DELETE) {
-        struct kvmexit_ctx *ctx = container_of(notify, struct kvmexit_ctx, notify);
-        bpf_map__delete_elem(ctx->obj->maps.kvm_vcpu, &pid, sizeof(pid), 0);
-    }
-    return 0;
-}
-
 static int monitor_ctx_init(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -111,14 +118,29 @@ static int monitor_ctx_init(struct prof_dev *dev)
             goto free_lat2;
     }
 
-    // Only oncpu mode needs global comm service to track system-wide process changes
-    if (ctx->oncpu) {
+    ctx->thread = env->perins && (!ctx->oncpu || env->detail);
+
+    /*
+     * global_comm is only needed to turn a pid into a process name, and only
+     * in oncpu mode -- per-process mode answers from ctx->thread_map instead.
+     * It is a system-wide service device (task_newtask, task_rename,
+     * sched_process_free on every CPU), so do not start it unless something
+     * is actually going to print a name:
+     *
+     *   ctx->thread                  per-thread rows in the interval output
+     *   --than / -vv                 per-event output via print_event()
+     *
+     * The kvm_vcpu map is reclaimed by the BPF sched_process_free program, so
+     * unlike before, correctness no longer depends on this service running.
+     * bpf_kvm_exit_print_dev() (SIGUSR2) may therefore find no names
+     * available; it degrades to "<...>" rather than forcing the service on.
+     */
+    if (ctx->oncpu &&
+        (ctx->thread || env->greater_than || env->verbose >= VERBOSE_EVENT)) {
         if (global_comm_ref() < 0)
             goto close2;
-        ctx->notify.notify = comm_notify;
-        global_comm_register_notify(&ctx->notify);
+        ctx->comm_ref = true;
     }
-    ctx->thread = env->perins && (!ctx->oncpu || env->detail);
     return 0;
 
 close2:
@@ -138,10 +160,8 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct kvmexit_ctx *ctx = dev->private;
     perf_thread_map__put(ctx->thread_map);
-    if (ctx->oncpu) {
-        global_comm_unregister_notify(&ctx->notify);
+    if (ctx->comm_ref)
         global_comm_unref();
-    }
     if (ctx->output2) fclose(ctx->output2);
     latency_dist_free(ctx->lat_dist2);
     latency_dist_free(ctx->lat_dist);
@@ -302,9 +322,14 @@ static int bpf_kvm_exit_filter(struct prof_dev *dev)
 static const char *comm_get(struct prof_dev *dev, int pid)
 {
     struct kvmexit_ctx *ctx = dev->private;
-    if (ctx->oncpu)
-        return global_comm_get(pid);
-    else {
+    if (ctx->oncpu) {
+        /*
+         * NULL when global_comm was never referenced (no name-printing option
+         * was given, so only print_dev() can get here) or when it simply has
+         * no record of the pid.
+         */
+        return global_comm_get(pid) ?: "<...>";
+    } else {
         int idx = perf_thread_map__idx(ctx->thread_map, pid);
         if (idx >= 0)
             return perf_thread_map__comm(ctx->thread_map, idx);
@@ -526,7 +551,8 @@ static const char *bpf_kvm_exit_desc[] = PROFILER_DESC("bpf:kvm_exit",
     "    -p pid     Process-specific monitoring (tracks all vcpu threads)",
     "",
     "TRACEPOINTS AND COMPATIBILITY",
-    "    Requires kvm:kvm_exit and kvm:kvm_entry; system-wide mode also uses",
+    "    Requires kvm:kvm_exit and kvm:kvm_entry, plus sched:sched_process_free",
+    "    to reclaim the state of dead vcpu threads. System-wide mode also uses",
     "    sched:sched_switch. On x86 kernels before Linux 5.16, exit_reason is",
     "    read from raw tracepoint arguments. On Linux 5.16 and later, fields",
     "    are read from the trace event entry. arm64 keeps the raw tracepoint path.",

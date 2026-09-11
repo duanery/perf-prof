@@ -32,6 +32,11 @@
  * (-C cpus) mode, which is the only mode that attaches to sched_switch. In
  * per-process (-p pid) mode they are always 0, and the event is truncated at
  * offsetof(runq_delay) on output.
+ *
+ * Entries in the kvm_vcpu map that holds this struct between kvm_exit and
+ * kvm_entry are reclaimed in BPF, by the sched_process_free program. Userspace
+ * plays no part in it, so a lost perf event cannot leave a stale entry behind
+ * to exhaust the map or to be matched against a recycled pid.
  */
 struct kvm_vcpu_event
 {

@@ -55,6 +55,44 @@ int BPF_PROG(kvm_exit, int ret, unsigned int esr_ec, unsigned long vcpu_pc)
     return kvm_exit_oncpu(EXIT_REASON((u32)ret, esr_ec), KVM_ISA_ARM);
 }
 #else
+/*
+ * x86 has two mutually exclusive ways to read exit_reason, and which one works
+ * depends on the kernel. kvm_exit_select_prog() in bpf_kvm_exit.c autoloads
+ * exactly one of the pair below.
+ *
+ * Up to v5.15 the tracepoint carried exit_reason as its first *argument*:
+ *
+ *     TP_PROTO(unsigned int exit_reason, struct kvm_vcpu *vcpu, u32 isa)
+ *
+ * so raw_tp/kvm_exit can take it straight from the argument list, which is
+ * what kvm_exit_legacy() does.
+ *
+ * Since 0a62a0319abb ("KVM: x86: Get exit_reason as part of
+ * kvm_x86_ops.get_exit_info"), in v5.16, the argument is gone:
+ *
+ *     TP_PROTO(struct kvm_vcpu *vcpu, u32 isa)
+ *
+ * exit_reason is now obtained inside TP_fast_assign(), via the
+ * get_exit_info() callback, and only ever exists as a field of the trace
+ * entry. A raw_tp program sees the *arguments*, so on v5.16+ there is no
+ * exit_reason for it to read -- and no way to synthesise one either, since
+ * get_exit_info() is a vendor callback (vmx/svm) that BPF cannot invoke.
+ * Hence the tp/kvm/kvm_exit program, which runs later in the pipeline, after
+ * TP_fast_assign() has populated the entry, and reads ctx->exit_reason.
+ *
+ * The struct below mirrors the head of that entry. It is not read from BTF,
+ * so the three fields must stay in sync with TRACE_EVENT_KVM_EXIT() in
+ * arch/x86/kvm/trace.h; fields past isa are not needed and are left out.
+ *
+ * Why `return 1' rather than 0: for a tp program the return value gates
+ * whether the trace entry is still delivered to perf. See
+ * perf_trace_run_bpf_submit() in kernel/events/core.c -- a zero from
+ * trace_call_bpf() makes it drop the sample. Returning 0 would therefore
+ * silently break any *other* consumer of kvm:kvm_exit (perf record, a
+ * concurrent perf-prof kvm-exit) for as long as this program is attached.
+ * The raw_tp variants have no such effect, which is why they can return the
+ * helper's value directly.
+ */
 struct kvm_exit_trace_ctx {
     struct trace_entry ent;
     unsigned int exit_reason;
@@ -62,13 +100,15 @@ struct kvm_exit_trace_ctx {
     u32 isa;
 };
 
+/* v5.16+: exit_reason only exists in the trace entry. */
 SEC("tp/kvm/kvm_exit")
 int kvm_exit(struct kvm_exit_trace_ctx *ctx)
 {
     kvm_exit_oncpu(ctx->exit_reason, ctx->isa);
-    return 1;
+    return 1; /* keep delivering the entry to other perf consumers */
 }
 
+/* <= v5.15: exit_reason is the first tracepoint argument. */
 SEC("raw_tp/kvm_exit")
 int BPF_PROG(kvm_exit_legacy, u32 exit_reason, void *vcpu, u32 isa)
 {
@@ -239,6 +279,30 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_s
     return 0;
 }
 
+/*
+ * Reclaim the kvm_vcpu entry of a dead vcpu thread. Attached in both modes:
+ * oncpu inserts from sched_switch, per-process from kvm_exit_track_pid().
+ *
+ * It must be sched_process_free (release_task()) rather than
+ * sched_process_exit (do_exit()): sched_process_exit fires *before* the task's
+ * final schedule(), so the sched_switch that follows -- with the dying vcpu as
+ * prev and curr->pid still set -- would immediately reinsert what was just
+ * deleted. sched_process_free is past that last switch, so nothing can
+ * resurrect the entry.
+ *
+ * Deliberately not gated on work_cpus[] or filter_pid: the map is global, a
+ * vcpu may well be reaped on a CPU we do not monitor, and deleting a key that
+ * is not there costs less than the lookup needed to decide to skip it.
+ */
+SEC("raw_tp/sched_process_free")
+int BPF_PROG(sched_process_free, struct task_struct *p)
+{
+    u32 pid = BPF_CORE_READ(p, pid);
+
+    bpf_map_delete_elem(&kvm_vcpu, &pid);
+    return 0;
+}
+
 static __always_inline int kvm_exit_track_pid(u32 exit_reason, u32 isa)
 {
     static struct kvm_vcpu_event zero;
@@ -273,11 +337,13 @@ int BPF_PROG(kvm_exit_pid, int ret, unsigned int esr_ec, unsigned long vcpu_pc)
     return kvm_exit_track_pid(EXIT_REASON((u32)ret, esr_ec), KVM_ISA_ARM);
 }
 #else
+/* Same v5.16 split as kvm_exit()/kvm_exit_legacy() above, including the
+ * `return 1'. See the comment there. */
 SEC("tp/kvm/kvm_exit")
 int kvm_exit_pid(struct kvm_exit_trace_ctx *ctx)
 {
     kvm_exit_track_pid(ctx->exit_reason, ctx->isa);
-    return 1;
+    return 1; /* keep delivering the entry to other perf consumers */
 }
 
 SEC("raw_tp/kvm_exit")
