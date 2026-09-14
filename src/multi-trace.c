@@ -14,9 +14,11 @@
 #include <stack_helpers.h>
 #include <two-event.h>
 #include <tp_struct.h>
+#include <internal/threadmap.h>
 
 #define ENABLED_MAX ULLONG_MAX
 #define ENABLED_TP_MAX (ULLONG_MAX-1)
+#define RUNDELAY_TOMBSTONE_MAX 64
 
 struct multi_trace_ctx;
 struct timeline_node {
@@ -93,6 +95,17 @@ struct multi_trace_ctx {
     struct callchain_ctx *cc;
     struct perf_thread_map *thread_map; // profiler rundelay
     bool comm; // profiler rundelay, syscalls
+    /* profiler rundelay: thread_map grows via ptrace; pid is matched in
+     * sample(), not SET_FILTER. */
+    bool dynamic_threads;
+    /* profiler rundelay: deleted threads are kept here for one -i interval
+     * so their tail events, still queued in the order window, can complete
+     * the last wakeup->switch pairing. */
+    struct {
+        pid_t pid;
+        u64 del_time; // realtime ns
+    } tombstones[RUNDELAY_TOMBSTONE_MAX];
+    int nr_tombstones;
     int level; // level = sched_init()
 
     /* lost */
@@ -1641,6 +1654,39 @@ static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
+// profiler rundelay.
+static int rundelay_tombstone_find(struct multi_trace_ctx *ctx, pid_t pid)
+{
+    int i;
+
+    for (i = 0; i < ctx->nr_tombstones; i++) {
+        if (ctx->tombstones[i].pid == pid)
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * profiler rundelay: in dynamic_threads mode the kernel filter carries no
+ * pid list (SET_FILTER cannot be replaced on an enabled tracepoint), so
+ * match the growing thread_map here, like task_state_tracked() does.
+ * pid <= 0 (swapper and friends) is dropped, as the kernel `pid' filter
+ * does in the static mode.
+ */
+static bool rundelay_untracked(struct multi_trace_ctx *ctx, u64 key)
+{
+    pid_t pid = (int)key;
+
+    if (!ctx->thread_map)
+        return false;
+    if (pid <= 0)
+        return true;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return false;
+    /* The pid was deleted recently, its tail events are still in flight. */
+    return rundelay_tombstone_find(ctx, pid) < 0;
+}
+
 static int multi_trace_grow(struct prof_dev *dev)
 {
     struct multi_trace_ctx *ctx = dev->private;
@@ -1771,6 +1817,18 @@ found:
         key = tp_get_key(tp, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
     } else
         key = ctx->oncpu ? prof_dev_ins_cpu(dev, instance) : prof_dev_ins_thread(dev, instance);
+
+    /*
+     * profiler rundelay: in dynamic_threads mode, drop events whose key pid
+     * is neither in the growing thread_map nor recently deleted. The filter
+     * runs after sched_event() above, so the unnecessary-wakeup detection
+     * still sees the full system state. Events without a key (untraced and
+     * other auxiliary events) are never filtered: the kernel pid filter of
+     * the static mode does not filter them either.
+     */
+    if (ctx->dynamic_threads && tp->key_prog &&
+        rundelay_untracked(ctx, key))
+        goto not_found;
 
     current.time = hdr->time;
     current.key = key;
@@ -2449,8 +2507,152 @@ static profiler nested_trace = {
 PROFILER_REGISTER(nested_trace);
 
 
+// profiler rundelay.
+static void rundelay_tombstone_del(struct multi_trace_ctx *ctx, int idx)
+{
+    ctx->tombstones[idx] = ctx->tombstones[--ctx->nr_tombstones];
+}
+
+static void rundelay_tombstone_add(struct multi_trace_ctx *ctx, pid_t pid)
+{
+    struct timespec ts;
+    int slot;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    if (ctx->nr_tombstones < RUNDELAY_TOMBSTONE_MAX)
+        slot = ctx->nr_tombstones++;
+    else
+        slot = 0; // full: overwrite the oldest one, it should have expired.
+    ctx->tombstones[slot].pid = pid;
+    ctx->tombstones[slot].del_time = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+}
+
+/*
+ * profiler rundelay: after one -i interval the order window has drained all
+ * queued events of the deleted thread; stop matching its tail events.
+ * A pending wakeup of the dying thread is an unpaired event like any other
+ * and is handled by the timeline remaining mechanism.
+ */
+static void rundelay_tombstone_expire(struct prof_dev *dev)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    struct timespec ts;
+    u64 now;
+    int i;
+
+    if (ctx->nr_tombstones == 0)
+        return;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    now = ts.tv_sec * (u64)NSEC_PER_SEC + ts.tv_nsec;
+
+    for (i = 0; i < ctx->nr_tombstones; ) {
+        if (now - ctx->tombstones[i].del_time > (u64)dev->env->interval * NSEC_PER_MSEC)
+            rundelay_tombstone_del(ctx, i);
+        else
+            i++;
+    }
+}
+
+static int rundelay_threads_cow(struct multi_trace_ctx *ctx)
+{
+    struct perf_thread_map *priv;
+
+    if (refcount_read(&ctx->thread_map->refcnt) == 1)
+        return 0;
+    priv = perf_thread_map__dup(ctx->thread_map);
+    if (!priv)
+        return -1;
+    perf_thread_map__put(ctx->thread_map);
+    ctx->thread_map = priv;
+    return 0;
+}
+
+static int rundelay_add_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    struct perf_thread_map *threads;
+    int i, nr;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return 0;
+    if (rundelay_threads_cow(ctx) < 0)
+        return -1;
+
+    /*
+     * The pid may be reused by a new thread while its tombstone is still
+     * alive. Drop the tombstone, otherwise the tail events of the dying
+     * thread would be attributed to the new one.
+     */
+    {
+        int t = rundelay_tombstone_find(ctx, pid);
+        if (t >= 0)
+            rundelay_tombstone_del(ctx, t);
+    }
+
+    threads = ctx->thread_map;
+    for (i = 0; i < threads->nr; i++) {
+        if (threads->map[i].pid == PERF_THREAD_MAP_HOLE)
+            break;
+    }
+    if (i == threads->nr) {
+        nr = threads->nr + 1;
+        threads = perf_thread_map__realloc(threads, nr);
+        if (!threads)
+            return -1;
+        threads->nr = nr;
+        ctx->thread_map = threads;
+        threads->map[i].pid = PERF_THREAD_MAP_HOLE;
+    }
+    threads->map[i].pid = pid;
+    threads->map[i].cgroup = 0;
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: add thread %d\n", pid);
+    }
+    return 0;
+}
+
+static int rundelay_del_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    int i;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    i = perf_thread_map__idx(ctx->thread_map, pid);
+    if (i < 0)
+        return 0;
+    if (rundelay_threads_cow(ctx) < 0)
+        return -1;
+
+    free(ctx->thread_map->map[i].comm);
+    ctx->thread_map->map[i].comm = NULL;
+    ctx->thread_map->map[i].cgroup = 0;
+    ctx->thread_map->map[i].pid = PERF_THREAD_MAP_HOLE;
+
+    /*
+     * Tombstone the dying thread: its tail events (the release wakeup and
+     * the dead switch) may still be queued in the order window. Keep the
+     * pid matched for one -i interval, so the last wakeup->switch pairing
+     * of the dying thread is accounted. rundelay_tombstone_expire() drops
+     * the tombstone afterwards.
+     */
+    rundelay_tombstone_add(ctx, pid);
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: del thread %d\n", pid);
+    }
+    return 0;
+}
+
 static int rundelay_init(struct prof_dev *dev)
 {
+    struct env *env = dev->env;
     struct multi_trace_ctx *ctx = zalloc(sizeof(*ctx));
     if (!ctx)
         return -1;
@@ -2464,8 +2666,30 @@ static int rundelay_init(struct prof_dev *dev)
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
         dev->threads = perf_thread_map__new_dummy();
+        /*
+         * SET_FILTER cannot be replaced on an enabled tracepoint here
+         * (EEXIST). With ptrace the pid set changes, so match in
+         * sample() instead of pinning a kernel pid filter.
+         * With --filter the filter matches comm only, so new threads
+         * of the same comm are let through by the kernel anyway.
+         */
+        if (!env->filter && (env->using_ptrace || env->workload.pid > 0 ||
+                             (dev->links.parent &&
+                              dev->links.parent->env->using_ptrace)))
+            ctx->dynamic_threads = true;
     }
     ctx->comm = 1;
+
+    /*
+     * The device has been converted to cpu bound, so prof_dev_open() will
+     * not ptrace_attach() automatically. Do it here, like task-state does.
+     * With --filter the filter matches comm only, so there is no need to
+     * track the newly created threads.
+     */
+    if (ctx->thread_map && !env->filter && (env->workload.pid > 0 ||
+                                            env->using_ptrace)) {
+        ptrace_attach(ctx->thread_map, dev);
+    }
 
     return multi_trace_init(dev);
 }
@@ -2493,7 +2717,8 @@ static int rundelay_filter(struct prof_dev *dev)
                     if (i == 0) {
                         if (tp_set_key(tp, "pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->thread_map, "pid", env->filter, "comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "pid", env->filter, "comm");
                     }
                 } else if (tp->id == sched_switch) {
                     if (i == 0) {
@@ -2508,7 +2733,8 @@ static int rundelay_filter(struct prof_dev *dev)
                         else
                             len = snprintf(buff, sizeof(buff), "prev_state==0");
 
-                        tp_filter = tp_filter_new(ctx->thread_map, "prev_pid", env->filter, "prev_comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "prev_pid", env->filter, "prev_comm");
                         if (tp_filter) {
                             snprintf(buff+len, sizeof(buff)-len, " && (%s)", tp_filter->filter);
                             filter = buff;
@@ -2520,7 +2746,8 @@ static int rundelay_filter(struct prof_dev *dev)
                     if (i == 1) {
                         if (tp_set_key(tp, "next_pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->thread_map, "next_pid", env->filter, "next_comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "next_pid", env->filter, "next_comm");
                     }
                 }
 
@@ -2542,6 +2769,12 @@ static int rundelay_filter(struct prof_dev *dev)
     }
     ctx->level = sched_init(ctx->nr_list, ctx->tp_list);
     return multi_trace_filter(dev);
+}
+
+static void rundelay_interval(struct prof_dev *dev)
+{
+    rundelay_tombstone_expire(dev);
+    multi_trace_interval(dev);
 }
 
 static void rundelay_help(struct help_ctx *hctx)
@@ -2601,7 +2834,8 @@ static const char *rundelay_desc[] = PROFILER_DESC("rundelay",
 static const char *rundelay_argv[] = PROFILER_ARGV("rundelay",
     PROFILER_ARGV_OPTION,
     PROFILER_ARGV_CALLCHAIN_FILTER,
-    PROFILER_ARGV_PROFILER, "event", "than", "detail", "perins", "heatmap", "filter\nFilter process comm");
+    PROFILER_ARGV_PROFILER, "event", "than", "detail", "perins", "heatmap", "filter\nFilter process comm",
+    "ptrace");
 static profiler rundelay = {
     .name = "rundelay",
     .desc = rundelay_desc,
@@ -2617,11 +2851,13 @@ static profiler rundelay = {
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
     .print_dev = multi_trace_print_dev,
-    .interval = multi_trace_interval,
+    .interval = rundelay_interval,
     .minevtime = multi_trace_minevtime,
     .lost = multi_trace_lost,
     .ftrace_filter = multi_trace_ftrace_filter,
     .sample = multi_trace_sample,
+    .add_thread = rundelay_add_thread,
+    .del_thread = rundelay_del_thread,
 };
 PROFILER_REGISTER(rundelay);
 
