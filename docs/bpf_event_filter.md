@@ -7,12 +7,12 @@
 一句话概括机制：**表达式就是 `expr_filter()` 这个函数的函数体**。
 
 ```c
---filter 'exit_reason == 12 && latency > 1000000'
+--filter 'exit_reason == 12 && exit_latency > 1000000'
 
 /* 等价于让 BPF 程序里的 expr_filter() 变成： */
 int expr_filter(struct kvm_vcpu_event *event)
 {
-    return event->exit_reason == 12 && event->latency > 1000000;
+    return event->exit_reason == 12 && event->exit_latency > 1000000;
 }
 ```
 
@@ -25,7 +25,7 @@ BPF 程序里预留了一个 `expr_filter()` 占位符（默认恒返回 1，即
 
 > **本文的示例全部以 `src/bpf-skel/kvm_exit.bpf.c`（`bpf:kvm_exit` 分析器）为例**，它是目前
 > 唯一接入这套机制的 BPF 程序，事件结构体是 `src/bpf-skel/kvm_exit.h` 里的
-> `struct kvm_vcpu_event`。文中出现的字段名（`exit_reason`、`latency`、`sched_latency` 等）
+> `struct kvm_vcpu_event`。文中出现的字段名（`exit_reason`、`exit_latency`、`offcpu_wait` 等）
 > 和字段偏移都来自它；换成别的 BPF 程序时，字段由该程序自己的事件结构体决定——机制本身
 > 与事件结构体无关，布局是运行时从 BTF 读出来的（见 5.3）。
 >
@@ -190,43 +190,93 @@ if (kvm_exit_bpf__load(ctx->obj))
 
 因此**每一点的栈深度在编译期已知**，栈槽 N 可以直接映射到寄存器 `r(2+N)`，完全不碰内存。
 
-> verifier 要求 subprogram 读 r6–r9 之前必须先写
-> （`callee cannot access r0, r6 - r9 for reading and has to write into its own stack
-> before reading from it`）。这天然满足：栈槽总是先 `PSH` 写入、才被读取。
+> verifier 要求 subprogram 读 r6–r9 之前必须先写——`setup_func_entry()` 里的注释把这条讲得
+> 最清楚：`callee cannot access r0, r6 - r9 for reading and has to write into its own stack
+> before reading from it`（注意这是**源码注释**，不是报错原文；它靠 `init_reg_state()` 把新帧
+> 的寄存器全标成 `NOT_INIT` 来落实，真读了报的是通用的 `R6 !read_ok`）。这天然满足：栈槽总是
+> 先 `PSH` 写入、才被读取。
 
 栈深度超过 8 会报错（`expression too deeply nested`），实践中不会触及。
 
 #### 5.2.1 破坏 r2–r9 为什么是安全的
 
-占位符的函数体只有 `r0 = 1; exit`，只读 r1；替换进去的表达式却会写 r2–r9。调用点是
-clang 在**编译 BPF 程序时**生成的，那时表达式还不存在——它会不会假设这些寄存器跨调用不变？
-不会，但两半的理由不同。
+占位符的函数体只有 `r0 = 1; exit`，只读 r1；替换进去的表达式却会写 r2–r9。调用点是编译 BPF
+程序时生成的，那时表达式还不存在——调用方会不会假设这些寄存器跨调用不变？
 
-**r2–r5：caller-saved，是 ABI 规定，与被调用者的函数体无关。** clang 从不把跨调用存活的
-值留在这里，哪怕它能看穿被调用者只用了 r1。构造一个 8 个值跨调用存活的高压场景，编译出来是：
+不会。但**两半的理由完全不同，保证强度也不同**，这个区别是后面构建自检的全部依据：
+
+| | 谁来保证 | 保证的性质 | 换编译器后 |
+|---|---|---|---|
+| **r2–r5** | 编译器 | caller-saved，是 ABI **约定** | 需要重新验证 |
+| **r6–r9** | 内核 | JIT/解释器的**运行期机制** | 无条件成立 |
+
+r6–r9 那半不依赖编译器做任何事；r2–r5 那半依赖编译器守约定。所以只有前者可以直接断言，后者
+必须实测。
+
+##### r2–r5：由编译器保证，需要验证
+
+BPF 调用约定里 r2–r5 是 caller-saved：值要活过一次调用，就不能留在这里。这与被调用者的函数体
+无关——哪怕编译器能看穿占位符只碰了 r1，它也不该利用这一点。
+
+判断某个寄存器是否"被依赖跨调用存活"，看的是**调用后的首次访问是读还是写**：
+
+- 先写（`W`）——值是调用后重新定义的，被调用者破坏它无害；
+- 先读（`R`）——调用方依赖它活过调用，这才是危险的。
+
+**不启用 IPRA。** 构造 N 个值跨调用存活的高压场景，跨调用存活的值一律进 r6–r9 和栈，r2 只做
+同一条指令内的搬运中转：
 
 ```
     0: r2 = *(u64 *)(r1 + 0x38)
-    1: *(u64 *)(r10 - 0x8) = r2     ← r2 只作搬运的中转，值溢出到栈
+    1: *(u64 *)(r10 - 0x8) = r2     ← r2 装入即溢出，生命期 1 条指令
     ...
     8: r8 = *(u64 *)(r1 + 0x18)     ← 要跨调用存活的，进 r6-r9
-   11: r7 = *(u64 *)(r1 + 0x0)
-   12: call 0x13                    ← expr_filter()，函数体只有 r0 = 1; exit
+   12: call ...                     ← expr_filter()，函数体只有 r0 = 1; exit
    13: r0 <<= 0x20                  ← 调用后只认 r0
 ```
 
-跨调用存活的值全在 r6–r9 和栈上，r2 只用作同一条指令内的搬运中转。BPF 后端也没有启用
-IPRA（跨过程寄存器分配，`-mllvm -enable-ipra`，正是"看穿被调用者实际用了哪些寄存器"的那个
-优化）——开着它编译，代码一模一样。
+而且 r6–r9 用满后**不会回退去用 r2–r5**，是直接溢出到栈：1 个跨调用存活值时占 r6，4 个时占满
+r6–r9，8 个、10 个时仍只有 r6–r9 承载、其余进栈——r2–r5 那一列全程是 `-` 或 `W`。
+
+**启用 IPRA。** IPRA（跨过程寄存器分配，`-mllvm -enable-ipra`）正是"看穿被调用者实际用了哪些
+寄存器"的那个优化，是这里最该担心的。它在 BPF 后端确实生效，编译出来的代码**和默认不一样**：
+它会优先把值分配进 r2–r5。但调用前必定溢出、调用后必定重载：
+
+```
+    2: r2 = *(u64 *)(r1 + 0x18)     ← 值先进 r2-r5（默认模式下是 r6-r9）
+    6: *(u64 *)(r10 - 0x8) = r2     ← 调用前溢出
+   10: call ...
+   11: r5 = *(u64 *)(r10 - 0x20)    ← 调用后从栈重载
+   14: r2 = *(u64 *)(r10 - 0x8)
+```
+
+r2–r5 被"用到"了，却没有任何值依赖它们跨调用存活——分类结果仍是清一色的 `W`。
+
+这不是"压力不够大所以没暴露"。把条件放到对 IPRA 最有利的极端：被调用者换成一个**没有
+`asm volatile`、编译器完全看得穿只用 r1/r0** 的函数，跨调用存活的值取自 helper 调用（无法重算、
+也无法下沉到调用之后），只留一个值、不给任何溢出压力——IPRA 依然是溢出加重载：
+
+```
+默认：  1: w6 = w0                IPRA：  1: w3 = w0
+       4: call ...                       4: *(u64 *)(r10 - 0x8) = r3   ← 溢出
+       8: *(...) = r6  ← r6 直接活过调用    5: call ...
+                                         6: r3 = *(u64 *)(r10 - 0x8)   ← 重载
+```
+
+同一个值，默认模式放 r6 直接活过调用，IPRA 放 r3 但绕栈一趟。两条路径对替换代码都安全。
 
 verifier 还会再兜一层：`clear_caller_saved_regs()` 在每个 subprog 调用后把 r0–r5 标成
 `NOT_INIT`，调用方若真敢读就是 `R2 !read_ok`。
 
-**r6–r9：callee-saved，由 JIT 按替换后的指令流现场决定保存哪些。** 这一半才是真问题：栈槽
-从 `r2` 起编号，深度超过 4 就用到 r6，而占位符里这些寄存器根本不出现。
+以上都是实测结论而非推断，用的就是 5.2.2 那套脚本，`src/bpf-skel/slot_check.bpf.c` 里保留了
+可复现的样本。但**它只对测过的那个编译器成立**，所以这一条被做成了每次 configure 的自检。
+
+##### r6–r9：由内核保证，无条件成立
+
+这一半反而不需要验证。栈槽从 r2 起编号，深度超过 4 就用到 r6，而占位符里这些寄存器根本不出现：
 
 ```
---filter 'latency > (run_delay + (sched_latency + (exit_reason + (isa + (switches + (pid + tgid))))))'
+--filter 'exit_latency > (runq_delay + (offcpu_wait + (exit_reason + (isa + (switches + (pid + tgid))))))'
 
     1: (bf) r2 = r0                 ← 栈槽 0，caller-saved 区
     3: (bf) r3 = r0
@@ -238,8 +288,9 @@ verifier 还会再兜一层：`clear_caller_saved_regs()` 在每个 subprog 调�
 ```
 
 关键在于**内核从头到尾没见过占位符**：替换发生在 `bpf_object__load()` 之前（见第二节的注入
-窗口），verifier 和 JIT 拿到的只有最终指令。`jit_subprogs()` 把每个 subprog 做成独立的
-`bpf_prog` 单独 JIT，x86 后端在 `do_jit()` 里现场扫描当前指令流：
+窗口），verifier 和 JIT 拿到的只有最终指令。`jit_subprogs()`（6.x 在 `kernel/bpf/verifier.c`，
+7.3 起移到 `kernel/bpf/fixups.c`）把每个 subprog `memcpy` 成独立的 `bpf_prog` 单独 JIT，x86
+后端在 `do_jit()` 里现场扫描当前指令流：
 
 ```c
 detect_reg_usage(insn, insn_cnt, callee_regs_used);   /* 逐条看 dst_reg/src_reg 是否命中 r6-r9 */
@@ -247,12 +298,114 @@ emit_prologue(...);
 push_callee_regs(&prog, callee_regs_used);            /* 命中的才 push，epilogue 对称 pop */
 ```
 
-arm64 的 `push_callee_regs()` / `pop_callee_regs()` 同理。解释器路径的机制不同但同样安全：
-`DEFINE_BPF_PROG_RUN_ARGS` 给每一帧一个全新的 `u64 regs[MAX_BPF_EXT_REG]`，调用者的 r6–r9
-在自己的数组里，物理上碰不到。
+扫的是 `bpf_prog->insnsi`，即**当前正在编译的这份最终指令**，不查任何声明期的元数据。指令里
+出现了 r6，JIT 就保存 r6——它不关心这些指令是编译器生成的还是我们替换进去的。
+
+arm64 同理，只是函数名不同：`find_used_callee_regs()` 做同样的逐条扫描，`push_callee_regs()` /
+`pop_callee_regs()` 按结果成对 push/pop。两个架构都只有 `exception_boundary` 程序才无条件保存
+全部 callee-saved 寄存器。较老的内核（如 5.4）则是**无条件**保存四个，`detect_reg_usage()` 的
+选择性保存是后来才有的——两种行为对安全性都无影响。
+
+解释器路径的机制不同但同样安全：`DEFINE_BPF_PROG_RUN_ARGS` 给每一帧一个全新的
+`u64 regs[MAX_BPF_EXT_REG]`（就是个 C 局部数组，每次调用一份），调用者的 r6–r9 在自己的数组里，
+物理上碰不到。
+
+还有一条独立的理由：生成的过滤器代码里**根本不会有 call**——后端拒绝一切函数调用
+（`function calls are not supported by the BPF backend`），所以"helper call 会破坏 r6–r9"这个
+通常的顾虑在这里不存在。
+
+> 实测：上面这条深嵌套 filter 加载运行正常，`bpftool prog dump jited` 能看到替换后的
+> `expr_filter` subprog 的 prologue 确实 push 了 rbx/r13/r14/r15（= BPF r6–r9）。
 
 所以后端不需要为了保护调用者而限制可用寄存器。真正被编译期约定绑死的只有**入口**——参数必须
 在 r1、返回值必须在 r0，这正是第六节里 `asm volatile` 必须消费 `event` 的原因。
+
+#### 5.2.2 构建期的自检
+
+上一节把安全性拆成了两半：r6–r9 靠内核机制，无条件成立；r2–r5 靠编译器守 ABI 约定，**只对实测
+过的那个编译器成立**。BPF 代码未来会在各种版本的 clang 上编译，所以这一条不写成文档里的假设，
+而是每次 configure 实测一遍。
+
+要盯的不变量只有一条：
+
+> **对每个 `call`，r2–r5 在调用后的首次访问都必须是写，不能是读。**
+
+出现 `R` 就说明调用方开始依赖 caller-saved 寄存器跨调用存活了（这同时也意味着编译器违反了 BPF
+ABI）。
+
+**降级而不是报错。** 检查不通过时，把栈槽基址从 r2 改成 r6——退回到那半无条件成立的保证上，
+不再依赖编译器的任何行为：
+
+| | 槽位 | 依赖 |
+|---|---|---|
+| 默认 | r2–r9，8 个 | 编译器守约定（已实测）+ 内核机制 |
+| 降级 | r6–r9，4 个 | 只依赖内核机制 |
+
+代价只是深嵌套表达式会报 `expression too deeply nested for register allocation`——明确拒绝，
+不会静默算错。其余一切照常，两条路径的测试都是全通过的。
+
+**任何"没法确认"也一律降级。** 找不到 `llvm-objdump`、读不了 `.o`、反汇编里一个 `call` 都没有，
+全都走同一条路。因为 r6 侧的保证不依赖探测结果，降级永远是安全的，所以宁可少四个槽位，也不
+默认放行。
+
+涉及三个文件：
+
+| 文件 | 作用 |
+|------|------|
+| `src/bpf-skel/slot_check.bpf.c` | 被测样本。用 `DEFINE_EXPR_FILTER()` 定义占位符，造出 1..8 个值跨调用存活的场景，外加一个贴近真实代码形状的用例 |
+| `scripts/bpf_slot_check.py` | 反汇编上面的 `.o`，对每个 `call` 做上述分类；不合格则输出 `BPF_SLOT_FIRST_R6=y` |
+| `Makefile.config` | 调 `build/Makefile.build` 编出 `.o`（走 `cmd_bpf_o_c`，与真实 BPF 程序同一套 flags 和同一个编译器），再跑脚本；据其输出决定是否追加 `-DBPF_SLOT_FIRST_R6` |
+
+`src/expr.c` 里 `BPF_SLOT_FIRST` 按这个宏在 `BPF_REG_2` 和 `BPF_REG_6` 之间切换。
+
+**样本为什么要这么写。** 光堆寄存器压力不够——编译器会把值重算、或把加载下沉到调用之后，压力
+就凭空消失了，测试随之失去意义。所以样本里：
+
+- 跨调用存活的值取自 `bpf_get_prandom_u32()`：helper 结果不透明，无法重算，也不能移到调用另一侧；
+- 事件字段声明成 `volatile`，堵住折叠和下沉；
+- 被调用者就是 `DEFINE_EXPR_FILTER()` 本身，占位符怎么变，检查就跟着变。
+
+> 顺带一个反面印证：如果被调用者简单到能被整个折叠（比如只有 `return p != 0;`），`.text` 里连
+> `call` 都不剩，压力测试就白做了。这也正是第六节要求占位符必须同时有 `__noinline` 和
+> `asm volatile` 的原因。
+
+**判读时有三个容易搞错的地方**，弄错会读出不存在的 `R`（脚本里 `reads_and_write()` 就是在处理
+这三条）：
+
+- `rN = <src>` 是**纯定义**，`rN` 不算被读；但 `rN += <src>` 这类读改写要算；
+- 存储 `*(u64 *)(r10 - 0x8) = r2` 写的是**内存**，`r2` 和 `r10` 都算被读，没有寄存器被定义；
+- `r10` 是只读帧指针，永远有效，不参与判断。
+
+手工复核用 `--verbose` 看每个调用点的分类：
+
+```sh
+$ python3 scripts/bpf_slot_check.py src/bpf-skel/slot_check.bpf.o --verbose
+bpf_slot_check: 45 call sites, r2-r5 never live across a call
+  slot_check_8         call@174  r2:- r3:- r4:- r5:- r6:- r7:- r8:- r9:W
+  slot_check_8         call@176  r2:W r3:- r4:- r5:- r6:R r7:R r8:R r9:R
+  slot_check_fields    call@216  r2:- r3:- r4:- r5:- r6:R r7:R r8:R r9:R
+```
+
+`r6:R` 那些是跨调用存活的值，合法——JIT 会保存恢复；r2–r5 一列只有 `W` 和 `-`。
+
+构建默认不开 IPRA，想单独验它：
+
+```sh
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -mllvm -enable-ipra \
+      -Ilib -Isrc/bpf-skel -c -o /tmp/slot_check.ipra.o src/bpf-skel/slot_check.bpf.c
+python3 scripts/bpf_slot_check.py /tmp/slot_check.ipra.o
+```
+
+同一个脚本也可以直接扫真实的 BPF 目标文件，验证的是同一条不变量。`.bpf.o` 是中间产物，普通
+构建后不一定留着，需要时单独编一份：
+
+```sh
+$ make -f build/Makefile.build dir=src/bpf-skel obj=perf-prof \
+       srctree=$PWD SRCARCH=x86 INCLUDES="-I$PWD/lib/ -I$PWD/src/" \
+       src/bpf-skel/kvm_exit.bpf.o
+$ python3 scripts/bpf_slot_check.py src/bpf-skel/kvm_exit.bpf.o --verbose
+bpf_slot_check: 35 call sites, r2-r5 never live across a call
+```
 
 ### 5.3 核心：字段访问
 
@@ -362,9 +515,9 @@ invalid access to map value, value_size=299080 off=561116 size=4
 低 32 位在第一个槽的 `imm`，高 32 位在第二个槽的 `imm`。
 
 ```
---filter 'latency > 10000000000'          10000000000 = 0x2_540BE400
+--filter 'exit_latency > 10000000000'          10000000000 = 0x2_540BE400
 
-    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    0: r0 = *(u64 *)(r1 + 16)             ← exit_latency
     1: r2 = r0
     2: code=0x18  imm=1410065408          ← ld_imm64 低半：0x540BE400
     3: code=0x00  imm=2                   ← 高半；opcode 为 0，不是独立指令
@@ -383,9 +536,9 @@ BPF 指令集第 4 版（clang 的 `-mcpu=v4`，内核 6.6）没有为有符号�
 因此后端不能用 `BPF_ALU64_REG()`——它把 `off` 写死成 0——只能用 `BPF_RAW_INSN()`。
 
 ```
---filter 'latency / 1000 > 5'
+--filter 'exit_latency / 1000 > 5'
 
-    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    0: r0 = *(u64 *)(r1 + 16)             ← exit_latency
     1: r2 = r0
     2: r0 = 1000
     3: code=0x3f dst=r2 src=r0 off=1      ← BPF_ALU64|BPF_DIV|BPF_X，off=1 即有符号
@@ -406,7 +559,7 @@ else          scalar_min_max_udiv(dst_reg, &src_reg);
 BPF_ALU uses reserved fields
 ```
 
-所以版本判断必须在生成指令**之前**做（`--filter 'latency / 1000 > 5'` 在低版本内核上直接报
+所以版本判断必须在生成指令**之前**做（`--filter 'exit_latency / 1000 > 5'` 在低版本内核上直接报
 `signed division requires a 6.6+ kernel`），否则错误会推迟到 verifier，且信息晦涩。
 
 > 版本判断是**运行时**的：perf-prof 编译一次、可能跑在任意内核上，过滤器是为"即将加载进去的
@@ -457,9 +610,9 @@ EMIT(BPF_ALU64_IMM(BPF_ARSH, BPF_ACC, bits));
 ```
 
 两个加载点共用 `emit_load()`：5.3 里折叠成一条的字段读，以及 `LI` 单独出现、地址已经在累加器
-里的情况（`*(char *)((char *)&latency + 1)` 这种先算地址的形式）。
+里的情况（`*(char *)((char *)&exit_latency + 1)` 这种先算地址的形式）。
 
-以 `*(char *)((char *)&latency + 1) < 0` 为例，`latency` 偏移 16，取第 1 个字节：
+以 `*(char *)((char *)&exit_latency + 1) < 0` 为例，`exit_latency` 偏移 16，取第 1 个字节：
 
 ```
     5: r0 = r2                        ← 地址算完在累加器里
@@ -504,11 +657,17 @@ Available variables:
 后端**支持** `SI`（赋值），这是有意的，两个理由：
 
 1. **就地修正/标注要输出的事件**——掩码某个字段、缩放一个延迟，比送到用户态再改便宜；
-2. **表达式语言没有自己的变量**，闲置的事件字段是唯一能放临时值的地方：
-   `sched_latency = latency / switches, sched_latency > 100` 必须有处安放那个商。
+2. **表达式语言没有自己的变量**，事件字段是唯一能放临时值的地方：
+   `offcpu_wait = exit_latency / switches, offcpu_wait > 100` 必须有处安放那个商。
+
+⚠️ **注意**：`struct kvm_vcpu_event` 里**没有闲置字段**——每个字段都会被输出。上面那个例子
+把商写进 `offcpu_wait`，代价是这条事件报出的 `offcpu_wait` 不再是"非就绪等待时间"，而是那个
+商。拿字段当临时变量，就是拿输出的准确性换的。
 
 ⚠️ **注意**：事件可能是 BPF 程序**跨事件保留**的存储，而不是一份临时副本。写掉程序后续
-还要用的字段，会扰动之后的事件，不只是当前这一个。
+还要用的字段，会扰动之后的事件，不只是当前这一个。`bpf:kvm_exit` 就是这样：
+`percpu_event[]` 和 `kvm_vcpu` hashmap 里的条目在 `kvm_exit → kvm_entry` 之间持续存活
+（见 `src/bpf-skel/kvm_exit.h` 里的 `EXIT_TIME()` / `OFFCPU_ACC()` 等暂存宏）。
 
 ## 六、占位符为什么要写成那样
 
@@ -547,9 +706,31 @@ static __noinline int expr_filter(event_type *event)
 | `isa` | 8 | 2 |
 | `switches` | 10 | 2 |
 | `exit_reason` | 12 | 4 |
-| `latency` | 16 | 8 |
-| `run_delay` | 24 | 8 |
-| `sched_latency` | 32 | 8 |
+| `exit_latency` | 16 | 8 |
+| `runq_delay` | 24 | 8 |
+| `offcpu_wait` | 32 | 8 |
+
+三个时间字段的含义（`exit_latency` 之内的分解）：
+
+```
+exit_latency   kvm:kvm_exit -> kvm:kvm_entry
+  ├─ runq_delay    已就绪、在运行队列上等 CPU（sched_info.run_delay 增量）
+  ├─ offcpu_wait   切出后非就绪的等待（halt-poll、阻塞、睡眠）
+  └─ (其余)        vcpu 在 CPU 上、跑在宿主机里
+```
+
+报出的分解**恒满足** `0 <= runq_delay + offcpu_wait <= exit_latency`。这一点需要专门保证：
+`exit_latency` 和 off-CPU 时间都是 `bpf_ktime_get_ns()` 的差值，而 `runq_delay` 来自
+`sched_info.run_delay`，内核用 **`rq_clock()`** 记账——`sched_info_queued()` 记的是**切出**
+那个 rq 的时钟，`sched_info_arrive()` 用的是**切入**那个 rq 的时钟，两者都是 per-CPU
+`sched_clock()`、未经 NTP 校正且互不同步。vcpu 一旦迁移，这个差值可以偏大到超过
+`exit_latency`（曾出现 `lat 15108 runq_delay 15131` 这样的输出）。因此 `kvm_entry()` 把
+`runq_delay` 夹到 `[0, off-CPU 时间]`——就绪等待本就是 off-CPU 时间的一部分，off-CPU 是它
+真正的上界。
+
+过滤器看到的全部是**最终值**：BPF 程序在 `expr_filter()` 之前就把这三个字段从暂存的时间戳/
+快照换算成了时长（`kvm_entry()` 里完成）。`switches`、`runq_delay`、`offcpu_wait` 只在
+`-C cpus` 系统全局模式下解析——只有该模式挂 `sched:sched_switch`；`-p pid` 模式下三者恒为 0。
 
 ### 7.1 简单比较
 
@@ -578,23 +759,23 @@ BPF: 0: r0 = *(u32 *)(r1 + 12)      ← IMM+LI 折叠，偏移 12 = exit_reason
 ### 7.2 逻辑与（含跳转回填）
 
 ```
---filter 'exit_reason == 12 && latency > 1000000'
+--filter 'exit_reason == 12 && exit_latency > 1000000'
 
 等价于 expr_filter() 被实现成：
 
     int expr_filter(struct kvm_vcpu_event *event)
     {
-        return event->exit_reason == 12 && event->latency > 1000000;
+        return event->exit_reason == 12 && event->exit_latency > 1000000;
     }
 
 VM:  ... EQ; BZ 0x1472098; IMM 0x1458410; LI 0x3; PSH; IMM 0xf4240; GT; EXIT
 
 BPF: 0-6: 同上，exit_reason == 12 的结果在 r0
      7: if r0 == 0 goto +7           ← BZ 短路，回填后指向 15
-     8: r0 = *(u64 *)(r1 + 16)       ← latency，偏移 16，BPF_DW
+     8: r0 = *(u64 *)(r1 + 16)       ← exit_latency，偏移 16，BPF_DW
      9: r2 = r0
     10: r0 = 1000000
-    11: if r2 > r0 goto +2           ← 有符号 JSGT（latency 是 int64_t）
+    11: if r2 > r0 goto +2           ← 有符号 JSGT（exit_latency 是 int64_t）
     12: r0 = 0
     13: goto +1
     14: r0 = 1
@@ -603,25 +784,28 @@ BPF: 0-6: 同上，exit_reason == 12 的结果在 r0
 
 ### 7.3 赋值 + 用字段当临时变量
 
+⚠️ 这个例子只为展示 `SI` 的代码生成。`offcpu_wait` 是会被输出的字段，写它就是改输出——
+真要这么用，先接受 5.10 里那两条代价。
+
 ```
---filter 'sched_latency = latency, sched_latency > 1000'
+--filter 'offcpu_wait = exit_latency, offcpu_wait > 1000'
 
 等价于 expr_filter() 被实现成（逗号运算符：求值全部，返回最后一个）：
 
     int expr_filter(struct kvm_vcpu_event *event)
     {
-        event->sched_latency = event->latency;      /* 赋值，写回事件 */
-        return event->sched_latency > 1000;
+        event->offcpu_wait = event->exit_latency;      /* 赋值，写回事件 */
+        return event->offcpu_wait > 1000;
     }
 
 VM:  IMM 0x14f8420; PSH; IMM 0x14f8410; LI 0x3; SI 0x3; ...
 
 BPF: 0: r0 = r1
-     1: r0 += 32                     ← &sched_latency，取址（IMM 无 LI）
+     1: r0 += 32                     ← &offcpu_wait，取址（IMM 无 LI）
      2: r2 = r0                      ← PSH，目标地址进栈槽
-     3: r0 = *(u64 *)(r1 + 16)       ← latency
+     3: r0 = *(u64 *)(r1 + 16)       ← exit_latency
      4: *(u64 *)(r2 + 0) = r0        ← SI：赋值
-     5: r0 = *(u64 *)(r1 + 32)       ← 回读 sched_latency
+     5: r0 = *(u64 *)(r1 + 32)       ← 回读 offcpu_wait
      6: r2 = r0
      7: r0 = 1000
      8: if r2 > r0 goto +2
