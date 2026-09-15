@@ -3,7 +3,7 @@ name: perf-prof
 metadata:
   version: "0.2.0"
   source: https://github.com/OpenCloudOS/perf-prof.git
-description: 使用perf-prof进行Linux系统问题分析。perf-prof是基于perf_event的系统级分析工具，事件在内存中实时处理，可长期运行。触发场景：(1) CPU使用率高、热点分析 (2) 进程状态异常(D/S状态多) (3) 延迟抖动、响应慢 (4) 内存泄露或增长异常 (5) 块设备IO慢 (6) 虚拟机性能问题 (7) 事件聚合统计 (8) 自定义脚本分析。核心分析器：profile(CPU采样)、task-state(进程状态)、multi-trace(延迟分析)、kmemleak(内存泄露)、blktrace(IO延迟)、top/sql(聚合统计)、kvm-exit(虚拟化退出)、rundelay(调度延迟)、syscalls(系统调用耗时)、python(自定义脚本分析)。适用于：性能问题定位、内核/应用开发调试、学习理解Linux内核机制（调度、内存、IO、中断等）。English: Linux system performance analysis with perf-prof, a perf_event-based tool for real-time in-memory event processing. Triggers: high CPU usage, hotspot profiling, process state issues (D/S states), latency spikes, slow response, memory leak detection, memory growth, block device IO slowness, VM performance issues, event aggregation, custom script analysis. Key profilers: profile (CPU sampling), task-state (process state), multi-trace (latency analysis), kmemleak (memory leak), blktrace (IO latency), top/sql (aggregation), kvm-exit (virtualization exit), rundelay (scheduling delay), syscalls (syscall latency), python (custom scripting).
+description: 使用perf-prof进行Linux系统问题分析。perf-prof是基于perf_event的系统级分析工具，事件在内存中实时处理，可长期运行。触发场景：(1) CPU使用率高、热点分析 (2) 进程状态异常(D/S状态多) (3) 延迟抖动、响应慢 (4) 内存泄露或增长异常 (5) 块设备IO慢 (6) 虚拟机性能问题 (7) 事件聚合统计 (8) 自定义脚本分析。核心分析器：profile(CPU采样)、task-state(进程状态)、multi-trace(延迟分析)、kmemleak(内存泄露)、blktrace(IO延迟)、top/sql(聚合统计)、kvm-exit(虚拟化退出)、rundelay(调度延迟)、syscalls(系统调用耗时)、python(自定义脚本分析)。附带现成工具脚本(tools/)：func_latency.sh(函数调用树耗时)、exec_trace.py(事件触发时的进程上下文快照/谁在做这件事)、kvm_userspace_exit_latency.py(QEMU userspace exit处理耗时)。适用于：性能问题定位、内核/应用开发调试、学习理解Linux内核机制（调度、内存、IO、中断等）。English: Linux system performance analysis with perf-prof, a perf_event-based tool for real-time in-memory event processing. Triggers: high CPU usage, hotspot profiling, process state issues (D/S states), latency spikes, slow response, memory leak detection, memory growth, block device IO slowness, VM performance issues, event aggregation, custom script analysis. Key profilers: profile (CPU sampling), task-state (process state), multi-trace (latency analysis), kmemleak (memory leak), blktrace (IO latency), top/sql (aggregation), kvm-exit (virtualization exit), rundelay (scheduling delay), syscalls (syscall latency), python (custom scripting).
 ---
 
 # perf-prof 系统性能分析
@@ -85,7 +85,11 @@ make
    |   ├── 高频计数、微突发检测 → hrcount
    |   └── 低频计数 → stat
    ├── 通用事件追踪 → trace
-   └── 自定义脚本分析 → python
+   ├── 自定义脚本分析 → python
+   └── 现成工具脚本（tools/）
+       ├── 函数调用树耗时 → func_latency.sh
+       ├── "谁在做这件事"（事件触发时的进程上下文） → exec_trace.py
+       └── QEMU userspace exit 处理耗时 → kvm_userspace_exit_latency.py
    ```
 
 ### 第一步(续)：问题定界 - 用户态 vs 内核态 - Guest vs Host
@@ -172,6 +176,22 @@ make
 - nested-trace - 嵌套事件分析：分析嵌套事件（如函数调用、中断等），基于multi-trace实现
 - bpf:kvm_exit - KVM退出延迟BPF分析：在内核态处理kvm_exit和kvm_entry事件生成bpf:kvm_exit事件，提供详细的延迟分解
 - event-care - 事件丢失和乱序关注：监控事件的丢失和乱序情况
+
+#### 现成工具脚本（tools/）
+
+除了内建分析器，perf-prof 还附带一组**已经拼好命令的成品脚本**，基于 `python` 分析器实现，把 `-e` 事件串和 `--order`/`-m` 固化在 shebang 或 shell 封装里，用户只需补 `-p PID` 等观测范围。
+详见 [tools.md](references/tools.md)。
+
+| 工具 | 解决的问题 | 何时优先于内建分析器 |
+|---|---|---|
+| `func_latency.sh` | 一组用户态/内核函数的**调用树 + 各自耗时分布**（N/TOTAL/MIN/AVG/P50/P95/P99/MAX），按完整调用路径独立聚合 | 已经定位到具体函数，要看它调了谁、各自多慢。|
+| `exec_trace.py` | 任意事件触发瞬间，on-CPU 进程的 cmdline 与 `/proc` 上下文快照（父进程/祖先链/cwd/uid/env/exe/stdio/cgroup/调度参数） | 要回答"**是谁**在做这件事"。默认即 exec 追踪器；覆盖 `-e` 可用于任何 tracepoint/kprobe/uprobe |
+| `kvm_userspace_exit_latency.py` | `kvm:kvm_userspace_exit` → 同 vcpu 线程下一次 `ioctl(KVM_RUN)` 的延迟，按 exit reason 分组统计 | `kvm-exit` 显示 IO/MMIO 类退出耗时高，要切出"QEMU 用户态处理"那一段 |
+
+**工具位置**：源码树 `tools/`；RPM 安装后 `/usr/share/perf-prof/tools/`（设计文档不打包）。
+脚本可执行且自带 shebang，可直接 `./exec_trace.py` 运行。
+
+**使用前必须先看该工具的 `-h`**（脚本头部注释即完整帮助，含 EXAMPLES 与 Notes）。
 
 #### 功能分类
 
@@ -672,6 +692,7 @@ filter: trace events filter
 ## 严格约束
 
 - 使用新的分析器时，必须先执行`perf-prof <profiler> -h`查看帮助
+- 使用`tools/`下的现成工具脚本时，必须先执行该工具的`-h`查看帮助（见 [tools.md](references/tools.md)）
 - 新增动态探针，必须阅读对应的文档，`kprobe_events.md`或`uprobe_events.md`
 - **控制运行时长用外部 `timeout N`，不要用 `-- sleep N`**：perf-prof 会把 `--` 之后的命令当作 workload 进程附着，`-- sleep N` 只会采样 sleep 本身，与 `perf record -- sleep N` 的语义完全不同。正确写法：`timeout 60 perf-prof profile -F 997 -g --flame-graph cpu.folded` 或直接 Ctrl-C 结束。
 
@@ -679,5 +700,6 @@ filter: trace events filter
 
 详细的分析器文档在 `references/` 目录：
 - 分析器使用指南：profile.md, top.md, task-state.md, multi-trace.md, hrcount.md, breakpoint.md, python.md等
+- 现成工具脚本：[tools.md](references/tools.md)（func_latency.sh, exec_trace.py, kvm_userspace_exit_latency.py）
 - 过滤器语法：Event_filtering.md
 - 表达式系统：expr.md

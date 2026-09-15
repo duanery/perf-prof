@@ -19,7 +19,6 @@
 struct kvmexit_ctx {
     struct kvm_exit_bpf *obj;
     struct perf_evsel *evsel;
-    struct comm_notify notify;
     struct latency_dist *lat_dist;
     struct latency_dist *lat_dist2; // non-HLT, per process.
     FILE *output2;
@@ -28,15 +27,32 @@ struct kvmexit_ctx {
     bool print_header;
     bool oncpu;
     bool thread;
+    bool comm_ref;
 };
 
 struct extra_rundelay {
-    u64 wait;
-    u64 rundelay;
+    u64 offcpu_wait;
+    u64 runq_delay;
     u32 switches;
 };
 
 #if defined(__i386__) || defined(__x86_64__)
+/*
+ * Whether exit_reason is still a kvm:kvm_exit tracepoint argument, and so
+ * readable by a raw_tp program.
+ *
+ * It stopped being one in 0a62a0319abb ("KVM: x86: Get exit_reason as part of
+ * kvm_x86_ops.get_exit_info"), in v5.16, which dropped it from TP_PROTO() and
+ * moved it into TP_fast_assign(). From there on only the trace entry has it,
+ * so the tp/kvm/kvm_exit program must be used instead. See the comment above
+ * kvm_exit() in bpf-skel/kvm_exit.bpf.c.
+ *
+ * This is the one place a kernel version is compared rather than probed: the
+ * two programs read the same tracepoint, so neither one's absence marks the
+ * change, and the field is not in BTF to be looked up. That makes it blind to
+ * a backport of the commit into a pre-5.16 kernel -- which would be reported
+ * as a verifier failure on the raw_tp program at startup, not as bad data.
+ */
 static int kvm_exit_reason_in_args(void)
 {
     int version = kernel_release();
@@ -72,15 +88,6 @@ static int kvm_exit_select_prog(struct kvm_exit_bpf *obj)
 }
 #endif
 
-static int comm_notify(struct comm_notify *notify, int pid, int state, u64 free_time)
-{
-    if (state == NOTIFY_COMM_DELETE) {
-        struct kvmexit_ctx *ctx = container_of(notify, struct kvmexit_ctx, notify);
-        bpf_map__delete_elem(ctx->obj->maps.kvm_vcpu, &pid, sizeof(pid), 0);
-    }
-    return 0;
-}
-
 static int monitor_ctx_init(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -111,14 +118,29 @@ static int monitor_ctx_init(struct prof_dev *dev)
             goto free_lat2;
     }
 
-    // Only oncpu mode needs global comm service to track system-wide process changes
-    if (ctx->oncpu) {
+    ctx->thread = env->perins && (!ctx->oncpu || env->detail);
+
+    /*
+     * global_comm is only needed to turn a pid into a process name, and only
+     * in oncpu mode -- per-process mode answers from ctx->thread_map instead.
+     * It is a system-wide service device (task_newtask, task_rename,
+     * sched_process_free on every CPU), so do not start it unless something
+     * is actually going to print a name:
+     *
+     *   ctx->thread                  per-thread rows in the interval output
+     *   --than / -vv                 per-event output via print_event()
+     *
+     * The kvm_vcpu map is reclaimed by the BPF sched_process_free program, so
+     * unlike before, correctness no longer depends on this service running.
+     * bpf_kvm_exit_print_dev() (SIGUSR2) may therefore find no names
+     * available; it degrades to "<...>" rather than forcing the service on.
+     */
+    if (ctx->oncpu &&
+        (ctx->thread || env->greater_than || env->verbose >= VERBOSE_EVENT)) {
         if (global_comm_ref() < 0)
             goto close2;
-        ctx->notify.notify = comm_notify;
-        global_comm_register_notify(&ctx->notify);
+        ctx->comm_ref = true;
     }
-    ctx->thread = env->perins && (!ctx->oncpu || env->detail);
     return 0;
 
 close2:
@@ -138,10 +160,8 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct kvmexit_ctx *ctx = dev->private;
     perf_thread_map__put(ctx->thread_map);
-    if (ctx->oncpu) {
-        global_comm_unregister_notify(&ctx->notify);
+    if (ctx->comm_ref)
         global_comm_unref();
-    }
     if (ctx->output2) fclose(ctx->output2);
     latency_dist_free(ctx->lat_dist2);
     latency_dist_free(ctx->lat_dist);
@@ -206,7 +226,7 @@ static int bpf_kvm_exit_init(struct prof_dev *dev)
         perf_cpu_map__for_each_cpu(cpu, ins, dev->cpus)
             ctx->obj->bss->work_cpus[cpu] = 1;
         for (i = 0; i < ARRAY_SIZE(ctx->obj->bss->percpu_event); i++)
-            ctx->obj->bss->percpu_event[i].latency = INT64_MAX;
+            EXIT_TIME(&ctx->obj->bss->percpu_event[i]) = INT64_MAX;
 
         bpf_program__set_autoload(ctx->obj->progs.kvm_exit_pid, 0);
 #if defined(__i386__) || defined(__x86_64__)
@@ -302,9 +322,14 @@ static int bpf_kvm_exit_filter(struct prof_dev *dev)
 static const char *comm_get(struct prof_dev *dev, int pid)
 {
     struct kvmexit_ctx *ctx = dev->private;
-    if (ctx->oncpu)
-        return global_comm_get(pid);
-    else {
+    if (ctx->oncpu) {
+        /*
+         * NULL when global_comm was never referenced (no name-printing option
+         * was given, so only print_dev() can get here) or when it simply has
+         * no record of the pid.
+         */
+        return global_comm_get(pid) ?: "<...>";
+    } else {
         int idx = perf_thread_map__idx(ctx->thread_map, pid);
         if (idx >= 0)
             return perf_thread_map__comm(ctx->thread_map, idx);
@@ -334,7 +359,7 @@ static void print_latency_node(void *opaque, struct latency_node *node)
             printf("%-*s %8s %16s %12s %12s %12s %12s%s", isa == KVM_ISA_VMX ? 20 : 32, "exit_reason", "calls",
                      "total(us)", "min(us)", "avg(us)", "p99(us)", "max(us)", ctx->oncpu ? " " : "\n");
             if (ctx->oncpu)
-                printf("total wait(us) rundelay(us)\n");
+                printf("offcpu_wait(us) runq_delay(us)\n");
         }
 
         if (env->verbose >= 0) {
@@ -343,7 +368,7 @@ static void print_latency_node(void *opaque, struct latency_node *node)
             printf("%s %8s %16s %12s %12s %12s %12s%s", isa == KVM_ISA_VMX ? "--------------------" : "--------------------------------",
                 "--------", "----------------", "------------", "------------", "------------", "------------", ctx->oncpu ? " " : "\n");
             if (ctx->oncpu)
-                printf("-------------- ------------\n");
+                printf("--------------- --------------\n");
         }
     }
     if (env->perins) {
@@ -357,7 +382,7 @@ static void print_latency_node(void *opaque, struct latency_node *node)
             node->n, node->sum/1000.0,
             node->min/1000.0, node->sum/node->n/1000.0, p99/1000.0, node->max/1000.0, ctx->oncpu ? " " : "\n");
     if (ctx->oncpu)
-        printf("%14.3f %12.3f\n", extra->wait/1000.0, extra->rundelay/1000.0);
+        printf("%15.3f %14.3f\n", extra->offcpu_wait/1000.0, extra->runq_delay/1000.0);
 }
 
 static void output2(void *opaque, struct latency_node *node)
@@ -405,11 +430,9 @@ static void bpf_kvm_exit_print_event(struct prof_dev *dev, union perf_event *eve
         prof_dev_print_time(dev, *time, stdout);
     printf("%18s %8u    [%03d] %lu.%06lu: bpf:kvm_exit: %s lat %lu%s", comm_get(dev, raw->pid),
         raw->pid, prof_dev_ins_cpu(dev, instance), *time / NSEC_PER_SEC, (*time % NSEC_PER_SEC)/1000,
-        find_exit_reason(raw->isa, raw->exit_reason), raw->latency, ctx->oncpu ? " " : "\n");
-    if (ctx->oncpu) {
-        int64_t wait = raw->sched_latency - raw->run_delay;
-        printf("wait %ld rundelay %lu sw %u\n", wait < 0 ? 0 : wait, raw->run_delay, raw->switches);
-    }
+        find_exit_reason(raw->isa, raw->exit_reason), raw->exit_latency, ctx->oncpu ? " " : "\n");
+    if (ctx->oncpu)
+        printf("runq_delay %lu offcpu_wait %lu sw %u\n", raw->runq_delay, raw->offcpu_wait, raw->switches);
 }
 
 static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int instance)
@@ -422,7 +445,7 @@ static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, i
     struct kvm_vcpu_event *raw = (void *)event->sample.array + sizeof(u64) + sizeof(u32)/* u32 size; */;
     u64 *time = (void *)event->sample.array;
     u64 key = ((u64)raw->isa<<32) | raw->exit_reason;
-    s64 delta = raw->latency;
+    s64 delta = raw->exit_latency;
     u64 ins = 0;
     u32 hlt;
 
@@ -446,20 +469,19 @@ static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, i
     node = latency_dist_input(ctx->lat_dist, ins, key, delta, 0);
     if (node && ctx->oncpu) {
         struct extra_rundelay *extra = (void *)node->extra;
-        int64_t wait = raw->sched_latency - raw->run_delay;
-        extra->wait += (wait < 0 ? 0 : wait);
-        extra->rundelay += raw->run_delay;
+        extra->offcpu_wait += raw->offcpu_wait;
+        extra->runq_delay += raw->runq_delay;
         extra->switches += raw->switches;
     }
 
     if (ctx->lat_dist2)
-        latency_dist_input(ctx->lat_dist2, raw->tgid, 0, raw->exit_reason != hlt ? delta : raw->run_delay, 0);
+        latency_dist_input(ctx->lat_dist2, raw->tgid, 0, raw->exit_reason != hlt ? delta : raw->runq_delay, 0);
 
     if (unlikely(env->verbose >= VERBOSE_EVENT))
         goto print_event;
 
     if (env->greater_than &&
-        (raw->exit_reason != hlt ? delta : raw->run_delay) > env->greater_than) {
+        (raw->exit_reason != hlt ? delta : raw->runq_delay) > env->greater_than) {
     print_event:
         bpf_kvm_exit_print_event(dev, event, instance, 0);
     }
@@ -529,17 +551,32 @@ static const char *bpf_kvm_exit_desc[] = PROFILER_DESC("bpf:kvm_exit",
     "    -p pid     Process-specific monitoring (tracks all vcpu threads)",
     "",
     "TRACEPOINTS AND COMPATIBILITY",
-    "    Requires kvm:kvm_exit and kvm:kvm_entry; system-wide mode also uses",
+    "    Requires kvm:kvm_exit and kvm:kvm_entry, plus sched:sched_process_free",
+    "    to reclaim the state of dead vcpu threads. System-wide mode also uses",
     "    sched:sched_switch. On x86 kernels before Linux 5.16, exit_reason is",
     "    read from raw tracepoint arguments. On Linux 5.16 and later, fields",
     "    are read from the trace event entry. arm64 keeps the raw tracepoint path.",
     "",
     "BPF-EVENT FIELDS",
+    "    Every field is a final value: the BPF program resolves all three time",
+    "    fields before it filters, so an expression never sees an intermediate.",
+    "",
+    "    u32 tgid          # Thread group id of the vcpu thread",
+    "    u32 pid           # Pid of the vcpu thread",
+    "    u16 isa           # 1=VMX, 2=SVM, 3=ARM",
     "    u32 exit_reason   # VM exit reason code",
-    "    u64 latency       # Exit latency: kvm:kvm_exit => kvm:kvm_entry (ns)",
-    "    u64 run_delay     # Scheduling delay within latency (ns)",
-    "    u64 wait          # Wait time: sched_latency - run_delay (ns)",
-    "    u16 switches      # Context switch count during exit",
+    "    u64 exit_latency  # Exit latency: kvm:kvm_exit => kvm:kvm_entry (ns)",
+    "    u16 switches      # Context switch count during the exit",
+    "    u64 runq_delay    # Within exit_latency: runnable, waiting for a CPU (ns)",
+    "    u64 offcpu_wait   # Within exit_latency: off-CPU but not runnable (ns)",
+    "",
+    "    The breakdown always adds up: runq_delay + offcpu_wait <= exit_latency.",
+    "    runq_delay comes from sched_info.run_delay, which the kernel accounts on",
+    "    a different clock, so it is clamped to the measured off-CPU time.",
+    "",
+    "    switches, runq_delay and offcpu_wait are only resolved in system-wide",
+    "    (-C cpus) mode, the only mode that attaches to sched:sched_switch. In",
+    "    per-process (-p pid) mode they are always 0.",
     "",
     "EXAMPLES",
     "    "PROGRAME" bpf:kvm_exit -p 2347 -i 1000 --than 50ms",
@@ -548,14 +585,17 @@ static const char *bpf_kvm_exit_desc[] = PROFILER_DESC("bpf:kvm_exit",
     "    "PROGRAME" bpf:kvm_exit -C 1-4 -i 1000 --perins",
     "        # Monitor CPUs 1-4, output per-instance stats every 1s",
     "",
-    "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'latency > 10000000' --than 20ms",
+    "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'exit_latency > 10000000' --than 20ms",
     "        # Drop exits < 10ms in BPF, display exits > 20ms (non-HLT)",
     "",
     "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'exit_reason != 12'",
     "        # Ignore HLT exits entirely, in the kernel",
     "",
-    "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'latency > 1000000 && switches > 0'",
-    "        # Exits over 1ms that were also preempted");
+    "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'exit_latency > 1000000 && switches > 0'",
+    "        # Exits over 1ms that were also preempted",
+    "",
+    "    "PROGRAME" bpf:kvm_exit -C 0-7 -i 1000 --filter 'runq_delay > 1000000'",
+    "        # Exits that spent over 1ms runnable, waiting for a host CPU");
 static const char *bpf_kvm_exit_argv[] = PROFILER_ARGV("bpf:kvm_exit",
     PROFILER_ARGV_OPTION,
     PROFILER_ARGV_PROFILER, "perins", "than",

@@ -54,9 +54,17 @@ endif
 
 bin = $(Q)$(MAKE) -f $(srctree)/build/Makefile.bin dir=. $@
 
-__build:
-	$(bin)
+# The sub-make is hidden inside $(bin), so make cannot spot the literal
+# $(MAKE) in the recipe and will not pass the jobserver down ("warning:
+# jobserver unavailable: using -j1"). The '+' prefix marks the line as a
+# recursive make invocation explicitly.
+#
+# Build fixdep serially first: every lib/*/Makefile declares 'all: fixdep',
+# so under -j they would otherwise race each other writing the same
+# build/fixdep.o and build/fixdep binary.
+__build: fixdep
+	+$(bin)
 
 clean: fixdep-clean
-	$(bin)
+	+$(bin)
 	$(Q)rm -f $(OUTPUT)FEATURE-DUMP $(OUTPUT).config-detected
