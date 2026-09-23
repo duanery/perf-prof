@@ -36,10 +36,12 @@ struct heap_event {
     struct prof_dev *dev;
     union perf_event *event;
     heapclock_t time;
-    int ins;
+    /* Binding of the stream this event came from; one of the two is -1. */
+    int cpu, tid;
     bool writable;
     bool converted;
     bool unconsumed; // event is unconsumed.
+    bool removed;
     char type; // 0: perf_mmap_event; 1: stream_event;
 };
 
@@ -195,12 +197,64 @@ static u64 perf_sample_watermark(struct prof_dev *dev)
     return min_watermark;
 }
 
+int order_mmap_add(struct prof_dev *dev, struct perf_mmap *map)
+{
+    struct perf_mmap_event *mmap_event = NULL;
+    struct heap_event *heap_event;
+    int ret;
+
+    list_for_each_entry(heap_event, &dev->order.heap_event_list, link) {
+        mmap_event = (struct perf_mmap_event *)heap_event;
+        if (heap_event->type == PERF_MMAP_EVENT && mmap_event->map == map)
+            return 0;
+    }
+    mmap_event = NULL;
+
+    ret = posix_memalign((void **)&mmap_event, ALIGN_SIZE, sizeof(*mmap_event));
+    if (ret != 0 || !mmap_event)
+        return -1;
+
+    memset(mmap_event, 0, sizeof(*mmap_event));
+    mmap_event->base.dev = dev;
+    mmap_event->base.cpu = perf_mmap__cpu(map);
+    mmap_event->base.tid = perf_mmap__tid(map);
+    mmap_event->base.converted = false;
+    mmap_event->base.type = PERF_MMAP_EVENT;
+    mmap_event->map = map;
+
+    perf_mmap__get(map);
+    dev->order.nr_mmaps++;
+    list_add_tail(&mmap_event->base.link, &dev->order.heap_event_list);
+    return 0;
+}
+
+void order_mmap_del(struct prof_dev *dev, struct perf_mmap *map)
+{
+    struct heap_event *heap_event, *tmp;
+
+    list_for_each_entry_safe(heap_event, tmp, &dev->order.heap_event_list, link) {
+        struct perf_mmap_event *mmap_event = (struct perf_mmap_event *)heap_event;
+
+        if (heap_event->type == PERF_MMAP_EVENT && mmap_event->map == map) {
+            if (order_main_dev(dev)->order.inprocess) {
+                heap_event->removed = true;
+                return;
+            }
+            list_del(&heap_event->link);
+            if (dev->order.nr_mmaps > 0)
+                dev->order.nr_mmaps--;
+            free(mmap_event);
+            perf_mmap__put(map);
+            return;
+        }
+    }
+}
+
 int order_init(struct prof_dev *dev)
 {
     struct prof_dev *source, *tmp;
     struct perf_mmap *map;
     int nr_mmaps = 0, heap_size = 0;
-    struct perf_mmap_event *mmap_event;
     int ret;
 
     if (dev->order.enabled)
@@ -223,38 +277,27 @@ int order_init(struct prof_dev *dev)
     heap_size += nr_mmaps;
     heap_size += dev->order.nr_streams;
 
+    if (heap_size < 16)
+        heap_size = 16;
     dev->order.heap_size = heap_size;
     dev->order.data = calloc(heap_size, sizeof(*dev->order.data));
     if (!dev->order.data)
         return -1;
     min_heap_init(&dev->order.heapsort, dev->order.data, heap_size);
 
-    dev->order.nr_mmaps = nr_mmaps;
-    ret = posix_memalign(&dev->order.permap_event, ALIGN_SIZE, nr_mmaps * sizeof(struct perf_mmap_event));
+    dev->order.nr_mmaps = 0;
     dev->order.heap_popped_time = 0;
     dev->order.wakeup_watermark = perf_sample_watermark(dev);
 
-    if (ret != 0 || !dev->order.permap_event)
-        goto failed;
-
-    memset(dev->order.permap_event, 0, nr_mmaps * sizeof(struct perf_mmap_event));
+    ret = 0;
     perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite) {
-        int idx = perf_mmap__idx(map);
-        if (idx == 0)
-            perf_event_convert_read_tsc_conversion(dev, map);
-
-        mmap_event = (struct perf_mmap_event *)dev->order.permap_event + idx;
-        mmap_event->base.dev = dev;
-        mmap_event->base.ins = idx;
-        mmap_event->base.converted = false;
-        mmap_event->base.type = PERF_MMAP_EVENT;
-        mmap_event->map = map;
-
-        list_add_tail(&mmap_event->base.link, &dev->order.heap_event_list);
+        if (order_mmap_add(dev, map) < 0) {
+            ret = -1;
+            break;
+        }
     }
-    for_each_source_dev_get(source, tmp, dev) {
-        list_splice_tail_init(&source->order.heap_event_list, &dev->order.heap_event_list);
-    }
+    if (ret)
+        goto failed;
 
     dev->order.enabled = 1;
     return 0;
@@ -267,30 +310,22 @@ failed:
 void order_deinit(struct prof_dev *dev)
 {
     struct heap_event *heap_event, *tmp;
-    struct perf_mmap_event *mmap_event;
-    int i;
 
-    for (i = 0; i < dev->order.nr_mmaps; i++) {
-        mmap_event = (struct perf_mmap_event *)dev->order.permap_event + i;
-        list_del(&mmap_event->base.link);
-    }
     list_for_each_entry_safe(heap_event, tmp, &dev->order.heap_event_list, link) {
         list_del_init(&heap_event->link);
-        if (heap_event->type == STREAM_EVENT)
-            free(heap_event);
+        if (heap_event->type == PERF_MMAP_EVENT)
+            perf_mmap__put(((struct perf_mmap_event *)heap_event)->map);
+        free(heap_event);
     }
 
     if (dev->order.data)
         free(dev->order.data);
-    if (dev->order.permap_event)
-        free(dev->order.permap_event);
+    dev->order.data = NULL;
+    dev->order.nr_mmaps = 0;
 }
 
 int order_together(struct prof_dev *main_dev, struct prof_dev *dev)
 {
-    int heap_size;
-    void **data;
-
     // main_dev may be a forwarding source, and heap-sorting must
     // be enabled for the top-level device. See order_main_dev().
     main_dev = order_main_dev(main_dev);
@@ -300,17 +335,7 @@ int order_together(struct prof_dev *main_dev, struct prof_dev *dev)
     if (order_init(dev) < 0)
         return -1;
 
-    heap_size = main_dev->order.heap_size + dev->order.heap_size;
-    data = calloc(heap_size, sizeof(*main_dev->order.data));
-    if (!data)
-        return -1;
-
-    free(main_dev->order.data);
-    main_dev->order.heap_size = heap_size;
-    main_dev->order.data = data;
-    min_heap_init(&main_dev->order.heapsort, data, heap_size);
-
-    list_splice_tail_init(&dev->order.heap_event_list, &main_dev->order.heap_event_list);
+    /* order_heap_init() walks the device tree; ownership stays on the source. */
     return 0;
 }
 
@@ -330,24 +355,10 @@ int order_register(struct prof_dev *dev, read_event *read_event, void *stream)
     stream_event->read_event = read_event;
     stream_event->stream = stream;
 
-    if (main_dev->order.enabled) {
-        int heap_size = main_dev->order.heap_size + 1;
-        void **data = calloc(heap_size, sizeof(*dev->order.data));
-        if (!data)
-            goto failed;
-
-        free(main_dev->order.data);
-        main_dev->order.heap_size = heap_size;
-        main_dev->order.data = data;
-        min_heap_init(&main_dev->order.heapsort, data, heap_size);
-    }
     main_dev->order.nr_streams++;
-    list_add(&stream_event->base.link, &main_dev->order.heap_event_list);
+    list_add(&stream_event->base.link, &dev->order.heap_event_list);
     return 0;
 
-failed:
-    free(stream_event);
-    return -1;
 }
 
 void order_unregister(struct prof_dev *dev, void *stream)
@@ -356,9 +367,13 @@ void order_unregister(struct prof_dev *dev, void *stream)
     struct heap_event *heap_event, *tmp;
     struct stream_event *stream_event;
 
-    list_for_each_entry_safe(heap_event, tmp, &main_dev->order.heap_event_list, link) {
+    list_for_each_entry_safe(heap_event, tmp, &dev->order.heap_event_list, link) {
         stream_event = (struct stream_event *)heap_event;
         if (heap_event->type == STREAM_EVENT && stream_event->stream == stream) {
+            if (main_dev->order.inprocess) {
+                heap_event->removed = true;
+                return;
+            }
             list_del(&heap_event->link);
             main_dev->order.nr_streams--;
             free(stream_event);
@@ -412,14 +427,16 @@ u64 heapclock_to_perfclock(struct prof_dev *dev, heapclock_t time)
 
 static union perf_event *
 perf_mmap_fix_out_of_order(struct prof_dev *main_dev, struct prof_dev *dev,
-                           struct heap_event *heap_event, heapclock_t popped_time, int popped_ins)
+                           struct heap_event *heap_event, heapclock_t popped_time, int popped_cpu,
+                           int popped_tid)
 {
     union perf_event *event = heap_event->event;
 
     // Currently, All 2 fixes are explainable.
     if (main_dev->env->verbose)
-        printf("%s: fix out-of-order event %lu(%d) < %lu(%d)\n", dev->prof->name,
-                    heap_event->time, heap_event->ins, popped_time, popped_ins);
+        printf("%s: fix out-of-order event %lu(cpu %d tid %d) < %lu(cpu %d tid %d)\n", dev->prof->name,
+                    heap_event->time, heap_event->cpu, heap_event->tid,
+                    popped_time, popped_cpu, popped_tid);
 
     if (!heap_event->writable) {
         struct perf_mmap *map = ((struct perf_mmap_event *)heap_event)->map;
@@ -460,7 +477,7 @@ static int perf_mmap_event_init(struct heap_event *heap_event, struct prof_dev *
     struct perf_mmap_event *mmap_event = (struct perf_mmap_event *)heap_event;
     struct prof_dev *dev = heap_event->dev;
     struct perf_mmap *map = mmap_event->map;
-    int ins = heap_event->ins;
+    int cpu = heap_event->cpu, tid = heap_event->tid;
     union perf_event *event;
     bool writable;
     struct perf_record_lost lost;
@@ -494,7 +511,7 @@ retry:
                 lost.id = event->lost.id;
                 lost.lost = event->lost.lost;
             } else
-                perf_event_process_record(dev, event, ins, writable, false);
+                perf_event_process_record(dev, event, cpu, tid, writable, false);
             perf_mmap__consume(map);
             goto retry;
         }
@@ -543,14 +560,15 @@ retry:
          */
         if (unlikely(heap_event->time < main_dev->order.heap_popped_time))
             perf_mmap_fix_out_of_order(main_dev, dev, heap_event, main_dev->order.heap_popped_time,
-                                       main_dev->order.heap_popped_ins);
+                                       main_dev->order.heap_popped_cpu,
+                                       main_dev->order.heap_popped_tid);
 
         if (unlikely(lost.lost)) {
             if (mmap_event->event_mono_time/*lost_start*/ < main_dev->order.heap_popped_time)
                 fprintf(stderr, "BUG: unsafe lost event %lu < popped %lu\n",
                                  mmap_event->event_mono_time, main_dev->order.heap_popped_time);
 
-            dev->prof->lost(dev, (union perf_event *)&lost, ins,
+            dev->prof->lost(dev, (union perf_event *)&lost, cpu, tid,
                             heapclock_to_evclock(main_dev, mmap_event->event_mono_time),
                             heapclock_to_evclock(main_dev, heap_event->time));
         }
@@ -566,7 +584,7 @@ static int stream_event_init(struct heap_event *heap_event, bool init)
     struct stream_event *stream_event = (struct stream_event *)heap_event;
     struct prof_dev *dev = heap_event->dev;
     union perf_event *event;
-    int ins;
+    int cpu, tid;
     bool writable;
     bool converted;
 
@@ -598,18 +616,19 @@ static int stream_event_init(struct heap_event *heap_event, bool init)
      *    it will cause perf_mmap events to be out of order.
      */
 retry:
-    event = stream_event->read_event(stream_event->stream, init, &ins, &writable, &converted);
+    event = stream_event->read_event(stream_event->stream, init, &cpu, &tid, &writable, &converted);
     if (event) {
         if (unlikely(event->header.type != PERF_RECORD_SAMPLE &&
                      event->header.type != PERF_RECORD_ORDER_TIME)) {
-            perf_event_process_record(dev, event, ins, writable, converted);
+            perf_event_process_record(dev, event, cpu, tid, writable, converted);
             goto retry;
         }
         heap_event->event = event;
         heap_event->time = event->header.type == PERF_RECORD_ORDER_TIME ?
                            ((struct perf_record_order_time *)event)->order_time :
                            *(u64 *)((void *)event->sample.array + dev->pos.time_pos);
-        heap_event->ins = ins;
+        heap_event->cpu = cpu;
+        heap_event->tid = tid;
         heap_event->writable = writable;
         heap_event->converted = converted;
         return 0;
@@ -623,7 +642,7 @@ static int stream_event_process(struct prof_dev *main_dev, struct heap_event *he
     struct prof_dev *dev = heap_event->dev;
     union perf_event *event = heap_event->event;
     u64 time = heap_event->time;
-    int ins = heap_event->ins;
+    int cpu = heap_event->cpu, tid = heap_event->tid;
     bool writable = heap_event->writable;
     bool converted = heap_event->converted;
 
@@ -631,15 +650,20 @@ static int stream_event_process(struct prof_dev *main_dev, struct heap_event *he
     if (dev != main_dev) dev->order.heap_popped_time = time;
     if (unlikely(time < main_dev->order.heap_popped_time)) {
         dev->order.nr_unordered_events++;
-        fprintf(stderr, "%s: out-of-order stream event %lu(%d) < %s %lu(%d)\n", dev->prof->name,
-                        time, ins, main_dev->prof->name, main_dev->order.heap_popped_time,
-                        main_dev->order.heap_popped_ins);
+        fprintf(stderr, "%s: out-of-order stream event %lu(cpu %d tid %d) < %s %lu(cpu %d tid %d)\n",
+                        dev->prof->name, time, cpu, tid, main_dev->prof->name,
+                        main_dev->order.heap_popped_time, main_dev->order.heap_popped_cpu,
+                        main_dev->order.heap_popped_tid);
     } else {
         main_dev->order.heap_popped_time = time;
-        main_dev->order.heap_popped_ins = ins;
+        main_dev->order.heap_popped_cpu = cpu;
+        main_dev->order.heap_popped_tid = tid;
     }
 
-    perf_event_process_record(dev, event, ins, writable, converted);
+    perf_event_process_record(dev, event, cpu, tid, writable, converted);
+
+    if (heap_event->removed)
+        return -1;
 
     if (stream_event_init(heap_event, false) == 0) {
         if (stream_event->empty_pause) {
@@ -655,7 +679,7 @@ static int stream_event_process(struct prof_dev *main_dev, struct heap_event *he
     }
 }
 
-static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev)
+static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev, bool streams)
 {
     DEFINE_MIN_HEAP(struct heap_event *, ) *heap;
     struct heap_event *heap_event;
@@ -664,11 +688,15 @@ static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev)
     heap = (void *)&main_dev->order.heapsort;
 
     list_for_each_entry(heap_event, &dev->order.heap_event_list, link) {
+        if (heap_event->removed || (heap_event->type == STREAM_EVENT) != streams)
+            continue;
         if (heap_event->type == PERF_MMAP_EVENT) {
             if (perf_mmap_event_init(heap_event, main_dev) < 0)
                 continue;
         } else if (heap_event->type == STREAM_EVENT) {
             if (stream_event_init(heap_event, true) < 0) {
+                if (main_dev->inclose)
+                    continue;
                 main_dev->order.break_reason = ORDER_BREAK_STREAM_STOP;
                 return 1;
             }
@@ -676,7 +704,7 @@ static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev)
 
         if (heap->nr == heap->size) {
             // expand
-            int heap_size = heap->size + dev->order.heap_size;
+            int heap_size = heap->size ? heap->size * 2 : 16;
             void *data = realloc(heap->data, heap_size * sizeof(*heap->data));
             if (!data)
                 return -1;
@@ -696,12 +724,49 @@ static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev)
      * does not affect the forwarding and close of the device.
      */
     for_each_child_dev_get(child, tmp, dev) {
-        int ret = order_heap_init(main_dev, child);
+        int ret = order_heap_init(main_dev, child, streams);
         if (ret)
             return ret;
     }
 
     return 0;
+}
+
+static void order_reap(struct prof_dev *dev)
+{
+    struct heap_event *event, *next;
+    struct prof_dev *child, *tmp;
+
+    list_for_each_entry_safe(event, next, &dev->order.heap_event_list, link) {
+        if (!event->removed)
+            continue;
+        if (event->type == PERF_MMAP_EVENT)
+            order_mmap_del(dev, ((struct perf_mmap_event *)event)->map);
+        else
+            order_unregister(dev, ((struct stream_event *)event)->stream);
+    }
+    for_each_child_dev_get(child, tmp, dev)
+        order_reap(child);
+}
+
+bool order_drain(struct prof_dev *dev, struct perf_mmap *map, u64 end)
+{
+    struct prof_dev *main_dev = order_main_dev(dev);
+    bool drained;
+
+    if (main_dev->order.inprocess)
+        return false;
+    if ((!map->overwrite && map->prev >= end) ||
+        (map->overwrite && map->prev == end))
+        return true;
+    main_dev->order.drain_map = map;
+    main_dev->order.drain_end = end;
+    prof_dev_get(main_dev);
+    order_mmap(dev, map);
+    main_dev->order.drain_map = NULL;
+    drained = map->overwrite ? map->prev == end : map->prev >= end;
+    prof_dev_put(main_dev);
+    return drained;
 }
 
 void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock_t target_tm)
@@ -714,7 +779,7 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
     struct perf_mmap *map;
     union perf_event *event;
     heapclock_t time;
-    int ins;
+    int cpu, tid;
     bool writable;
     u64 wakeup_watermark;
     u64 target_end;
@@ -749,14 +814,16 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
      * to it until the latest event of `target_map' is processed. `target_map->
      * end' points to the end of the latest event.
      */
-    target_end = target_map ? target_map->end : 0;
+    target_end = target_map == main_dev->order.drain_map ? main_dev->order.drain_end :
+                 (target_map ? target_map->end : 0);
     target_time = target_tm ? heapclock(main_dev, target_tm) : -1UL;
 
     lost.lost = 0;
     heap = (void *)&main_dev->order.heapsort;
     heap->nr = 0;
 
-    if (order_heap_init(main_dev, main_dev) != 0)
+    if (order_heap_init(main_dev, main_dev, true) != 0 ||
+        order_heap_init(main_dev, main_dev, false) != 0)
         goto stream_stop;
 
 
@@ -772,6 +839,11 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
         }
 
         heap_event = data[0];
+        if (heap_event->removed) {
+            min_heap_pop(heap, &funcs, NULL);
+            prof_dev_put(heap_event->dev);
+            continue;
+        }
 
         if (unlikely(heap_event->type == STREAM_EVENT)) {
             if (stream_event_process(main_dev, heap_event) == 0) {
@@ -791,7 +863,8 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
         map = mmap_event->map;
         event = heap_event->event;
         time = heap_event->time;
-        ins = heap_event->ins;
+        cpu = heap_event->cpu;
+        tid = heap_event->tid;
         writable = heap_event->writable;
         wakeup_watermark = dev->order.wakeup_watermark;
 
@@ -801,7 +874,7 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
         }
 
         // Don't care about the correctness of lost.
-        if (!dev->prof->lost)
+        if (!dev->prof->lost || map == main_dev->order.drain_map || main_dev->inclose)
             goto skip_lost_detect;
 
         /*                     lost
@@ -891,7 +964,8 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
          * output first.
          */
         if (unlikely(time < mmap_event->event_mono_time)) {
-            event = perf_mmap_fix_out_of_order(main_dev, dev, heap_event, mmap_event->event_mono_time, ins);
+            event = perf_mmap_fix_out_of_order(main_dev, dev, heap_event, mmap_event->event_mono_time,
+                                               cpu, tid);
             time = mmap_event->event_mono_time;
             writable = 1;
         } else
@@ -901,24 +975,26 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
         if (dev != main_dev) dev->order.heap_popped_time = time;
         if (unlikely(time < main_dev->order.heap_popped_time)) {
             dev->order.nr_unordered_events++;
-            fprintf(stderr, "%s: out-of-order event %lu(%d) < %s %lu(%d)\n", dev->prof->name,
-                            time, ins, main_dev->prof->name, main_dev->order.heap_popped_time,
-                            main_dev->order.heap_popped_ins);
+            fprintf(stderr, "%s: out-of-order event %lu(cpu %d tid %d) < %s %lu(cpu %d tid %d)\n",
+                            dev->prof->name, time, cpu, tid, main_dev->prof->name,
+                            main_dev->order.heap_popped_time, main_dev->order.heap_popped_cpu,
+                            main_dev->order.heap_popped_tid);
         } else {
             main_dev->order.heap_popped_time = time;
-            main_dev->order.heap_popped_ins = ins;
+            main_dev->order.heap_popped_cpu = cpu;
+            main_dev->order.heap_popped_tid = tid;
         }
 
 
     process:
-        perf_event_process_record(dev, event, ins, writable, false);
+        perf_event_process_record(dev, event, cpu, tid, writable, false);
     consume:
         // Not lost. Or lost, fast consuming will result in more losses.
         if (map->end != mmap_event->maybe_lost_end ||
             perf_mmap_has_space(map, wakeup_watermark/2))
             perf_mmap__consume(map);
 
-        if (map == target_map && map->start == target_end) {
+        if (map == target_map && map->start >= target_end) {
             main_dev->order.break_reason = ORDER_BREAK_TARGET_MAP;
             need_break = 1;
         }
@@ -948,7 +1024,7 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
                 else
                     main_dev->order.prev_lost_time = mmap_event->event_mono_time;
 
-                dev->prof->lost(dev, (union perf_event *)&lost, ins,
+                dev->prof->lost(dev, (union perf_event *)&lost, cpu, tid,
                                 heapclock_to_evclock(main_dev, mmap_event->event_mono_time),
                                 heapclock_to_evclock(main_dev, heap_event->time));
                 lost.lost = 0;
@@ -977,6 +1053,7 @@ stream_stop:
         prof_dev_put(heap_event->dev);
     }
     main_dev->order.inprocess = 0;
+    order_reap(main_dev);
     prof_dev_put(main_dev);
 }
 
@@ -1060,4 +1137,3 @@ void prof_dev_env2attr(struct prof_dev *dev, struct perf_event_attr *attr)
         attr->exclude_callchain_user = 0;
     }
 }
-

@@ -210,7 +210,7 @@ static inline void __print_callchain(struct prof_dev *dev, struct tp *tp, union 
     }
 }
 
-static long trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct trace_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -226,7 +226,7 @@ static long trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, i
     return tp_prog_run(tp, tp->ftrace_filter, GLOBAL(data->cpu_entry.cpu, data->tid_entry.pid, raw, size));
 }
 
-static void trace_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void trace_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct trace_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -255,7 +255,7 @@ static void trace_print_event(struct prof_dev *dev, union perf_event *event, int
     }
 }
 
-static void trace_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void trace_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct trace_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -265,7 +265,7 @@ static void trace_sample(struct prof_dev *dev, union perf_event *event, int inst
     int size;
 
     if (event->header.type == PERF_RECORD_DEV) {
-        prof_dev_print_event(dev, event, instance, 0);
+        prof_dev_print_event(dev, event, cpu, tid, 0);
         return;
     }
 
@@ -422,7 +422,7 @@ failed:
     return -1;
 }
 
-static void tracepoint_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void tracepoint_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct tracepoint_private *p = dev->private;
     struct {

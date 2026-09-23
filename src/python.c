@@ -275,7 +275,8 @@ typedef struct {
     int _tid;                       /* Thread ID */
     unsigned long long _time;       /* Event timestamp (ns) */
     int _cpu;                       /* CPU number */
-    int instance;                   /* Instance number */
+    /* Binding of the ring buffer the event was read from, for print_event() */
+    int bind_cpu, bind_tid;
     unsigned long long _period;     /* Sample period (tracepoint only) */
 
     /* Lazy computed fields (via PyGetSetDef) - cached when first accessed */
@@ -940,7 +941,7 @@ static void live_events_remove(struct python_ctx *ctx, PerfEventObject *obj)
  * that are processed and immediately discarded.
  */
 static PerfEventObject *PerfEvent_create(struct prof_dev *dev, struct tp *tp,
-                                          union perf_event *event, int instance)
+                                          union perf_event *event, int cpu, int tid)
 {
     PerfEventObject *self;
     struct python_sample_type *data;
@@ -962,7 +963,8 @@ static PerfEventObject *PerfEvent_create(struct prof_dev *dev, struct tp *tp,
     self->_tid = data->tid_entry.tid;
     self->_time = data->time;
     self->_cpu = data->cpu_entry.cpu;
-    self->instance = instance;
+    self->bind_cpu = cpu;
+    self->bind_tid = tid;
     self->_period = data->period;
 
     /* Initialize lazy computed fields to NULL */
@@ -1028,7 +1030,8 @@ static PerfEventObject *PerfEvent_create_from_dev(struct prof_dev *dev, struct t
     self->_tid = event_dev->tid;
     self->_time = event_dev->time;
     self->_cpu = event_dev->cpu;
-    self->instance = event_dev->instance;
+    self->bind_cpu = event_dev->bind_cpu;
+    self->bind_tid = event_dev->bind_tid;
     self->_period = 0;  /* Not used for profiler events */
 
     /* Initialize lazy computed fields to NULL */
@@ -1641,7 +1644,7 @@ static PyObject *PerfEvent_print(PerfEventObject *self, PyObject *args, PyObject
         if (!print_callchain)
             flags |= OMIT_CALLCHAIN;
 
-        prof_dev_print_event(source_dev, self->event, self->instance, flags);
+        prof_dev_print_event(source_dev, self->event, self->bind_cpu, self->bind_tid, flags);
     } else {
         void *raw;
         int raw_size;
@@ -2814,14 +2817,14 @@ static void python_exit(struct prof_dev *dev)
 }
 
 static void python_lost(struct prof_dev *dev, union perf_event *event,
-                        int instance, u64 lost_start, u64 lost_end)
+                        int cpu, int tid, u64 lost_start, u64 lost_end)
 {
     struct python_ctx *ctx = dev->private;
-    print_lost_fn(dev, event, instance);
+    print_lost_fn(dev, event, cpu, tid);
     python_call_lost(ctx, lost_start, lost_end);
 }
 
-static long python_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long python_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct python_ctx *ctx = dev->private;
     struct python_sample_type *data = (void *)event->sample.array;
@@ -2849,7 +2852,7 @@ static long python_ftrace_filter(struct prof_dev *dev, union perf_event *event, 
     return tp_prog_run(tp, tp->ftrace_filter, GLOBAL(data->cpu_entry.cpu, data->tid_entry.pid, raw, size));
 }
 
-static void python_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void python_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct python_ctx *ctx = dev->private;
     struct python_sample_type *data;
@@ -2887,7 +2890,7 @@ static void python_sample(struct prof_dev *dev, union perf_event *event, int ins
             return;
 
         /* Tracepoint event: use normal creation path */
-        perf_event = PerfEvent_create(dev, tp, event, instance);
+        perf_event = PerfEvent_create(dev, tp, event, cpu, tid);
     }
 
     if (!perf_event)
