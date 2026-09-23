@@ -89,11 +89,12 @@ typedef struct monitor {
     void (*deinit)(struct perf_evlist *evlist);
     void (*sigusr1)(int signum);
     void (*interval)(void);
-    void (*read)(struct perf_evsel *evsel, struct perf_counts_values *count, int instance);
+    void (*read)(struct prof_dev *dev, struct perf_evsel *evsel,
+                 struct perf_counts_values *count, int cpu, int tid);
     
     /* PERF_RECORD_* */
     //PERF_RECORD_SAMPLE			= 9,
-    void (*sample)(union perf_event *event, int instance);
+    void (*sample)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 	
 	...
 } profiler;
