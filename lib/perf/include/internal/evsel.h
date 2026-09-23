@@ -10,6 +10,13 @@
 struct perf_cpu_map;
 struct perf_thread_map;
 struct xyarray;
+struct perf_mmap;
+
+struct perf_evsel_fd {
+	int fd;
+	int group_fd;
+	struct perf_mmap *mmap;
+};
 
 /*
  * Per fd, to map back from PERF_SAMPLE_ID to evsel, only used when there are
@@ -36,10 +43,17 @@ struct perf_sample_id {
 
 struct perf_evsel {
 	struct list_head	 node;
+	struct perf_evlist	*evlist;
 	struct perf_event_attr	 attr;
+	/*
+	 * @cpus/@threads are the bindings in effect. @own_cpus/@own_threads are
+	 * the bindings this evsel asked for; when NULL the evlist default is
+	 * used. See __perf_evlist__propagate_maps().
+	 */
 	struct perf_cpu_map	*cpus;
 	struct perf_cpu_map	*own_cpus;
 	struct perf_thread_map	*threads;
+	struct perf_thread_map	*own_threads;
 	struct xyarray		*fd;
 	struct xyarray		*mmap;
 	struct xyarray		*sample_id;
@@ -49,6 +63,20 @@ struct perf_evsel {
 	void			*external;
 	bool			 keep_disable;
 	bool			 init_enabled;
+	/* Set once the evsel is open: the cpu binding no longer changes. */
+	bool			 cpus_bound;
+	/* Set once perf_evlist__mmap() has run over this evsel. */
+	bool			 mmaped;
+	bool			 enabled;
+	/* The effective thread map has diverged from the initial binding. */
+	bool			 threads_private;
+	/*
+	 * Remembered so that threads added after perf_evlist__open() get the
+	 * same filter and bpf program as the fds opened up front.
+	 */
+	char			*filter;
+	int			 bpf_prog_fd;
+	int			 mmap_pages;
 
 	/* parse modifier helper */
 	int			 nr_members;
@@ -74,5 +102,19 @@ void perf_evsel__close_fd(struct perf_evsel *evsel);
 void perf_evsel__free_fd(struct perf_evsel *evsel);
 int perf_evsel__alloc_id(struct perf_evsel *evsel, int ncpus, int nthreads);
 void perf_evsel__free_id(struct perf_evsel *evsel);
+
+/*
+ * The binding dimension of an evsel. A non-empty cpu map means one ring buffer
+ * per cpu (all of the evsel's threads write into the ring buffer of the cpu
+ * they run on); an empty (dummy) cpu map means one ring buffer per thread.
+ */
+bool perf_evsel__oncpu(struct perf_evsel *evsel);
+/* Resolve the (cpu, tid) ring buffer key for one fd of the evsel. */
+void perf_evsel__mmap_bind(struct perf_evsel *evsel, int cpu, int thread,
+			   int *bind_cpu, pid_t *bind_tid);
+int perf_evsel__open_one(struct perf_evsel *evsel, int cpu, int thread);
+int perf_evsel__make_threads_private(struct perf_evsel *evsel);
+struct perf_evsel_fd *perf_evsel__fd_entry(struct perf_evsel *evsel, int cpu, int thread);
+int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group);
 
 #endif /* __LIBPERF_INTERNAL_EVSEL_H */

@@ -7,13 +7,29 @@
 #include <linux/zalloc.h>
 #include <linux/epoll.h>
 
-typedef int (*keycmp)(const void *key, const struct rb_node *rbn);
-
-static int fdcmp(struct rb_node *rb1, const struct rb_node *rb2)
+static struct event_poll_data *event_poll__find(struct event_poll *ep, int fd)
 {
-    struct event_poll_data *d1 = rb_entry(rb1, struct event_poll_data, rbn);
-    struct event_poll_data *d2 = rb_entry(rb2, struct event_poll_data, rbn);
-    return d1->fd - d2->fd;
+    if (fd < 0 || fd >= ep->fd_alloc)
+        return NULL;
+    return ep->by_fd[fd];
+}
+
+static int event_poll__grow(struct event_poll *ep, int fd)
+{
+    struct event_poll_data **n;
+    int alloc = ep->fd_alloc ? ep->fd_alloc : 64;
+
+    if (fd < ep->fd_alloc)
+        return 0;
+    while (alloc <= fd)
+        alloc *= 2;
+    n = realloc(ep->by_fd, (size_t)alloc * sizeof(*n));
+    if (!n)
+        return -ENOMEM;
+    memset(n + ep->fd_alloc, 0, (size_t)(alloc - ep->fd_alloc) * sizeof(*n));
+    ep->by_fd = n;
+    ep->fd_alloc = alloc;
+    return 0;
 }
 
 struct event_poll *event_poll__alloc(int maxevents)
@@ -34,7 +50,6 @@ struct event_poll *event_poll__alloc(int maxevents)
     if (ep->events == NULL)
         goto err;
 
-    ep->root = RB_ROOT;
     return ep;
 err:
     event_poll__free(ep);
@@ -43,18 +58,16 @@ err:
 
 void event_poll__free(struct event_poll *ep)
 {
-    if (ep->nr) {
-        struct rb_node *node, *next;
-        struct event_poll_data *data;
+    int fd;
 
-        for (node = rb_first(&ep->root); node; node = next) {
-            next = rb_next(node);
-            rb_erase(node, &ep->root);
-            data = rb_entry(node, struct event_poll_data, rbn);
-            epoll_ctl(ep->epfd, EPOLL_CTL_DEL, data->fd, NULL);
-            free(data);
-        }
+    for (fd = 0; fd < ep->fd_alloc; fd++) {
+        if (!ep->by_fd[fd])
+            continue;
+        epoll_ctl(ep->epfd, EPOLL_CTL_DEL, fd, NULL);
+        free(ep->by_fd[fd]);
+        ep->by_fd[fd] = NULL;
     }
+    free(ep->by_fd);
     if (ep->events)
         free(ep->events);
     if (ep->epfd >= 0)
@@ -65,69 +78,56 @@ void event_poll__free(struct event_poll *ep)
 int event_poll__add(struct event_poll *ep, int fd, unsigned int events, void *ptr, handle_event handle)
 {
     struct event_poll_data *data;
-    struct rb_node *rbn = NULL;
     struct epoll_event event;
+    int mod = 0;
 
-    data = malloc(sizeof(*data));
-    if (!data)
+    if (fd < 0)
+        return -EINVAL;
+    if (event_poll__grow(ep, fd) < 0)
         return -ENOMEM;
 
-    data->fd = fd;
-    RB_CLEAR_NODE(&data->rbn);
-    rbn = rb_find_add(&data->rbn, &ep->root, fdcmp);
-    if (rbn) {
-        free(data);
-        data = rb_entry(rbn, struct event_poll_data, rbn);
+    data = ep->by_fd[fd];
+    if (data) {
+        mod = 1;
+        data->dead = 0;
     } else {
+        data = zalloc(sizeof(*data));
+        if (!data)
+            return -ENOMEM;
+        data->fd = fd;
+        ep->by_fd[fd] = data;
         fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(fd, F_GETFL));
-        ep->nr ++;
+        ep->nr++;
     }
 
-    /*
-     * There is no need to check whether data is being used in ep->events, and new
-     * values can be safely assigned.
-     *
-     * For the new fd, there can be no reference to data in ep->events.
-     *
-     * For the old fd, there may be a reference to data in ep->events. Regardless
-     * of whether data->handle is executing or not, it is safe to assign a new value
-     * to data.
-    **/
     data->ptr = ptr;
     data->events = events;
     data->handle = handle;
 
     event.events = events;
     event.data.ptr = data;
-    return epoll_ctl(ep->epfd, rbn ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, fd, &event);
+    return epoll_ctl(ep->epfd, mod ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, fd, &event);
 }
 
 int event_poll__del(struct event_poll *ep, int fd)
 {
     struct event_poll_data *data;
-    struct event_poll_data key;
-    struct rb_node *rbn;
     int i;
 
-    key.fd = fd;
-    rbn = rb_find(&key, &ep->root, (keycmp)fdcmp);
-    if (rbn) {
-        data = rb_entry(rbn, struct event_poll_data, rbn);
-        /*
-         * Check if data is being used in ep->events, if so, clear it.
-        **/
-        for (i = ep->i + 1; i < ep->cnt; i++) {
-            if (ep->events[i].data.ptr == data) {
-                ep->events[i].data.ptr = NULL;
-            }
-        }
-
-        rb_erase(rbn, &ep->root);
-        free(data);
-        ep->nr --;
-        return epoll_ctl(ep->epfd, EPOLL_CTL_DEL, fd, NULL);
-    } else
+    data = event_poll__find(ep, fd);
+    if (!data)
         return -ENOENT;
+
+    for (i = 0; i < ep->cnt; i++) {
+        if (ep->events[i].data.ptr == data)
+            ep->events[i].data.ptr = NULL;
+    }
+
+    ep->by_fd[fd] = NULL;
+    ep->nr--;
+    epoll_ctl(ep->epfd, EPOLL_CTL_DEL, fd, NULL);
+    free(data);
+    return 0;
 }
 
 int event_poll__poll(struct event_poll *ep, int timeout)
@@ -144,7 +144,7 @@ int event_poll__poll(struct event_poll *ep, int timeout)
     for (i = 0; i < cnt; i++) {
         revents = ep->events[i].events;
         data = ep->events[i].data.ptr;
-        if (data) {
+        if (data && !data->dead) {
             ep->i = i;
             data->handle(data->fd, revents, data->ptr);
         }
@@ -153,4 +153,3 @@ int event_poll__poll(struct event_poll *ep, int timeout)
 
     return ep->nr ? cnt : -ENOENT;
 }
-
