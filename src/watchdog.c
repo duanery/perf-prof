@@ -357,7 +357,7 @@ struct sample_type_raw {
     } raw;
 };
 
-static void watchdog_stage_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void watchdog_stage_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct watchdog_ctx *ctx = dev->private;
     struct sample_type_raw *data = (void *)event->sample.array;
@@ -488,7 +488,7 @@ static void __print_callchain(struct prof_dev *dev, union perf_event *event)
     }
 }
 
-static void watchdog_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void watchdog_sample(struct prof_dev *dev, union perf_event *event, int bind_cpu, int bind_tid)
 {
     struct watchdog_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -556,7 +556,7 @@ static void watchdog_sample(struct prof_dev *dev, union perf_event *event, int i
     }
 }
 
-static void watchdog_throttle(struct prof_dev *dev, union perf_event *event, int instance)
+static void watchdog_throttle(struct prof_dev *dev, union perf_event *event, int bind_cpu, int bind_tid)
 {
     struct watchdog_ctx *ctx = dev->private;
     struct perf_evsel *evsel;

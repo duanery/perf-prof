@@ -6,14 +6,13 @@
 #include "tep.h"
 #include "stack_helpers.h"
 
+struct profile_binding {
+    struct prof_binding binding;
+    uint64_t counter, cycles, start_time, num;
+};
+
 struct profile_ctx {
-    int nr_ins;
-    uint64_t *counter;
-    uint64_t *cycles;
-    struct {
-        uint64_t start_time;
-        uint64_t num;
-    }*stat;
+    struct prof_bindings bindings;
     struct callchain_ctx *cc;
     struct flame_graph *flame;
     struct bpf_filter filter;
@@ -55,18 +54,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
     dev->private = ctx;
 
     tep__ref();
-    ctx->nr_ins = prof_dev_nr_ins(dev);
-    ctx->counter = calloc(ctx->nr_ins, sizeof(uint64_t));
-    if (!ctx->counter)
-        goto failed;
-
-    ctx->cycles = calloc(ctx->nr_ins, sizeof(uint64_t));
-    if (!ctx->cycles)
-        goto failed;
-
-    ctx->stat = calloc(ctx->nr_ins, sizeof(*ctx->stat));
-    if (!ctx->stat)
-        goto failed;
+    ctx->bindings.size = sizeof(struct profile_binding);
 
     ctx->time = 0;
     ctx->time_str[0] = '\0';
@@ -102,9 +90,7 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct profile_ctx *ctx = dev->private;
 
-    if (ctx->counter) free(ctx->counter);
-    if (ctx->cycles) free(ctx->cycles);
-    if (ctx->stat) free(ctx->stat);
+    prof_bindings_exit(&ctx->bindings);
     bpf_filter_close(&ctx->filter);
     if (dev->env->callchain) {
         callchain_ctx_free(ctx->cc);
@@ -209,46 +195,61 @@ static void profile_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static int profile_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int profile_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
     struct profile_ctx *ctx = dev->private;
+    struct profile_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
     uint64_t cycles = 0;
     const char *str_in[] = {"host,guest", "host", "guest", "error"};
     const char *str_mode[] = {"all", "usr", "sys", "error"};
     int in, mode, oncpu;
 
-    if (count->val > ctx->cycles[instance]) {
-        cycles = count->val - ctx->cycles[instance];
-        ctx->cycles[instance] = count->val;
+    if (!state)
+        return 0;
+
+    if (count->val > state->cycles) {
+        cycles = count->val - state->cycles;
+        state->cycles = count->val;
     }
     if (cycles) {
         in = (dev->env->exclude_host << 1) | dev->env->exclude_guest;
         mode = (dev->env->exclude_user << 1) | dev->env->exclude_kernel;
         print_time(stdout);
-        oncpu = prof_dev_ins_oncpu(dev);
+        oncpu = cpu >= 0;
         if (ctx->vendor == X86_VENDOR_INTEL && ctx->tsc_khz > 0)
             printf("%s %d [%s] %.2f%% [%s] %lu cycles\n", oncpu ? "cpu" : "thread",
-                    oncpu ? prof_dev_ins_cpu(dev, instance) : prof_dev_ins_thread(dev, instance),
+                    oncpu ? cpu : tid,
                     str_in[in],
                     (float)cycles * 100 / (ctx->tsc_khz * (__u64)dev->env->interval),
                     str_mode[mode], cycles);
         else
             printf("%s %d [%s] [%s] %lu cycles\n", oncpu ? "cpu" : "thread",
-                    oncpu ? prof_dev_ins_cpu(dev, instance) : prof_dev_ins_thread(dev, instance),
+                    oncpu ? cpu : tid,
                     str_in[in], str_mode[mode], cycles);
     }
     return 0;
 }
 
-static void profile_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static int profile_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct profile_ctx *ctx = dev->private;
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static void profile_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
+{
+    struct profile_ctx *ctx = dev->private;
+    struct profile_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
 
-    if (data->counter > ctx->counter[instance])
-        counter = data->counter - ctx->counter[instance];
-    ctx->counter[instance] = data->counter;
+    if (!state)
+        return;
+
+    if (data->counter > state->counter)
+        counter = data->counter - state->counter;
+    state->counter = data->counter;
 
     if (!(flags & OMIT_TIMESTAMP))
         prof_dev_print_time(dev, data->time, stdout);
@@ -264,27 +265,31 @@ static void profile_print_event(struct prof_dev *dev, union perf_event *event, i
     }
 }
 
-static void profile_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void profile_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct profile_ctx *ctx = dev->private;
+    struct profile_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
     int print = 1;
 
-    if (data->counter > ctx->counter[instance])
-        counter = data->counter - ctx->counter[instance];
-    ctx->counter[instance] = data->counter;
+    if (!state)
+        return;
+
+    if (data->counter > state->counter)
+        counter = data->counter - state->counter;
+    state->counter = data->counter;
 
     if (dev->env->greater_than) {
-        uint64_t time = ctx->stat[instance].start_time;
-        ctx->stat[instance].num ++;
+        uint64_t time = state->start_time;
+        state->num ++;
         if (data->time - time >= NSEC_PER_SEC) {
             print = 0;
-            ctx->stat[instance].start_time = data->time;
-            ctx->stat[instance].num = 1;
+            state->start_time = data->time;
+            state->num = 1;
         } else {
             int x = (dev->env->freq * dev->env->greater_than + 99) / 100;
-            if (ctx->stat[instance].num < x)
+            if (state->num < x)
                 print = 0;
         }
     }
@@ -362,6 +367,7 @@ struct monitor profile = {
     .init = profile_init,
     .filter = profile_filter,
     .deinit = profile_exit,
+    .del_thread = profile_del_thread,
     .interval = profile_interval,
     .print_event = profile_print_event,
     .sample = profile_sample,
@@ -396,7 +402,7 @@ struct monitor cpu_util = {
     .pages = 0,
     .init = cpu_util_init,
     .deinit = profile_exit,
+    .del_thread = profile_del_thread,
     .read   = profile_read,
 };
 PROFILER_REGISTER(cpu_util);
-

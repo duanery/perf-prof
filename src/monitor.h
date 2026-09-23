@@ -22,6 +22,7 @@
 #include <linux/time64.h>
 #include <linux/refcount.h>
 #include <linux/min_heap.h>
+#include "bindings.h"
 #include "include/linux/types.h"
 
 /* perf sample has 16 bits size limit */
@@ -37,11 +38,19 @@ struct prof_dev;
 void monitor_register(struct monitor *m);
 struct monitor * monitor_find(const char *name);
 struct monitor *monitor_next(struct monitor *m);
-int prof_dev_nr_ins(struct prof_dev *dev);
-int prof_dev_ins_cpu(struct prof_dev *dev, int ins);
-int prof_dev_ins_thread(struct prof_dev *dev, int ins);
-int prof_dev_ins_oncpu(struct prof_dev *dev);
+int prof_dev_oncpu(struct prof_dev *dev);
 
+/*
+ * Profiler callbacks say where an event came from as a (cpu, tid) pair, taken
+ * from the binding of the ring buffer it was read from. Exactly one of the two
+ * is valid: an event out of a cpu-bound ring buffer has no thread of its own
+ * (tid == -1), and one out of a thread-bound ring buffer has no cpu
+ * (cpu == -1).
+ *
+ * Profiler state is keyed by the binding, not by an evlist/mmap array index.
+ */
+int prof_dev_add_thread(struct prof_dev *dev, pid_t pid);
+int prof_dev_del_thread(struct prof_dev *dev, pid_t pid);
 int main_epoll_add(int fd, unsigned int events, void *ptr, handle_event handle);
 int main_epoll_del(int fd);
 
@@ -77,9 +86,9 @@ int callchain_flags(struct prof_dev *dev, int default_flags);
 int exclude_callchain_user(struct prof_dev *dev, int dflt_flags);
 int exclude_callchain_kernel(struct prof_dev *dev, int dflt_flags);
 
-void print_lost_fn(struct prof_dev *dev, union perf_event *event, int ins);
+void print_lost_fn(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
-int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int instance, bool writable, bool converted);
+int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int cpu, int tid, bool writable, bool converted);
 
 
 #define PROFILER_REGISTER_NAME(p, name) \
@@ -246,6 +255,9 @@ typedef struct monitor {
     int (*init)(struct prof_dev *dev);
     int (*reinit)(struct prof_dev *dev, int err);
     int (*filter)(struct prof_dev *dev);
+    /* ptrace added or removed a thread; update profiler-side filters. */
+    int (*add_thread)(struct prof_dev *dev, pid_t pid);
+    int (*del_thread)(struct prof_dev *dev, pid_t pid);
     void (*enabled)(struct prof_dev *dev);
     void (*deinit)(struct prof_dev *dev);
     void (*flush)(struct prof_dev *dev, enum profdev_flush how);
@@ -262,58 +274,60 @@ typedef struct monitor {
     u64 (*minevtime)(struct prof_dev *dev);
 
     // return 0:continue; 1:break;
-    int (*read)(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance);
+    int (*read)(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid);
+    /* Runs before both sample() and forwarding, including dynamic PID filters. */
+    bool (*accept)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     /* PERF_RECORD_* */
 
     //PERF_RECORD_MMAP             = 1,
     //PERF_RECORD_MMAP2            = 10,
-    void (*mmap)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*mmap2)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*mmap)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*mmap2)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_LOST             = 2,
     // lost_start: evclock_t, lost_end: evclock_t.
-    void (*lost)(struct prof_dev *dev, union perf_event *event, int instance, u64 lost_start, u64 lost_end);
+    void (*lost)(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end);
 
     //PERF_RECORD_COMM             = 3,
-    void (*comm)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*comm)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_EXIT             = 4,
-    void (*exit)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*exit)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_THROTTLE         = 5,
     //PERF_RECORD_UNTHROTTLE       = 6,
-    void (*throttle)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*unthrottle)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*throttle)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*unthrottle)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_FORK             = 7,
-    void (*fork)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*fork)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_SAMPLE           = 9,
     // userspace ftrace filter: return >0: sample; <=0: drop.
-    long (*ftrace_filter)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*print_event)(struct prof_dev *dev, union perf_event *event, int instance, int flags);
-    void (*sample)(struct prof_dev *dev, union perf_event *event, int instance);
+    long (*ftrace_filter)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*print_event)(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags);
+    void (*sample)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_SWITCH           = 14,
     //PERF_RECORD_SWITCH_CPU_WIDE  = 15,
-    void (*context_switch)(struct prof_dev *dev, union perf_event *event, int instance);
-    void (*context_switch_cpu)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*context_switch)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
+    void (*context_switch_cpu)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_NAMESPACES       = 16,
-    void (*namespaces)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*namespaces)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_KSYMBOL          = 17,
-    void (*ksymbol)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*ksymbol)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_BPF_EVENT        = 18,
-    void (*bpf_event)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*bpf_event)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_CGROUP           = 19,
-    void (*cgroup)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*cgroup)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     //PERF_RECORD_TEXT_POKE        = 20,
-    void (*text_poke)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*text_poke)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 } profiler;
 
 enum prof_dev_state {
@@ -361,6 +375,8 @@ struct prof_dev {
     struct list_head dev_link;
     struct perf_cpu_map *cpus;
     struct perf_thread_map *threads;
+    struct list_head dead_threads;
+    bool reaping_threads;
     struct perf_evlist *evlist;
     struct timer timer;  // interval
     struct env *env;
@@ -399,7 +415,7 @@ struct prof_dev {
     struct perf_sample_pos {
         u64 sample_type;
         // Starting from event->sample.array, not include perf_event_header.
-        short tid_pos, time_pos, id_pos, cpu_pos, callchain_pos;
+        short tid_pos, time_pos, id_pos, cpu_pos, read_pos, callchain_pos;
     } pos;
     struct perf_sample_time_ctx { // PERF_SAMPLE_TIME
         evclock_t last_evtime; // ns, tsc, ...
@@ -422,11 +438,13 @@ struct prof_dev {
         struct list_head heap_event_list; // link all heap_event
         int heap_size, nr_mmaps, nr_streams;
         void **data; // used in heapsort;
-        void *permap_event; // struct perf_mmap_event
+        struct perf_mmap *drain_map;
+        u64 drain_end;
         u64 wakeup_watermark;
         heapclock_t prev_lost_time;
         heapclock_t heap_popped_time;
-        int heap_popped_ins;
+        int heap_popped_cpu;
+        int heap_popped_tid;
         u8 break_reason; // enum order_break_reason
         bool enabled;
         bool inprocess;
@@ -465,7 +483,6 @@ struct prof_dev {
         struct list_head source_list;
         struct list_head link_to_target;
         struct perf_record_dev *event_dev; // PERF_SAMPLE_MAX_SIZE
-        bool ins_reset;
     } forward;
     struct performance_evaluation { // env->sampling_limit
         struct hlist_head *hashmap; // cpu/tid => samples
@@ -538,7 +555,7 @@ int prof_dev_disable(struct prof_dev *dev);
 int prof_dev_forward(struct prof_dev *dev, struct prof_dev *target);
 void prof_dev_flush(struct prof_dev *dev, enum profdev_flush how);
 void prof_dev_print_time(struct prof_dev *dev, u64 evtime, FILE *fp);
-void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags);
+void prof_dev_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags);
 int prof_dev_reopen_output(struct prof_dev *dev);
 
 /*
@@ -634,7 +651,7 @@ perfclock_t prof_dev_list_minevtime(void);
     "OPTION:", \
     "cpus", "pids", "tids", "cgroups", "watermark", \
     "interval", "output", "order", "mmap-pages", "exit-N", "tsc", "kvmclock", "clock-offset", "monotonic", \
-    "usage-self", "sampling-limit", "perfeval-cpus", "perfeval-pids", "version", "verbose", "quiet", "help"
+    "usage-self", "sampling-limit", "perfeval-cpus", "perfeval-pids", "version", "verbose", "quiet", "help", "ptrace"
 #define PROFILER_ARGV_FILTER \
     "FILTER OPTION:", \
     "exclude-host", "exclude-guest", "exclude-user", "exclude-kernel", "python-callchain", \
@@ -649,9 +666,13 @@ perfclock_t prof_dev_list_minevtime(void);
 int order_init(struct prof_dev *dev);
 void order_deinit(struct prof_dev *dev);
 int order_together(struct prof_dev *main_dev, struct prof_dev *dev);
-typedef union perf_event *read_event(void *stream, bool init, int *ins, bool *writable, bool *converted);
+typedef union perf_event *read_event(void *stream, bool init, int *cpu, int *tid, bool *writable, bool *converted);
 int order_register(struct prof_dev *dev, read_event *read_event, void *stream);
 void order_unregister(struct prof_dev *dev, void *stream);
+int order_mmap_add(struct prof_dev *dev, struct perf_mmap *map);
+void order_mmap_del(struct prof_dev *dev, struct perf_mmap *map);
+bool order_drain(struct prof_dev *dev, struct perf_mmap *map, u64 end);
+void prof_dev_reap_threads(struct prof_dev *dev);
 void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock_t target_tm);
 static inline void order_mmap(struct prof_dev *dev, struct perf_mmap *map) { order_process(dev, map, 0); }
 static inline void order_stream(struct prof_dev *dev) { order_process(dev, NULL, 0); }
@@ -715,7 +736,9 @@ struct perf_event_member {
 };
 
 struct perf_event_member_cache {
+    struct perf_evsel *evsel;
     struct perf_event_member *id;
+    struct perf_event_member *read;
     struct perf_event_member *time;
     struct perf_event_member *cpu;
     struct perf_event_member *pid, *tid;
@@ -756,10 +779,12 @@ static inline struct perf_event_member_cache *perf_evsel_member_cache(struct per
 int prof_dev_evsel_external_init(struct prof_dev *dev);
 void prof_dev_evsel_external_deinit(struct prof_dev *dev);
 struct perf_evsel *perf_event_evsel(struct prof_dev *dev, union perf_event *event);
-struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel);
-int perf_event_member_offset(struct perf_event_member_cache *cache,
-                             struct perf_event_member *member,
-                             union perf_event *event);
+    struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel);
+    int perf_event_member_offset(struct perf_event_member_cache *cache,
+                                 struct perf_event_member *member,
+                                 union perf_event *event);
+int perf_sample_read_size(struct perf_evsel *evsel, void *data);
+int perf_event_callchain_offset(struct prof_dev *dev, union perf_event *event);
 struct callchain_data;
 void perf_event_build_callchain_data(struct perf_evsel *evsel,
                                      union perf_event *event,
@@ -797,7 +822,7 @@ void print_tracepoint_events(tracepoint_cb cb, void *opaque);
 //perfeval.c
 int perfeval_init(struct prof_dev *dev);
 void perfeval_free(struct prof_dev *dev);
-void perfeval_sample(struct prof_dev *dev, union perf_event *event, int instance);
+void perfeval_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 void perfeval_evaluate(struct prof_dev *dev);
 
 

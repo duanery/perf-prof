@@ -83,7 +83,7 @@ struct sample_id_type {
     u32 cpu, res; // PERF_SAMPLE_CPU
 };
 
-static void misc_header(struct prof_dev *dev, union perf_event *event, int instance)
+static void misc_header(struct prof_dev *dev, union perf_event *event)
 {
     struct sample_id_type *s = (void *)event + event->header.size - sizeof(*s);
     prof_dev_print_time(dev, s->time, stdout);
@@ -91,7 +91,7 @@ static void misc_header(struct prof_dev *dev, union perf_event *event, int insta
            s->time/1000/USEC_PER_SEC, (s->time/1000)%USEC_PER_SEC);
 }
 
-static void misc_ksymbol(struct prof_dev *dev, union perf_event *event, int instance)
+static void misc_ksymbol(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct perf_record_ksymbol *ksymbol = (void *)event;
     const char *str = "";
@@ -99,18 +99,18 @@ static void misc_ksymbol(struct prof_dev *dev, union perf_event *event, int inst
         str = "bpf";
     if (ksymbol->ksym_type == PERF_RECORD_KSYMBOL_TYPE_OOL)
         str = "kprobe/ftrace";
-    misc_header(dev, event, instance);
+    misc_header(dev, event);
     printf("misc:ksymbol: %s %s %016llx/%d %s\n", str,
         ksymbol->flags & PERF_RECORD_KSYMBOL_FLAGS_UNREGISTER ? "unreg" : "reg",
         ksymbol->addr, ksymbol->len, ksymbol->name);
 }
 
-static void misc_bpf_event(struct prof_dev *dev, union perf_event *event, int instance)
+static void misc_bpf_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct perf_record_bpf_event *bpf = (void *)event;
     const char *type = "unknown";
     int i;
-    misc_header(dev, event, instance);
+    misc_header(dev, event);
     if (bpf->type == PERF_BPF_EVENT_PROG_LOAD)
         type = "prog load";
     if (bpf->type == PERF_BPF_EVENT_PROG_UNLOAD)
@@ -121,21 +121,21 @@ static void misc_bpf_event(struct prof_dev *dev, union perf_event *event, int in
     printf("\n");
 }
 
-static void misc_cgroup(struct prof_dev *dev, union perf_event *event, int instance)
+static void misc_cgroup(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct perf_record_cgroup *cgroup = (void *)event;
-    misc_header(dev, event, instance);
+    misc_header(dev, event);
     printf("misc:cgroup: id %llu %s\n", cgroup->id, cgroup->path);
 }
 
-static void misc_text_poke(struct prof_dev *dev, union perf_event *event, int instance)
+static void misc_text_poke(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct perf_record_text_poke_event *text = (void *)event;
     __u64 addr = text->addr;
     __u64 func = addr;
     char *func_name = function_resolver(NULL, &func, NULL);
     int i;
-    misc_header(dev, event, instance);
+    misc_header(dev, event);
     printf("misc:text_poke: %016llx", addr);
     for (i = 0; i < text->old_len; i++)
         printf(" %02x", text->bytes[i]);
@@ -183,7 +183,7 @@ static int ksymbol_init(struct prof_dev *dev)
 static void ksymbol_deinit(struct prof_dev *dev)
 {
 }
-static void ksymbol_event(struct prof_dev *dev, union perf_event *event, int instance)
+static void ksymbol_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct ksyms *ksyms = dev->private;
     struct perf_record_ksymbol *ksymbol = (void *)event;

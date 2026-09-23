@@ -3,12 +3,25 @@
 #define __LIBPERF_MMAP_H
 
 #include <linux/types.h>
+#include <sys/types.h>
+#include <stdbool.h>
 #include <perf/core.h>
 
 struct perf_mmap;
 union perf_event;
 
 LIBPERF_API int perf_mmap__idx(struct perf_mmap *map);
+/*
+ * The binding of the ring buffer. A ring buffer is bound either to a cpu
+ * (perf_mmap__cpu() >= 0, perf_mmap__tid() == -1) or to a thread
+ * (perf_mmap__cpu() == -1, perf_mmap__tid() >= 0).
+ */
+LIBPERF_API int perf_mmap__cpu(struct perf_mmap *map);
+LIBPERF_API pid_t perf_mmap__tid(struct perf_mmap *map);
+LIBPERF_API bool perf_mmap__oncpu(struct perf_mmap *map);
+/* Pin a mapping while processing records that can remove its last writer. */
+LIBPERF_API void perf_mmap__get(struct perf_mmap *map);
+LIBPERF_API void perf_mmap__put(struct perf_mmap *map);
 LIBPERF_API void perf_mmap__consume(struct perf_mmap *map);
 LIBPERF_API int perf_mmap__read_init(struct perf_mmap *map);
 LIBPERF_API void perf_mmap__read_done(struct perf_mmap *map);

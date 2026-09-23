@@ -59,7 +59,7 @@ static int tlbstat_init(struct prof_dev *dev)
     __u64 dTLB_store_misses = 0;
     __u64 dTLB_stores = 0;
 
-    if (!prof_dev_ins_oncpu(dev)) {
+    if (!prof_dev_oncpu(dev)) {
         fprintf(stderr, "can only be bound to CPU\n");
         return -1;
     }
@@ -158,8 +158,9 @@ static void tlbstat_exit(struct prof_dev *dev)
     free(ctx);
 }
 
-static int tlbstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int tlbstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
+    int cpu_index = perf_cpu_map__idx(dev->cpus, cpu);
     struct tlbstat_ctx *ctx = dev->private;
     struct perf_counts {
         u64 nr;
@@ -174,13 +175,13 @@ static int tlbstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct p
     int i;
 
     #define UPDATE_COUNTER(c) \
-    if (c > cache[instance].counter) { \
-        cache[instance].incremental = c - cache[instance].counter; \
-        cache[instance].counter = c; \
+    if (c > cache[cpu_index].counter) { \
+        cache[cpu_index].incremental = c - cache[cpu_index].counter; \
+        cache[cpu_index].counter = c; \
     } else \
-        cache[instance].incremental = 0;
+        cache[cpu_index].incremental = 0;
 
-    if (evsel != ctx->leader)
+    if (cpu_index < 0 || evsel != ctx->leader)
         return 0;
 
     cache = ctx->total_time_enabled;
@@ -226,6 +227,7 @@ static void tlbstat_interval(struct prof_dev *dev)
         float load_hit = 0.0;
         float store_hit = 0.0;
         float run = 0.0;
+
         if (ctx->dTLB_loads[ins].incremental > ctx->dTLB_load_misses[ins].incremental)
             load_hit = (ctx->dTLB_loads[ins].incremental - ctx->dTLB_load_misses[ins].incremental) * 100.0 /
                         ctx->dTLB_loads[ins].incremental;
@@ -233,7 +235,7 @@ static void tlbstat_interval(struct prof_dev *dev)
             store_hit = (ctx->dTLB_stores[ins].incremental - ctx->dTLB_store_misses[ins].incremental) * 100.0 /
                         ctx->dTLB_stores[ins].incremental;
         run = ctx->total_time_running[ins].incremental * 100.0 / ctx->total_time_enabled[ins].incremental;
-        printf("[%03d] %9lu %9lu  %6.2f%% %9lu %9lu  %6.2f%% %6.2f%%\n", prof_dev_ins_cpu(dev, ins),
+        printf("[%03d] %9lu %9lu  %6.2f%% %9lu %9lu  %6.2f%% %6.2f%%\n", perf_cpu_map__cpu(dev->cpus, ins),
                 ctx->dTLB_loads[ins].incremental, ctx->dTLB_load_misses[ins].incremental, load_hit,
                 ctx->dTLB_stores[ins].incremental, ctx->dTLB_store_misses[ins].incremental, store_hit,
                 run);
@@ -265,5 +267,3 @@ static profiler tlbstat = {
     .read = tlbstat_read,
 };
 PROFILER_REGISTER(tlbstat)
-
-

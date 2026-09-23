@@ -14,6 +14,7 @@
 #include <stack_helpers.h>
 #include <two-event.h>
 #include <tp_struct.h>
+#include <internal/threadmap.h>
 
 #define ENABLED_MAX ULLONG_MAX
 #define ENABLED_TP_MAX (ULLONG_MAX-1)
@@ -31,7 +32,7 @@ struct timeline_node {
         need_backup : 1,
         need_remove_from_backup : 1,
         maybe_unpaired : 1;
-    u32 ins;
+    u64 binding;
     u64 seq;
     union {
         struct list_head needed;
@@ -63,7 +64,7 @@ enum lost_affect {
 
 struct lost_node {
     struct list_head lost_link;
-    int ins;
+    u64 binding;
     bool reclaim;
     u64 start_time;
     u64 end_time;
@@ -81,7 +82,7 @@ struct multi_trace_ctx {
     struct two_event_class *class;
     struct rblist backup;
     struct rblist timeline;
-    struct list_head *perins_list;
+    struct prof_bindings bindings;
     struct list_head needed_list; // need_timeline
     struct list_head pending_list; // need_timeline
     bool need_timeline;
@@ -93,21 +94,50 @@ struct multi_trace_ctx {
     struct callchain_ctx *cc;
     struct perf_thread_map *thread_map; // profiler rundelay
     bool comm; // profiler rundelay, syscalls
+    /* profiler rundelay: thread_map grows via ptrace; pid is matched in
+     * sample(), not SET_FILTER. */
+    bool dynamic_threads;
     int level; // level = sched_init()
 
     /* lost */
     enum lost_affect lost_affect;
     struct list_head timeline_lost_list; // LOST_AFFECT_ALL_EVENT. struct lost_node
-    struct list_head *perins_lost_list;  // LOST_AFFECT_INS_EVENT. struct lost_node
 
     /* syscalls: exit, exit_group */
     struct perf_evsel *extra_evsel;
-    void (*extra_sample)(struct prof_dev *dev, union perf_event *event, int instance);
+    void (*extra_sample)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     /* stat */
     struct timeline_stat tl_stat;
     struct __backup_stat backup_stat;
 };
+
+struct multi_trace_binding {
+    struct prof_binding binding;
+    struct list_head needed;
+    struct list_head lost;
+};
+
+static void multi_trace_binding_init(void *ptr)
+{
+    struct multi_trace_binding *state = ptr;
+    INIT_LIST_HEAD(&state->needed);
+    INIT_LIST_HEAD(&state->lost);
+}
+
+static void multi_trace_binding_free(void *ptr)
+{
+    struct multi_trace_binding *state = ptr;
+    struct lost_node *lost, *next;
+
+    list_for_each_entry_safe(lost, next, &state->lost, lost_link)
+        free(lost);
+}
+
+static struct multi_trace_binding *multi_trace_binding(struct multi_trace_ctx *ctx, u64 key)
+{
+    return prof_binding_get(&ctx->bindings, prof_binding_cpu(key), prof_binding_tid(key));
+}
 
 static struct timeline_node *multi_trace_first_pending(struct prof_dev *dev, struct timeline_node *tail);
 
@@ -164,7 +194,7 @@ static struct rb_node *perf_event_backup_node_new(struct rblist *rlist, const vo
             b->need_backup = e->need_backup;
             b->need_remove_from_backup = e->need_remove_from_backup;
             b->maybe_unpaired = 0;
-            b->ins = e->ins;
+            b->binding = e->binding;
             b->seq = e->seq;
             b->event = new_event;
             RB_CLEAR_NODE(&b->timeline_node);
@@ -174,7 +204,7 @@ static struct rb_node *perf_event_backup_node_new(struct rblist *rlist, const vo
              * The events for each instance are time-ordered. Therefore, it can be directly added
              * to the end of the queue without reordering.
             **/
-            list_add_tail(&b->needed, &ctx->perins_list[b->ins]);
+            list_add_tail(&b->needed, &multi_trace_binding(ctx, b->binding)->needed);
 
             ctx->backup_stat.new ++;
             ctx->backup_stat.mem_bytes += event->header.size;
@@ -246,7 +276,7 @@ static struct rb_node *timeline_node_new(struct rblist *rlist, const void *new_e
         b->need_backup = e->need_backup;
         b->need_remove_from_backup = e->need_remove_from_backup;
         b->maybe_unpaired = 0;
-        b->ins = e->ins;
+        b->binding = e->binding;
         b->seq = e->seq;
         b->event = new_event;
         RB_CLEAR_NODE(&b->timeline_node);
@@ -376,7 +406,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
     struct env *env = dev->env;
     struct multi_trace_ctx *ctx = dev->private;
     int i, j, stacks = 0;
-    int oncpu = prof_dev_ins_oncpu(dev);
+    int oncpu = prof_dev_oncpu(dev);
     struct two_event_options options = {
         .keyname = (oncpu && !ctx->comm) ? "CPU" : "THREAD",
         .perins = env->perins,
@@ -416,7 +446,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
         goto failed;
 
 
-    ctx->nr_ins = prof_dev_nr_ins(dev);
+    ctx->nr_ins = oncpu ? perf_cpu_map__nr(dev->cpus) : perf_thread_map__nr(dev->threads);
     ctx->nr_list = env->nr_events;
     ctx->tp_list = calloc(ctx->nr_list, sizeof(*ctx->tp_list));
     if (!ctx->tp_list)
@@ -524,6 +554,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
         fprintf(stderr, "--impl %s not implemented\n", env->impl);
         goto failed;
     }
+    options.binding_key = !keyname && strcmp(dev->prof->name, "rundelay");
     ctx->class = ctx->impl->class_new(ctx->impl, &options);
 
     rblist__init(&ctx->backup);
@@ -536,12 +567,9 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->timeline.node_new = timeline_node_new;
     ctx->timeline.node_delete = timeline_node_delete;
 
-    ctx->perins_list = malloc(ctx->nr_ins * sizeof(struct list_head));
-    if (ctx->perins_list) {
-        for (i = 0; i < ctx->nr_ins; i++)
-            INIT_LIST_HEAD(&ctx->perins_list[i]);
-    } else
-        goto failed;
+    ctx->bindings.size = sizeof(struct multi_trace_binding);
+    ctx->bindings.init = multi_trace_binding_init;
+    ctx->bindings.destroy = multi_trace_binding_free;
 
     // rundelay automatically sets the key.
     if (keyname || strcmp(dev->prof->name, "rundelay") == 0) {
@@ -550,12 +578,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
         // use instance as key, cpu or pid.
         ctx->lost_affect = LOST_AFFECT_INS_EVENT;
 
-        ctx->perins_lost_list = malloc(ctx->nr_ins * sizeof(struct list_head));
-        if (ctx->perins_lost_list) {
-            for (i = 0; i < ctx->nr_ins; i++)
-                INIT_LIST_HEAD(&ctx->perins_lost_list[i]);
-        } else
-            goto failed;
     }
 
     ctx->need_timeline = env->detail;
@@ -579,7 +601,6 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct multi_trace_ctx *ctx = dev->private;
     struct lost_node *lost, *next;
-    int i;
 
     while (multi_trace_first_pending(dev, NULL)) ;
 
@@ -588,16 +609,9 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     rblist__exit(&ctx->backup);
     rblist__exit(&ctx->timeline);
 
-    if (ctx->perins_lost_list) {
-        for (i = 0; i < ctx->nr_ins; i++)
-            list_for_each_entry_safe(lost, next, &ctx->perins_lost_list[i], lost_link)
-                free(lost);
-        free(ctx->perins_lost_list);
-    } else
-        list_for_each_entry_safe(lost, next, &ctx->timeline_lost_list, lost_link)
-            free(lost);
-
-    free(ctx->perins_list);
+    prof_bindings_exit(&ctx->bindings);
+    list_for_each_entry_safe(lost, next, &ctx->timeline_lost_list, lost_link)
+        free(lost);
 
     if (ctx->impl && ctx->class)
         ctx->impl->class_delete(ctx->class);
@@ -869,9 +883,9 @@ static u64 multi_trace_minevtime(struct prof_dev *dev)
             rbn = rb_first_cached(&ctx->timeline.entries);
             node = rb_entry_safe(rbn, struct timeline_node, timeline_node);
         } else {
-            int i;
-            for (i = 0; i < ctx->nr_ins; i++) {
-                tmp = list_first_entry_or_null(&ctx->perins_list[i], struct timeline_node, needed);
+            struct multi_trace_binding *state;
+            prof_bindings_for_each(&ctx->bindings, state) {
+                tmp = list_first_entry_or_null(&state->needed, struct timeline_node, needed);
                 if (tmp && (!node || tmp->time < node->time))
                     node = tmp;
             }
@@ -937,30 +951,32 @@ static inline void reclaim(struct prof_dev *dev, u64 key, remaining_reason rr)
     }
 }
 
-static inline void lost_reclaim(struct prof_dev *dev, int ins)
+static inline void lost_reclaim(struct prof_dev *dev, u64 binding)
 {
     struct multi_trace_ctx *ctx = dev->private;
 
     if (ctx->lost_affect == LOST_AFFECT_INS_EVENT) {
-        u64 key = ctx->oncpu ? prof_dev_ins_cpu(dev, ins) : prof_dev_ins_thread(dev, ins);
-        reclaim(dev, key, REMAINING_LOST);
+        reclaim(dev, binding, REMAINING_LOST);
     } else {
         multi_trace_handle_remaining(dev, REMAINING_LOST);
         rblist__exit(&ctx->backup);
     }
 }
 
-static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event, int ins)
+static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct multi_trace_ctx *ctx = dev->private;
+    struct multi_trace_binding *state = multi_trace_binding(ctx, prof_binding_key(cpu, tid));
     struct lost_node *lost;
     struct env *env;
 
     if (event)
-        return print_lost_fn(dev, event, ins);
+        return print_lost_fn(dev, event, cpu, tid);
+    if (!state)
+        return;
 
     if (ctx->lost_affect == LOST_AFFECT_INS_EVENT)
-        lost = list_first_entry(&ctx->perins_lost_list[ins], struct lost_node, lost_link);
+        lost = list_first_entry(&state->lost, struct lost_node, lost_link);
     else
         lost = list_first_entry(&ctx->timeline_lost_list, struct lost_node, lost_link);
 
@@ -968,8 +984,8 @@ static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event
     if (unlikely(env->verbose >= VERBOSE_NOTICE)) {
         print_time(stderr);
         fprintf(stderr, "%s: lost %lu events on %s #%d", dev->prof->name, lost->lost,
-                        ctx->oncpu ? "CPU" : "thread",
-                        ctx->oncpu ? prof_dev_ins_cpu(dev, lost->ins) : prof_dev_ins_thread(dev, lost->ins));
+                        prof_binding_cpu(lost->binding) >= 0 ? "CPU" : "thread",
+                        prof_binding_id(lost->binding));
         if (env->greater_than || env->lower_than)
             fprintf(stderr, " (%lu.%06lu, %lu.%06lu)\n", lost->start_time/NSEC_PER_SEC, (lost->start_time%NSEC_PER_SEC)/1000,
                                 lost->end_time/NSEC_PER_SEC, (lost->end_time%NSEC_PER_SEC)/1000);
@@ -981,21 +997,32 @@ static void multi_trace_print_lost(struct prof_dev *dev, union perf_event *event
             .id = lost->lost_id,
             .lost = lost->lost,
         };
-        print_lost_fn(dev, (union perf_event *)&lost_event, lost->ins);
+        {
+            int lost_cpu, lost_tid;
+
+            lost_cpu = prof_binding_cpu(lost->binding);
+            lost_tid = prof_binding_tid(lost->binding);
+            print_lost_fn(dev, (union perf_event *)&lost_event, lost_cpu, lost_tid);
+        }
     }
 }
 
-static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
+    u64 binding = prof_binding_key(cpu, tid);
     struct multi_trace_ctx *ctx = dev->private;
+    struct multi_trace_binding *state = multi_trace_binding(ctx, binding);
     struct lost_node *pos;
     struct lost_node *lost;
+
+    if (!state)
+        return;
 
     // Without order, events are processed in the order within the ringbuffer.
     // When lost, all previous events have been processed and only need to reclaim.
     if (!using_order(dev) && !dev->env->after_event2) {
-        multi_trace_print_lost(dev, event, ins);
-        lost_reclaim(dev, ins);
+        multi_trace_print_lost(dev, event, cpu, tid);
+        lost_reclaim(dev, binding);
         if (ctx->need_timeline)
             timeline_free_unneeded(dev);
         return;
@@ -1006,7 +1033,7 @@ static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int 
     // seen in advance and processed later.
     lost = malloc(sizeof(*lost));
     if (lost) {
-        lost->ins = ins;
+        lost->binding = binding;
         lost->reclaim = false;
         lost->start_time = lost_start;
         lost->end_time = lost_end;
@@ -1014,7 +1041,7 @@ static void multi_trace_lost(struct prof_dev *dev, union perf_event *event, int 
         lost->lost = event->lost.lost;
 
         if (ctx->lost_affect == LOST_AFFECT_INS_EVENT) {
-            list_add_tail(&lost->lost_link, &ctx->perins_lost_list[ins]);
+            list_add_tail(&lost->lost_link, &state->lost);
         } else {
             list_for_each_entry(pos, &ctx->timeline_lost_list, lost_link) {
                 if (pos->start_time > lost_start)
@@ -1059,7 +1086,7 @@ void multi_trace_print_title(union perf_event *event, struct tp *tp, const char 
     }
 
     if (event->header.type == PERF_RECORD_DEV) {
-        prof_dev_print_event(dev, event, 0, OMIT_TIMESTAMP);
+        prof_dev_print_event(dev, event, -1, -1, OMIT_TIMESTAMP);
         return;
     }
 
@@ -1517,9 +1544,13 @@ static inline void multi_trace_event_lost(struct prof_dev *dev, struct timeline_
     struct lost_node *lost, *next;
     struct list_head *head;
 
-    if (ctx->lost_affect == LOST_AFFECT_INS_EVENT)
-        head = &ctx->perins_lost_list[tl_event->ins];
-    else
+    if (ctx->lost_affect == LOST_AFFECT_INS_EVENT) {
+        struct multi_trace_binding *state = prof_binding_find(&ctx->bindings,
+                prof_binding_cpu(tl_event->binding), prof_binding_tid(tl_event->binding));
+        if (!state)
+            return;
+        head = &state->lost;
+    } else
         head = &ctx->timeline_lost_list;
 
     if (list_empty(head))
@@ -1565,9 +1596,15 @@ static inline void multi_trace_event_lost(struct prof_dev *dev, struct timeline_
             u64 recent_time = ctx->recent_time;
             // Ensure that the output of multi_trace_call_remaining() is also correct.
             ctx->recent_time = lost->start_time;
-            multi_trace_print_lost(dev, NULL, tl_event->ins);
+            {
+                int lost_cpu, lost_tid;
+
+                lost_cpu = prof_binding_cpu(tl_event->binding);
+                lost_tid = prof_binding_tid(tl_event->binding);
+                multi_trace_print_lost(dev, NULL, lost_cpu, lost_tid);
+            }
             // delete A
-            lost_reclaim(dev, tl_event->ins);
+            lost_reclaim(dev, tl_event->binding);
             ctx->recent_time = recent_time;
             lost->reclaim = true;
         }
@@ -1596,7 +1633,7 @@ static inline void multi_trace_event_lost(struct prof_dev *dev, struct timeline_
     }
 }
 
-static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
@@ -1621,8 +1658,46 @@ static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
-static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, int instance)
+/*
+ * profiler rundelay: in dynamic_threads mode the kernel filter carries no
+ * pid list (SET_FILTER cannot be replaced on an enabled tracepoint), so
+ * match the growing thread_map here, like task_state_tracked() does.
+ * pid <= 0 (swapper and friends) is dropped, as the kernel `pid' filter
+ * does in the static mode.
+ */
+static bool rundelay_untracked(struct multi_trace_ctx *ctx, u64 key)
 {
+    pid_t pid = (int)key;
+
+    if (!ctx->thread_map)
+        return false;
+    if (pid <= 0)
+        return true;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return false;
+    return true;
+}
+
+static int multi_trace_del_thread(struct prof_dev *dev, pid_t tid)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    struct rb_node *rb, *next;
+
+    for (rb = rb_first_cached(&ctx->backup.entries); rb; rb = next) {
+        struct timeline_node *node = rb_entry(rb, struct timeline_node, key_node);
+        next = rb_next(rb);
+        if (prof_binding_tid(node->binding) == tid) {
+            multi_trace_call_remaining(dev, node, REMAINING_EXIT);
+            rblist__remove_node(&ctx->backup, rb);
+        }
+    }
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    u64 binding = prof_binding_key(cpu, tid);
     struct env *env = dev->env;
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
@@ -1635,6 +1710,9 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     int i, j;
     bool need_find_prev, need_backup, need_remove_from_backup;
     u64 key;
+
+    if (!multi_trace_binding(ctx, binding))
+        return;
 
     if (hdr->time > ctx->recent_time)
         ctx->recent_time = hdr->time;
@@ -1659,7 +1737,7 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     }
 
     if (evsel == ctx->extra_evsel) {
-        ctx->extra_sample(dev, event, instance);
+        ctx->extra_sample(dev, event, cpu, tid);
     }
 
 not_found:
@@ -1723,7 +1801,19 @@ found:
     if (tp->key_prog) {
         key = tp_get_key(tp, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
     } else
-        key = ctx->oncpu ? prof_dev_ins_cpu(dev, instance) : prof_dev_ins_thread(dev, instance);
+        key = binding;
+
+    /*
+     * profiler rundelay: in dynamic_threads mode, drop events whose key pid
+     * is neither in the growing thread_map nor recently deleted. The filter
+     * runs after sched_event() above, so the unnecessary-wakeup detection
+     * still sees the full system state. Events without a key (untraced and
+     * other auxiliary events) are never filtered: the kernel pid filter of
+     * the static mode does not filter them either.
+     */
+    if (ctx->dynamic_threads && tp->key_prog &&
+        rundelay_untracked(ctx, key))
+        goto not_found;
 
     current.time = hdr->time;
     current.key = key;
@@ -1733,7 +1823,7 @@ found:
     current.need_find_prev = need_find_prev;
     current.need_backup = need_backup;
     current.need_remove_from_backup = need_remove_from_backup;
-    current.ins = instance;
+    current.binding = binding;
     current.seq = ctx->event_handled++;
     current.event = event;
 
@@ -2008,6 +2098,7 @@ static profiler multi_trace = {
     .filter = multi_trace_filter,
     .enabled = multi_trace_enabled,
     .deinit = multi_trace_exit,
+    .del_thread = multi_trace_del_thread,
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
     .print_dev = multi_trace_print_dev,
@@ -2082,6 +2173,7 @@ static profiler kmemprof = {
     .filter = multi_trace_filter,
     .enabled = multi_trace_enabled,
     .deinit = multi_trace_exit,
+    .del_thread = multi_trace_del_thread,
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
     .print_dev = multi_trace_print_dev,
@@ -2094,7 +2186,7 @@ static profiler kmemprof = {
 PROFILER_REGISTER(kmemprof);
 
 
-static void syscalls_extra_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void syscalls_extra_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct multi_trace_type_raw *raw = (void *)event->sample.array;
     struct sched_process_free *proc_free = (void *)raw->raw.data;
@@ -2130,7 +2222,7 @@ static int syscalls_init(struct prof_dev *dev)
 
     if (env->key)
         free(env->key);
-    if (prof_dev_ins_oncpu(dev)) {
+    if (prof_dev_oncpu(dev)) {
         env->key = strdup("common_pid");
         env->order = 1;
     } else
@@ -2209,6 +2301,7 @@ static profiler syscalls = {
     .filter = multi_trace_filter,
     .enabled = multi_trace_enabled,
     .deinit = multi_trace_exit,
+    .del_thread = multi_trace_del_thread,
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
     .print_dev = multi_trace_print_dev,
@@ -2390,6 +2483,7 @@ static profiler nested_trace = {
     .filter = multi_trace_filter,
     .enabled = multi_trace_enabled,
     .deinit = nested_trace_exit,
+    .del_thread = multi_trace_del_thread,
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
     .print_dev = multi_trace_print_dev,
@@ -2402,14 +2496,92 @@ static profiler nested_trace = {
 PROFILER_REGISTER(nested_trace);
 
 
+static int rundelay_threads_cow(struct multi_trace_ctx *ctx)
+{
+    struct perf_thread_map *priv;
+
+    if (refcount_read(&ctx->thread_map->refcnt) == 1)
+        return 0;
+    priv = perf_thread_map__dup(ctx->thread_map);
+    if (!priv)
+        return -1;
+    perf_thread_map__put(ctx->thread_map);
+    ctx->thread_map = priv;
+    return 0;
+}
+
+static int rundelay_add_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    struct perf_thread_map *threads;
+    int i, nr;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
+        return 0;
+    if (rundelay_threads_cow(ctx) < 0)
+        return -1;
+
+    threads = ctx->thread_map;
+    for (i = 0; i < threads->nr; i++) {
+        if (threads->map[i].pid == PERF_THREAD_MAP_HOLE)
+            break;
+    }
+    if (i == threads->nr) {
+        nr = threads->nr + 1;
+        threads = perf_thread_map__realloc(threads, nr);
+        if (!threads)
+            return -1;
+        threads->nr = nr;
+        ctx->thread_map = threads;
+        threads->map[i].pid = PERF_THREAD_MAP_HOLE;
+    }
+    threads->map[i].pid = pid;
+    threads->map[i].cgroup = 0;
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: add thread %d\n", pid);
+    }
+    return 0;
+}
+
+static int rundelay_del_thread(struct prof_dev *dev, pid_t pid)
+{
+    struct multi_trace_ctx *ctx = dev->private;
+    int i;
+
+    if (!ctx->thread_map || pid < 0)
+        return 0;
+    i = perf_thread_map__idx(ctx->thread_map, pid);
+    if (i < 0)
+        return 0;
+    if (rundelay_threads_cow(ctx) < 0)
+        return -1;
+
+    reclaim(dev, pid, REMAINING_EXIT);
+    free(ctx->thread_map->map[i].comm);
+    ctx->thread_map->map[i].comm = NULL;
+    ctx->thread_map->map[i].cgroup = 0;
+    ctx->thread_map->map[i].pid = PERF_THREAD_MAP_HOLE;
+
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: del thread %d\n", pid);
+    }
+    return 0;
+}
+
 static int rundelay_init(struct prof_dev *dev)
 {
+    struct env *env = dev->env;
     struct multi_trace_ctx *ctx = zalloc(sizeof(*ctx));
     if (!ctx)
         return -1;
     dev->private = ctx;
 
-    if (!prof_dev_ins_oncpu(dev)) {
+    if (!prof_dev_oncpu(dev)) {
         /**
          * sched:sched_switch and sched:sched_wakeup are not suitable for binding to threads
         **/
@@ -2417,8 +2589,30 @@ static int rundelay_init(struct prof_dev *dev)
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
         dev->threads = perf_thread_map__new_dummy();
+        /*
+         * SET_FILTER cannot be replaced on an enabled tracepoint here
+         * (EEXIST). With ptrace the pid set changes, so match in
+         * sample() instead of pinning a kernel pid filter.
+         * With --filter the filter matches comm only, so new threads
+         * of the same comm are let through by the kernel anyway.
+         */
+        if (!env->filter && (env->using_ptrace || env->workload.pid > 0 ||
+                             (dev->links.parent &&
+                              dev->links.parent->env->using_ptrace)))
+            ctx->dynamic_threads = true;
     }
     ctx->comm = 1;
+
+    /*
+     * The device has been converted to cpu bound, so prof_dev_open() will
+     * not ptrace_attach() automatically. Do it here, like task-state does.
+     * With --filter the filter matches comm only, so there is no need to
+     * track the newly created threads.
+     */
+    if (ctx->thread_map && !env->filter && (env->workload.pid > 0 ||
+                                            env->using_ptrace)) {
+        ptrace_attach(ctx->thread_map, dev);
+    }
 
     return multi_trace_init(dev);
 }
@@ -2446,7 +2640,8 @@ static int rundelay_filter(struct prof_dev *dev)
                     if (i == 0) {
                         if (tp_set_key(tp, "pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->thread_map, "pid", env->filter, "comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "pid", env->filter, "comm");
                     }
                 } else if (tp->id == sched_switch) {
                     if (i == 0) {
@@ -2461,7 +2656,8 @@ static int rundelay_filter(struct prof_dev *dev)
                         else
                             len = snprintf(buff, sizeof(buff), "prev_state==0");
 
-                        tp_filter = tp_filter_new(ctx->thread_map, "prev_pid", env->filter, "prev_comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "prev_pid", env->filter, "prev_comm");
                         if (tp_filter) {
                             snprintf(buff+len, sizeof(buff)-len, " && (%s)", tp_filter->filter);
                             filter = buff;
@@ -2473,7 +2669,8 @@ static int rundelay_filter(struct prof_dev *dev)
                     if (i == 1) {
                         if (tp_set_key(tp, "next_pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->thread_map, "next_pid", env->filter, "next_comm");
+                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
+                                                  "next_pid", env->filter, "next_comm");
                     }
                 }
 
@@ -2554,7 +2751,8 @@ static const char *rundelay_desc[] = PROFILER_DESC("rundelay",
 static const char *rundelay_argv[] = PROFILER_ARGV("rundelay",
     PROFILER_ARGV_OPTION,
     PROFILER_ARGV_CALLCHAIN_FILTER,
-    PROFILER_ARGV_PROFILER, "event", "than", "detail", "perins", "heatmap", "filter\nFilter process comm");
+    PROFILER_ARGV_PROFILER, "event", "than", "detail", "perins", "heatmap", "filter\nFilter process comm",
+    "ptrace");
 static profiler rundelay = {
     .name = "rundelay",
     .desc = rundelay_desc,
@@ -2575,6 +2773,7 @@ static profiler rundelay = {
     .lost = multi_trace_lost,
     .ftrace_filter = multi_trace_ftrace_filter,
     .sample = multi_trace_sample,
+    .add_thread = rundelay_add_thread,
+    .del_thread = rundelay_del_thread,
 };
 PROFILER_REGISTER(rundelay);
-

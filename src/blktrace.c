@@ -45,7 +45,6 @@ struct block_iostat {
 
 struct block_lost_node {
     struct list_head lost_link;
-    int ins;
     bool reclaim;
     u64 start_time;
     u64 end_time;
@@ -373,20 +372,19 @@ static void blktrace_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void blktrace_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void blktrace_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
     struct blktrace_ctx *ctx = dev->private;
     struct block_lost_node *pos;
     struct block_lost_node *lost;
 
-    print_lost_fn(dev, event, ins);
+    print_lost_fn(dev, event, cpu, tid);
 
     // Order is enabled by default.
     // When order is enabled, event loss will be sensed in advance, but it
     // needs to be processed later.
     lost = malloc(sizeof(*lost));
     if (lost) {
-        lost->ins = ins;
         lost->reclaim = false;
         lost->start_time = lost_start;
         lost->end_time = lost_end;
@@ -443,7 +441,7 @@ if (common_type == ctx->stats[i].type) { \
     r.nr_sector = data->raw.trace.nr_sector; \
 }
 
-static void blktrace_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void blktrace_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct env *env = dev->env;
     struct blktrace_ctx *ctx = dev->private;
@@ -562,4 +560,3 @@ static profiler blktrace = {
     .sample = blktrace_sample,
 };
 PROFILER_REGISTER(blktrace)
-

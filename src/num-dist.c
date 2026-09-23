@@ -12,7 +12,6 @@
 #include <latency_helpers.h>
 
 struct num_dist_ctx {
-    int nr_ins;
     int nr_points;
     struct tp_list *tp_list;
     struct latency_dist *dist;
@@ -73,7 +72,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     else
         tep__ref_light();
 
-    ctx->nr_ins = prof_dev_nr_ins(dev);
 
     ctx->tp_list = tp_list_new(dev, env->event);
     if (!ctx->tp_list)
@@ -199,7 +197,7 @@ static void print_num_node(void *opaque, struct latency_node *node)
     struct prof_dev *dev = opaque;
     struct env *env = dev->env;
     struct num_dist_ctx *ctx = dev->private;
-    int oncpu = prof_dev_ins_oncpu(dev);
+    int oncpu = prof_dev_oncpu(dev);
     struct tp *tp = &ctx->tp_list->tp[node->key];
     double p99 = tdigest_quantile(node->td, 0.99);
     int i;
@@ -224,9 +222,9 @@ static void print_num_node(void *opaque, struct latency_node *node)
 
     if (env->perins) {
         if (oncpu)
-            printf("[%03d] ", prof_dev_ins_cpu(dev, node->instance));
+            printf("[%03d] ", prof_binding_cpu(node->instance));
         else
-            printf("%-8d ", prof_dev_ins_thread(dev, node->instance));
+            printf("%-8d ", prof_binding_tid(node->instance));
     }
     printf("%*s", ctx->max_len, tp->alias ?: tp->name);
     printf(" %8lu %16lu %12lu %12lu %12lu %12lu\n",
@@ -271,7 +269,7 @@ static void __print_callchain(struct num_dist_ctx *ctx, union perf_event *event,
     print_callchain_data(ctx->cc, &cd);
 }
 
-static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct num_dist_ctx *ctx = dev->private;
     struct sample_type_header *hdr = (void *)event->sample.array;
@@ -287,8 +285,10 @@ static long num_dist_ftrace_filter(struct prof_dev *dev, union perf_event *event
     return tp_prog_run(tp, tp->ftrace_filter, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
 }
 
-static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    u64 binding = prof_binding_key(cpu, tid);
+
     struct num_dist_ctx *ctx = dev->private;
     struct env *env = dev->env;
     struct sample_type_header *hdr = (void *)event->sample.array;
@@ -305,7 +305,7 @@ static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int i
 
     __raw_size(event, &raw, &size, tp->stack || env->callchain);
     delta = tp_get_num(tp, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
-    latency_dist_input(ctx->dist, env->perins?instance:0, tp->idx, delta, env->greater_than);
+    latency_dist_input(ctx->dist, env->perins?binding:0, tp->idx, delta, env->greater_than);
 
     if (env->heatmap)
         heatmap_write(ctx->heatmaps[tp->idx], hdr->time, delta);
@@ -384,5 +384,3 @@ static profiler num_dist = {
     .sample = num_dist_sample,
 };
 PROFILER_REGISTER(num_dist)
-
-

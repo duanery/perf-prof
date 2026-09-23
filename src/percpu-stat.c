@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <linux/rblist.h>
 #include "monitor.h"
 #include "trace_helpers.h"
@@ -9,6 +10,10 @@ struct swevent_stat {
     uint64_t count;
     uint64_t diff;
 };
+struct swevent_binding {
+    struct prof_binding binding;
+    struct swevent_stat stat;
+};
 struct evsel_node {
     struct rb_node rbnode;
     struct evsel_node *next;
@@ -16,12 +21,12 @@ struct evsel_node {
     const char *name;
     int name_len;
     bool cpu_idle;
-    struct swevent_stat *perins_stats;
-    struct swevent_stat *total_stats;
+    struct prof_bindings bindings;
+    struct swevent_stat total_stats;
 };
 
 struct percpu_stat_ctx {
-    int nr_ins;
+    struct prof_bindings bindings;
     struct evsel_node *first;
     struct evsel_node **p_next;
     struct rblist evsel_list;
@@ -52,12 +57,8 @@ static struct rb_node *evsel_node_new(struct rblist *rlist, const void *new_entr
         e->name = n->name;
         e->name_len = (int)strlen(e->name);
         e->cpu_idle = n->cpu_idle;
-        e->perins_stats = calloc(ctx->nr_ins + 1, sizeof(*e->perins_stats));
-        if (!e->perins_stats) {
-            free(e);
-            return NULL;
-        }
-        e->total_stats = e->perins_stats + ctx->nr_ins;
+        e->bindings = (struct prof_bindings) { .size = sizeof(struct swevent_binding) };
+        e->total_stats = (struct swevent_stat) {};
         *ctx->p_next = e;
         ctx->p_next = &e->next;
         RB_CLEAR_NODE(&e->rbnode);
@@ -69,7 +70,7 @@ static struct rb_node *evsel_node_new(struct rblist *rlist, const void *new_entr
 static void evsel_node_delete(struct rblist *rblist, struct rb_node *rb_node)
 {
     struct evsel_node *e = container_of(rb_node, struct evsel_node, rbnode);
-    free(e->perins_stats);
+    prof_bindings_exit(&e->bindings);
     free(e);
 }
 
@@ -80,7 +81,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
         return -1;
     dev->private = ctx;
 
-    ctx->nr_ins = prof_dev_nr_ins(dev);
+    ctx->bindings.size = sizeof(struct prof_binding);
 
     ctx->first = NULL;
     ctx->p_next = &ctx->first;
@@ -97,6 +98,7 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     rblist__exit(&ctx->evsel_list);
+    prof_bindings_exit(&ctx->bindings);
     free(ctx);
 }
 
@@ -220,26 +222,43 @@ static void percpu_stat_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static int percpu_stat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int percpu_stat_del_thread(struct prof_dev *dev, pid_t tid)
+{
+    struct percpu_stat_ctx *ctx = dev->private;
+    struct evsel_node *e;
+
+    for (e = ctx->first; e; e = e->next)
+        prof_bindings_remove_thread(&e->bindings, tid);
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static int percpu_stat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     struct evsel_node n = {.evsel = evsel};
     struct rb_node *rbn = rblist__find(&ctx->evsel_list, &n);
     struct evsel_node *e = rbn ? container_of(rbn, struct evsel_node, rbnode) : NULL;
+    struct swevent_binding *state;
 
     if (e == NULL)
         return 0;
+    if (!prof_binding_get(&ctx->bindings, cpu, tid))
+        return 0;
+    state = prof_binding_get(&e->bindings, cpu, tid);
+    if (!state)
+        return 0;
 
-    e->perins_stats[instance].diff = 0;
-    if (count->val > e->perins_stats[instance].count) {
-        e->perins_stats[instance].diff = count->val - e->perins_stats[instance].count;
-        e->perins_stats[instance].count = count->val;
+    state->stat.diff = 0;
+    if (count->val > state->stat.count) {
+        state->stat.diff = count->val - state->stat.count;
+        state->stat.count = count->val;
         if (e->cpu_idle) {
             //cpu_idle, contains enter and exit, must be divided by 2
-            e->perins_stats[instance].diff /= 2;
+            state->stat.diff /= 2;
         }
     }
-    e->total_stats->diff += e->perins_stats[instance].diff;
+    e->total_stats.diff += state->stat.diff;
     return 0;
 }
 
@@ -247,7 +266,7 @@ static void percpu_stat_interval(struct prof_dev *dev)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     struct evsel_node *next = ctx->first;
-    int ins;
+    struct prof_binding *binding;
 
     print_time(stdout);
     printf("\n[CPU] ");
@@ -257,11 +276,12 @@ static void percpu_stat_interval(struct prof_dev *dev)
     }
 
     if (dev->env->perins)
-    for (ins = 0; ins < ctx->nr_ins; ins ++) {
-        printf("\n[%03d] ", prof_dev_ins_cpu(dev, ins));
+    prof_bindings_for_each(&ctx->bindings, binding) {
+        printf("\n[%03d] ", binding->cpu >= 0 ? binding->cpu : binding->tid);
         next = ctx->first;
         while (next) {
-            printf("%*lu ", next->name_len, next->perins_stats[ins].diff);
+            struct swevent_binding *state = prof_binding_find(&next->bindings, binding->cpu, binding->tid);
+            printf("%*lu ", next->name_len, state ? state->stat.diff : 0);
             next = next->next;
         }
     }
@@ -269,14 +289,14 @@ static void percpu_stat_interval(struct prof_dev *dev)
     printf("\n[ALL] ");
     next = ctx->first;
     while (next) {
-        printf("%*lu ", next->name_len, next->total_stats->diff);
-        next->total_stats->diff = 0;
+        printf("%*lu ", next->name_len, next->total_stats.diff);
+        next->total_stats.diff = 0;
         next = next->next;
     }
     printf("\n");
 }
 
-static void percpu_stat_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void percpu_stat_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
 }
 
@@ -308,9 +328,9 @@ static profiler percpu_stat = {
     .pages = 0,
     .init = percpu_stat_init,
     .deinit = percpu_stat_exit,
+    .del_thread = percpu_stat_del_thread,
     .interval = percpu_stat_interval,
     .read   = percpu_stat_read,
     .sample = percpu_stat_sample,
 };
 PROFILER_REGISTER(percpu_stat);
-

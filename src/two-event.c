@@ -569,7 +569,9 @@ static void delay_print_node(void *opaque, struct latency_node *node)
         if (ret > 0) {
             if (opts->keylen+1 > ret)
                 printf("%-*s ", opts->keylen - ret, "");
-        } else printf("%-*lu ", opts->keylen, node->instance);
+        } else if (opts->binding_key)
+            printf("%-*d ", opts->keylen, prof_binding_id(node->instance));
+        else printf("%-*lu ", opts->keylen, node->instance);
 
         // if (comm) node->instance means pid.
         if (opts->comm && delay_class->global_comm)
@@ -1863,4 +1865,3 @@ void two_event_class_print(struct two_event_class *class, int indent)
         }
     }
 }
-

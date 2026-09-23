@@ -438,7 +438,7 @@ static void sql_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static long sql_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long sql_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct sql_ctx *ctx = dev->private;
     struct sql_sample_type *data = (void *)event->sample.array;
@@ -482,7 +482,7 @@ static void ensure_transaction(struct sql_ctx *ctx)
     }
 }
 
-static void sql_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void sql_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct sql_ctx *ctx = dev->private;
     struct sql_sample_type *data = (void *)event->sample.array;

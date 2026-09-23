@@ -1691,7 +1691,7 @@ struct sample_type_header {
     } raw;
 };
 
-static long expr_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long expr_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct expression_info *info = dev->private;
     struct sample_type_header *raw = (void *)event->sample.array;
@@ -1699,7 +1699,7 @@ static long expr_ftrace_filter(struct prof_dev *dev, union perf_event *event, in
     return tp_list_ftrace_filter(dev, info->tp_list, glo);
 }
 
-static void expr_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void expr_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct expression_info *info = dev->private;
     struct sample_type_header *raw = (void *)event->sample.array;
