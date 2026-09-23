@@ -48,6 +48,7 @@ struct pid_link_dev {
 };
 
 static void put_pid(struct pid_node *p, int pid);
+static void del_thread_tree(struct prof_dev *dev, pid_t pid);
 
 static int __ptrace_link(struct pid_node *node, struct prof_dev *dev)
 {
@@ -72,20 +73,36 @@ static int __ptrace_link(struct pid_node *node, struct prof_dev *dev)
 
 static void __ptrace_unlink_free(struct pid_link_dev *link)
 {
+    struct prof_dev *dev;
+    pid_t pid;
+
+    if (!link)
+        return;
+    dev = link->dev;
+    pid = link->pid ? link->pid->pid : -1;
+
     list_del(&link->link_to_pid);
     list_del(&link->link_to_dev);
-    prof_dev_unuse(link->dev);
     free(link);
+
+    /*
+     * Drain this thread before dropping the ptrace use. unuse() of the
+     * last link closes the device; del_thread must run while the evlist
+     * is still alive. Skip when already closing: close -> detach walks
+     * this list and must not re-enter del_thread.
+     */
+    if (dev && dev->evlist && pid >= 0 && !dev->inclose)
+        del_thread_tree(dev, pid);
+    prof_dev_unuse(dev);
 }
 
 static void __ptrace_unlink(struct pid_node *node)
 {
     struct pid_link_dev *link;
 
-restart:
-    list_for_each_entry(link, &node->dev_list, link_to_pid) {
+    while (!list_empty(&node->dev_list)) {
+        link = list_first_entry(&node->dev_list, struct pid_link_dev, link_to_pid);
         __ptrace_unlink_free(link);
-        goto restart;
     }
 }
 
@@ -237,7 +254,7 @@ int ptrace_attach(struct perf_thread_map *thread_map, struct prof_dev *dev)
 
 void ptrace_detach(struct prof_dev *dev)
 {
-    struct pid_link_dev *link, *n;
+    struct pid_link_dev *link;
     struct pid_node *node, *initial;
     struct prof_dev *child, *tmp;
 
@@ -252,11 +269,12 @@ void ptrace_detach(struct prof_dev *dev)
 
     prof_dev_get(dev);
 
-    list_for_each_entry_safe(link, n, &dev->ptrace_list, link_to_dev) {
+    while (!list_empty(&dev->ptrace_list)) {
+        link = list_first_entry(&dev->ptrace_list, struct pid_link_dev, link_to_dev);
         node = link->pid;
         __ptrace_unlink_free(link);
 
-        if (!list_empty(&node->dev_list))
+        if (!node || !list_empty(&node->dev_list))
             continue;
 
         if (!node->detach) {
@@ -357,6 +375,37 @@ static int __detach(struct pid_node *node)
     return SKIP_CONT;
 }
 
+static int add_thread_tree(struct prof_dev *dev, pid_t pid)
+{
+    struct prof_dev *child, *tmp;
+    int err = 0;
+
+    if (dev->inclose)
+        return 0;
+    err = prof_dev_add_thread(dev, pid);
+    if (err)
+        return err;
+    if (dev->prof->add_thread && (err = dev->prof->add_thread(dev, pid)) < 0)
+        return err;
+    for_each_child_dev_get(child, tmp, dev) {
+        int child_err = add_thread_tree(child, pid);
+        if (child_err)
+            err = child_err;
+    }
+    if (err)
+        del_thread_tree(dev, pid);
+    return err;
+}
+
+static void del_thread_tree(struct prof_dev *dev, pid_t pid)
+{
+    struct prof_dev *child, *tmp;
+
+    for_each_child_dev_get(child, tmp, dev)
+        del_thread_tree(child, pid);
+    prof_dev_del_thread(dev, pid);
+}
+
 static int __fork__new(struct pid_node *child)
 {
     struct pid_node *parent = child->parent;
@@ -367,18 +416,13 @@ static int __fork__new(struct pid_node *child)
         return __detach(child);
 
     if (parent) {
-        struct prof_dev *dev;
-        struct perf_thread_map *map;
         struct pid_link_dev *link;
 
-        map = thread_map__new_by_tid(child->pid);
-        if (map) {
-            list_for_each_entry(link, &parent->dev_list, link_to_pid) {
-                dev = prof_dev_clone(link->dev, NULL, map);
-                if (!__ptrace_link(child, dev) && dev)
-                    prof_dev_close(dev);
-            }
-            perf_thread_map__put(map);
+        list_for_each_entry(link, &parent->dev_list, link_to_pid) {
+            if (add_thread_tree(link->dev, child->pid) < 0)
+                continue;
+            if (!__ptrace_link(child, link->dev))
+                del_thread_tree(link->dev, child->pid);
         }
         put_pid(parent, 0);
         child->parent = NULL;
@@ -603,4 +647,3 @@ int ptrace_stop(int pid, int status)
     }
     return 0;
 }
-

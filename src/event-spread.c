@@ -184,7 +184,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
         if (sample_type & PERF_SAMPLE_PERIOD)
             pos += sizeof(u64);
         if (sample_type & PERF_SAMPLE_READ)
-            pos += perf_evsel__read_size(tp->evsel);
+            pos += perf_sample_read_size(tp->evsel, data + pos);
         block->common_type_pos = pos;
     }
 
@@ -193,7 +193,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
 
         if (!tp->vcpu) {
             if (oncpu)
-                cpuidx = perf_cpu_map__idx(tp->dev->cpus, cpu);
+                cpuidx = perf_cpu_map__idx(perf_evsel__cpus(tp->evsel), cpu);
         } else {
             if (oncpu)
                 cpuidx = perf_cpu_map__idx(tp->dev->cpus, tp->vcpu->vcpu[cpu].host_cpu);
@@ -219,7 +219,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
         tid = *(u32 *)(data + block->pid_pos + sizeof(u32));
         if (!tp->vcpu) {
             if (!oncpu)
-                threadidx = perf_thread_map__idx(tp->dev->threads, tid);
+                threadidx = perf_thread_map__idx(perf_evsel__threads(tp->evsel), tid);
         }
     }
 
@@ -260,7 +260,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
         static int once = 0;
         if (once == 0) {
             once = 1;
-            printf("The partial events pulled by %s:%s//pull=\"%s\"/ cannot be switched to instances of '%s'.\n",
+            printf("The partial events pulled by %s:%s//pull=\"%s\"/ cannot be switched to the cpus/threads of '%s'.\n",
                     tp->sys, tp->name, block->block_def, tp->dev->prof->name);
         }
     }
@@ -271,6 +271,7 @@ static int block_event_convert(struct event_block *block, union perf_event *even
 static int block_process_event(struct event_block *block, union perf_event *event)
 {
     struct tp *tp = block->eb_list->tp;
+    int cpu, tid;
     int ins = 0;
 
     switch (event->header.type) {
@@ -325,7 +326,9 @@ static int block_process_event(struct event_block *block, union perf_event *even
             break;
     }
 
-    perf_event_process_record(tp->dev, event, ins, true, true);
+    cpu = block->eb_list->ins_oncpu ? perf_cpu_map__cpu(perf_evsel__cpus(tp->evsel), ins) : -1;
+    tid = block->eb_list->ins_oncpu ? -1 : perf_thread_map__pid(perf_evsel__threads(tp->evsel), ins);
+    perf_event_process_record(tp->dev, event, cpu, tid, true, true);
     return 0;
 }
 
@@ -336,11 +339,11 @@ static __always_inline char *event_buf_alloc(void)
 
 static union perf_event *block_read_event(void *stream, bool init,
                 int (*read_init)(struct event_block *block, void *buf, size_t len),
-                int *ins, bool *writable, bool *converted)
+                int *cpu, int *tid, bool *writable, bool *converted)
 {
     struct event_block *block = stream;
     union perf_event *event = (void *)block->event;
-    int ret;
+    int ret, index;
 
 tcp_retry:
     // consume
@@ -382,11 +385,16 @@ tcp_retry:
 
         // converted
         if (event->header.type == PERF_RECORD_SAMPLE) {
-            *ins = block_event_convert(block, event);
-            if (*ins < 0)
+            index = block_event_convert(block, event);
+            if (index < 0)
                 goto tcp_retry;
         } else
-            *ins = 0;
+            index = 0;
+
+        *cpu = block->eb_list->ins_oncpu ?
+            perf_cpu_map__cpu(perf_evsel__cpus(block->eb_list->tp->evsel), index) : -1;
+        *tid = block->eb_list->ins_oncpu ? -1 :
+            perf_thread_map__pid(perf_evsel__threads(block->eb_list->tp->evsel), index);
 
         *writable = 1;
         *converted = 1;
@@ -401,9 +409,9 @@ static int tcp_read_init(struct event_block *block, void *buf, size_t len)
     return tcp_recv(block->u.tcp.tcp, buf, len, 0);
 }
 
-static union perf_event *tcp_read_event(void *stream, bool init, int *ins, bool *writable, bool *converted)
+static union perf_event *tcp_read_event(void *stream, bool init, int *cpu, int *tid, bool *writable, bool *converted)
 {
-    return block_read_event(stream, init, tcp_read_init, ins, writable, converted);
+    return block_read_event(stream, init, tcp_read_init, cpu, tid, writable, converted);
 }
 
 static void tcp_notify(struct tcp_socket_ops *ops)
@@ -513,9 +521,9 @@ static int cdev_read_init(struct event_block *block, void *buf, size_t len)
     return ret;
 }
 
-static union perf_event *cdev_read_event(void *stream, bool init, int *ins, bool *writable, bool *converted)
+static union perf_event *cdev_read_event(void *stream, bool init, int *cpu, int *tid, bool *writable, bool *converted)
 {
-    return block_read_event(stream, init, cdev_read_init, ins, writable, converted);
+    return block_read_event(stream, init, cdev_read_init, cpu, tid, writable, converted);
 }
 
 static int cdev_write_header(struct event_block *block)
@@ -921,7 +929,7 @@ static int block_list_new(struct tp *tp, char *s, bool broadcast)
         eb_list->time_pos = -1;
         eb_list->broadcast = broadcast;
         eb_list->freeing = 0;
-        eb_list->ins_oncpu = prof_dev_ins_oncpu(tp->dev);
+        eb_list->ins_oncpu = prof_dev_oncpu(tp->dev);
 
         if (broadcast) tp->broadcast = eb_list;
         else tp->receive = eb_list;
@@ -1054,7 +1062,7 @@ failed:
     return -1;
 }
 
-static void perf_clock_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void perf_clock_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct prof_dev *main_dev;
     struct event_block_list *eb_list;
@@ -1109,4 +1117,3 @@ static profiler perf_clock = {
     .deinit = perf_clock_deinit,
     .sample = perf_clock_sample,
 };
-

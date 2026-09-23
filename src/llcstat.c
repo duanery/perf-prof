@@ -63,7 +63,7 @@ static int llcstat_init(struct prof_dev *dev)
     if (get_cpuinfo(&ctx->cpuinfo) < 0)
         goto failed;
 
-    if (!prof_dev_ins_oncpu(dev)) {
+    if (!prof_dev_oncpu(dev)) {
         fprintf(stderr, "can only be bound to CPU\n");
         goto failed;
     }
@@ -199,8 +199,9 @@ static void llcstat_exit(struct prof_dev *dev)
     free(ctx);
 }
 
-static int llcstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int llcstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
+    int cpu_index = perf_cpu_map__idx(dev->cpus, cpu);
     struct llcstat_ctx *ctx = dev->private;
     struct perf_counts {
         u64 nr;
@@ -215,13 +216,13 @@ static int llcstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct p
     int i;
 
     #define UPDATE_COUNTER(c) \
-    if (c > cache[instance].counter) { \
-        cache[instance].incremental = c - cache[instance].counter; \
-        cache[instance].counter = c; \
+    if (c > cache[cpu_index].counter) { \
+        cache[cpu_index].incremental = c - cache[cpu_index].counter; \
+        cache[cpu_index].counter = c; \
     } else \
-        cache[instance].incremental = 0;
+        cache[cpu_index].incremental = 0;
 
-    if (evsel != ctx->leader)
+    if (cpu_index < 0 || evsel != ctx->leader)
         return 0;
 
     cache = ctx->total_time_enabled;
@@ -266,11 +267,12 @@ static void llcstat_interval(struct prof_dev *dev)
     for (ins = 0; ins < ctx->nr_ins; ins ++) {
         float hit = 0.0;
         float run = 0.0;
+
         if (ctx->l3_cache_references[ins].incremental > ctx->l3_cache_misses[ins].incremental)
             hit = (ctx->l3_cache_references[ins].incremental - ctx->l3_cache_misses[ins].incremental) * 100.0 /
                    ctx->l3_cache_references[ins].incremental;
         run = ctx->total_time_running[ins].incremental * 100.0 / ctx->total_time_enabled[ins].incremental;
-        printf("[%03d]    %9lu %9lu  %5.2f%% %6.2f%%  ", prof_dev_ins_cpu(dev, ins),
+        printf("[%03d]    %9lu %9lu  %5.2f%% %6.2f%%  ", perf_cpu_map__cpu(dev->cpus, ins),
                 ctx->l3_cache_references[ins].incremental, ctx->l3_cache_misses[ins].incremental,
                 hit, run);
         if (ctx->cpuinfo.vendor == X86_VENDOR_AMD) {
@@ -309,4 +311,3 @@ static profiler llcstat = {
     .read = llcstat_read,
 };
 PROFILER_REGISTER(llcstat)
-

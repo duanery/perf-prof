@@ -173,7 +173,9 @@ struct perf_record_dev {
     u32 pid, tid;
     u64 time;
     u64 id;
-    u32 cpu, instance;
+    u32 cpu;
+    /* Binding of the ring buffer the source device read this event from. */
+    int bind_cpu, bind_tid;
     struct prof_dev *dev;   /* source device, valid during target's lifetime */
     union perf_event *event; /* points to original or deep-copied event */
 };

@@ -517,6 +517,7 @@ static int perf_sample_pos_init(struct prof_dev *dev)
     dev->pos.time_pos = -1;
     dev->pos.id_pos = -1;
     dev->pos.cpu_pos = -1;
+    dev->pos.read_pos = -1;
     dev->pos.callchain_pos = -1;
 
     if (sample_type & PERF_SAMPLE_IDENTIFIER)
@@ -546,6 +547,7 @@ static int perf_sample_pos_init(struct prof_dev *dev)
     if (sample_type & PERF_SAMPLE_PERIOD)
         pos += sizeof(u64);
     if (sample_type & PERF_SAMPLE_READ) {
+        dev->pos.read_pos = pos;
         if (onlyone) {
             pos += perf_evsel__read_size(onlyone);
             dev->pos.callchain_pos = pos;
@@ -821,7 +823,7 @@ static void evtime_deinit(struct prof_dev *dev)
 {
 }
 
-static void evtime_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void evtime_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct prof_dev *pdev = dev->private;
     // PERF_SAMPLE_TIME
@@ -1133,6 +1135,7 @@ struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel)
         return NULL;
 
     memset(cache, 0, sizeof(*cache));
+    cache->evsel = evsel;
     cache->sample_type = sample_type;
     cache->nr_members = nr_members;
     cache->members = (struct perf_event_member *)(cache + 1);
@@ -1198,8 +1201,15 @@ do { \
     ADD_MEMBER("cpu", sizeof(u32), PERF_SAMPLE_CPU, "CPU number", cache->cpu = &members[i]; offset += 4; /* skip reserved */);
     ADD_MEMBER("period", sizeof(u64), PERF_SAMPLE_PERIOD, "Sample period");
 
-    /* PERF_SAMPLE_READ - Fixed size based on read_format */
-    ADD_MEMBER("read", perf_evsel__read_size(evsel), PERF_SAMPLE_READ, "Read format values");
+    /*
+     * PERF_FORMAT_GROUP only serializes the members actually attached to this
+     * binding, so group READ fields are variable-sized while non-group READ
+     * fields remain fixed-sized.
+     */
+    if (attr->read_format & PERF_FORMAT_GROUP)
+        ADD_MEMBER("read", 0, PERF_SAMPLE_READ, "Read format values", cache->read = &members[i]);
+    else
+        ADD_MEMBER("read", perf_evsel__read_size(evsel), PERF_SAMPLE_READ, "Read format values");
 
     /* PERF_SAMPLE_CALLCHAIN - variable size */
     ADD_MEMBER("callchain", 0, PERF_SAMPLE_CALLCHAIN, "Call chain", cache->callchain = &members[i]);
@@ -1260,6 +1270,26 @@ int perf_event_member_offset(struct perf_event_member_cache *cache,
     if (!member->deps)
         return member->offset;
 
+    /* PERF_SAMPLE_READ with PERF_FORMAT_GROUP: { u64 nr; u64 values[nr]; ... } */
+    if (member->deps & PERF_SAMPLE_READ) {
+        struct perf_evsel *evsel = cache->evsel;
+        u64 read_format = evsel->attr.read_format;
+        int entry = sizeof(u64);
+        u64 nr;
+
+        if (read_format & PERF_FORMAT_ID)
+            entry += sizeof(u64);
+        if (read_format & PERF_FORMAT_LOST)
+            entry += sizeof(u64);
+
+        nr = *(u64 *)(data + cache->read->offset + deps_size);
+        deps_size += sizeof(u64) + nr * entry;
+        if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+            deps_size += sizeof(u64);
+        if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+            deps_size += sizeof(u64);
+    }
+
     /* PERF_SAMPLE_CALLCHAIN: { u64 nr; u64 ips[nr]; } */
     if (member->deps & PERF_SAMPLE_CALLCHAIN) {
         u64 nr = *(u64 *)(data + cache->callchain->offset + deps_size);
@@ -1307,6 +1337,47 @@ int perf_event_member_offset(struct perf_event_member_cache *cache,
     }
 
     return member->offset + deps_size;
+}
+
+int perf_sample_read_size(struct perf_evsel *evsel, void *data)
+{
+    struct perf_event_attr *attr = perf_evsel__attr(evsel);
+    u64 read_format = attr->read_format;
+    int entry = sizeof(u64);
+    u64 nr = 1;
+
+    if (!(read_format & PERF_FORMAT_GROUP))
+        return perf_evsel__read_size(evsel);
+
+    if (read_format & PERF_FORMAT_ID)
+        entry += sizeof(u64);
+    if (read_format & PERF_FORMAT_LOST)
+        entry += sizeof(u64);
+
+    nr = *(u64 *)data;
+    return sizeof(u64) + nr * entry +
+           ((read_format & PERF_FORMAT_TOTAL_TIME_ENABLED) ? sizeof(u64) : 0) +
+           ((read_format & PERF_FORMAT_TOTAL_TIME_RUNNING) ? sizeof(u64) : 0);
+}
+
+int perf_event_callchain_offset(struct prof_dev *dev, union perf_event *event)
+{
+    void *data = event->sample.array;
+    struct perf_evsel *evsel;
+
+    if (!(dev->pos.sample_type & PERF_SAMPLE_READ))
+        return dev->pos.callchain_pos;
+
+    if (dev->pos.id_pos >= 0) {
+        u64 id = *(u64 *)(data + dev->pos.id_pos);
+        evsel = perf_evlist__id_to_evsel(dev->evlist, id, NULL);
+    } else
+        evsel = perf_evlist__first(dev->evlist);
+
+    if (!evsel || dev->pos.read_pos < 0)
+        return -1;
+
+    return dev->pos.read_pos + perf_sample_read_size(evsel, data + dev->pos.read_pos);
 }
 
 /* Export callchain_data from a perf_event sample. */

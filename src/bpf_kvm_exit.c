@@ -96,7 +96,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
         return -1;
     dev->private = ctx;
 
-    if (prof_dev_ins_oncpu(dev))
+    if (prof_dev_oncpu(dev))
         ctx->oncpu = 1;
 
     ctx->obj = kvm_exit_bpf__open();
@@ -234,13 +234,22 @@ static int bpf_kvm_exit_init(struct prof_dev *dev)
 #endif
         bpf_program__set_autoload(ctx->obj->progs.kvm_entry_pid, 0);
     } else {
+        struct perf_cpu_map *cpus = perf_cpu_map__new(NULL);
+        struct perf_thread_map *threads = perf_thread_map__new_dummy();
+
         // can only be bound to cpu
-        ctx->thread_map = dev->threads;
+        ctx->thread_map = perf_thread_map__get(dev->threads);
         // Pre-read comms to avoid costly global_comm lookups
         thread_map__read_comms(ctx->thread_map);
-        perf_cpu_map__put(dev->cpus);
-        dev->cpus = perf_cpu_map__new(NULL);
-        dev->threads = perf_thread_map__new_dummy();
+        if (!cpus || !threads) {
+            perf_cpu_map__put(cpus);
+            perf_thread_map__put(threads);
+            goto failed;
+        }
+        perf_evsel__set_own_cpus(ctx->evsel, cpus);
+        perf_evsel__set_own_threads(ctx->evsel, threads);
+        perf_cpu_map__put(cpus);
+        perf_thread_map__put(threads);
 
         tid = perf_thread_map__pid(ctx->thread_map, 0);
         tgid = get_tgid(tid);
@@ -309,7 +318,7 @@ static int bpf_kvm_exit_filter(struct prof_dev *dev)
     int cpu, ins, perf_event_fd;
     int err;
 
-    perf_cpu_map__for_each_cpu(cpu, ins, dev->cpus) {
+    perf_cpu_map__for_each_cpu(cpu, ins, perf_evsel__cpus(ctx->evsel)) {
         perf_event_fd = *FD(ctx->evsel, ins, 0);
         err = bpf_map__update_elem(perf_events, &cpu, sizeof(cpu), &perf_event_fd, sizeof(perf_event_fd), 0);
         if (err)
@@ -420,7 +429,7 @@ static void bpf_kvm_exit_deinit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void bpf_kvm_exit_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void bpf_kvm_exit_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct kvmexit_ctx *ctx = dev->private;
     struct kvm_vcpu_event *raw = (void *)event->sample.array + sizeof(u64) + sizeof(u32)/* u32 size; */;
@@ -429,13 +438,13 @@ static void bpf_kvm_exit_print_event(struct prof_dev *dev, union perf_event *eve
     if (!(flags & OMIT_TIMESTAMP))
         prof_dev_print_time(dev, *time, stdout);
     printf("%18s %8u    [%03d] %lu.%06lu: bpf:kvm_exit: %s lat %lu%s", comm_get(dev, raw->pid),
-        raw->pid, prof_dev_ins_cpu(dev, instance), *time / NSEC_PER_SEC, (*time % NSEC_PER_SEC)/1000,
+        raw->pid, cpu, *time / NSEC_PER_SEC, (*time % NSEC_PER_SEC)/1000,
         find_exit_reason(raw->isa, raw->exit_reason), raw->exit_latency, ctx->oncpu ? " " : "\n");
     if (ctx->oncpu)
         printf("runq_delay %lu offcpu_wait %lu sw %u\n", raw->runq_delay, raw->offcpu_wait, raw->switches);
 }
 
-static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kvmexit_ctx *ctx = dev->private;
     struct env *env = dev->env;
@@ -483,7 +492,7 @@ static void bpf_kvm_exit_sample(struct prof_dev *dev, union perf_event *event, i
     if (env->greater_than &&
         (raw->exit_reason != hlt ? delta : raw->runq_delay) > env->greater_than) {
     print_event:
-        bpf_kvm_exit_print_event(dev, event, instance, 0);
+        bpf_kvm_exit_print_event(dev, event, cpu, tid, 0);
     }
 }
 

@@ -21,6 +21,7 @@ typedef enum {
 struct two_event_options {
     const char *keyname;
     int keylen;
+    bool binding_key;
     bool perins;
     bool comm;
     bool only_print_greater_than;
@@ -210,4 +211,3 @@ int event_iter_cmd(struct event_iter *iter, enum event_iter_cmd cmd);
 
 
 #endif
-

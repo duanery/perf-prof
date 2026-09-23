@@ -1,11 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "monitor.h"
 #include "trace_helpers.h"
 #include "stack_helpers.h"
 
 struct hrtimer_ctx;
-typedef int (*analyzer)(struct hrtimer_ctx *ctx, int instance, int nr_tp, u64 *counters);
+typedef int (*analyzer)(struct hrtimer_ctx *ctx, int cpu, int tid, int nr_tp, u64 *counters);
+
+struct hrtimer_binding {
+    struct prof_binding binding;
+    u64 counters[];
+};
 
 #define BREAK 0
 #define PRINT 1
@@ -17,21 +23,22 @@ struct hrtimer_ctx {
     struct callchain_ctx *cc;
     struct perf_evsel *leader;
     struct tp_list *tp_list;
-    u64 *counters;
+    struct prof_bindings bindings;
     u64 *ins_counters;
     analyzer analyzer;
     struct bpf_filter filter;
     struct prof_dev *dev;
+    int width;
 };
 
-static int __analyzer(struct hrtimer_ctx *ctx, int instance, int nr_tp, u64 *counters)
+static int __analyzer(struct hrtimer_ctx *ctx, int cpu, int tid, int nr_tp, u64 *counters)
 {
     if (expr_load_data(ctx->prog, counters, (nr_tp+1)*sizeof(*counters)) != 0)
         return BREAK;
     return (int)expr_run(ctx->prog);
 }
 
-static int __analyzer_irq_off(struct hrtimer_ctx *ctx, int instance, int nr_tp, u64 *counters)
+static int __analyzer_irq_off(struct hrtimer_ctx *ctx, int cpu, int tid, int nr_tp, u64 *counters)
 {
     if (nr_tp == 0 && counters[0] > ctx->dev->env->greater_than)
         return PRINT;
@@ -56,9 +63,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
         if (!ctx->tp_list)
             goto failed;
 
-        ctx->counters = calloc(1, prof_dev_nr_ins(dev) * (ctx->tp_list->nr_real_tp + 1) * sizeof(u64));
-        if (!ctx->counters)
-            goto failed;
+        ctx->width = ctx->tp_list->nr_real_tp + 1;
+        ctx->bindings.size = sizeof(struct hrtimer_binding) + ctx->width * sizeof(u64);
 
         ctx->ins_counters = malloc((ctx->tp_list->nr_real_tp + 1) * sizeof(u64));
         if (!ctx->ins_counters)
@@ -71,9 +77,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
 
         ctx->expression = expression;
     } else if (env->greater_than) {
-        ctx->counters = calloc(1, prof_dev_nr_ins(dev) * sizeof(u64));
-        if (!ctx->counters)
-            goto failed;
+        ctx->width = 1;
+        ctx->bindings.size = sizeof(struct hrtimer_binding) + sizeof(u64);
 
         ctx->ins_counters = malloc(sizeof(u64));
         if (!ctx->ins_counters)
@@ -104,8 +109,7 @@ static void monitor_ctx_exit(struct prof_dev *dev)
         callchain_ctx_free(ctx->cc);
     }
 
-    if (ctx->counters)
-        free(ctx->counters);
+    prof_bindings_exit(&ctx->bindings);
     if (ctx->ins_counters)
         free(ctx->ins_counters);
 
@@ -167,7 +171,7 @@ static int hrtimer_init(struct prof_dev *dev)
     struct perf_evsel *evsel;
     int i, j;
 
-    if (!prof_dev_ins_oncpu(dev))
+    if (!prof_dev_oncpu(dev))
         return -1;
     if (env->sample_period == 0 && env->freq == 0)
         return -1;
@@ -268,12 +272,12 @@ static void hrtimer_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct env *env = dev->env;
     struct hrtimer_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ | PERF_SAMPLE_CALLCHAIN
+    struct hrtimer_binding *state;
+    /* PERF_SAMPLE_TID | TIME | CPU | READ | CALLCHAIN */
     struct sample_type_data {
         struct {
             __u32    pid;
@@ -293,12 +297,20 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
         } groups;
     } *data = (void *)event->sample.array;
     int n = env->event ? ctx->tp_list->nr_real_tp : 0;
-    u64 *jcounter = ctx->counters + instance * (n + 1);
+    u64 *jcounter;
     u64 counter, cpu_clock = 0;
     u64 i, j = 0, print = BREAK;
     int verbose = env->verbose;
     int header_end = 0;
     struct tp *tp;
+
+    if (!ctx->bindings.size)
+        return;
+    state = prof_binding_get(&ctx->bindings, cpu, tid);
+    if (!state)
+        return;
+    jcounter = state->counters;
+    memset(ctx->ins_counters, 0, (n + 1) * sizeof(u64));
 
     if (verbose) {
         if (dev->print_title) prof_dev_print_time(dev, data->time, stdout);
@@ -328,10 +340,10 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
         if (ctx->tp_list) {
             tp = tp_from_evsel(evsel, ctx->tp_list);
             if (tp) {
+                j = tp->idx;
                 counter = data->groups.ctnr[i].value - jcounter[j];
                 jcounter[j] = data->groups.ctnr[i].value;
                 ctx->ins_counters[j] = counter;
-                j++;
                 if (verbose) {
                     if (!header_end) {
                         printf("\n");
@@ -343,8 +355,7 @@ static void hrtimer_sample(struct prof_dev *dev, union perf_event *event, int in
         }
     }
 
-    if (data->groups.nr == n + 1)
-        print = ctx->analyzer(ctx, instance, n, ctx->ins_counters);
+    print = ctx->analyzer(ctx, cpu, tid, n, ctx->ins_counters);
 
     if (print == PRINT || verbose) {
         if (!verbose) {
@@ -492,4 +503,3 @@ struct monitor irq_off = {
     .sample = hrtimer_sample,
 };
 MONITOR_REGISTER(irq_off);
-

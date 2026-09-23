@@ -151,7 +151,7 @@ static void print_regs_user(struct sample_regs_user *regs_user, u64 unused)
 #endif
 }
 
-static void page_faults_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void page_faults_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct page_faults_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -184,11 +184,11 @@ static void page_faults_print_event(struct prof_dev *dev, union perf_event *even
     }
 }
 
-static void page_faults_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void page_faults_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct page_faults_ctx *ctx = dev->private;
     ctx->sample = 1;
-    page_faults_print_event(dev, event, instance, 0);
+    page_faults_print_event(dev, event, cpu, tid, 0);
     ctx->sample = 0;
 }
 
