@@ -6,17 +6,25 @@
 #include <linux/string.h>
 #include <stack_helpers.h>
 
+struct event_care_binding {
+    struct prof_binding binding;
+    union perf_event *event;
+    u64 evtime;
+    unsigned long counters[];
+};
+
 struct event_care_ctx {
     struct tp_list *tp_list;
-
-    // detect out-of-order
-    struct {
-        union perf_event *event;
-        u64 evtime;
-    } *perins_info;
+    struct prof_bindings bindings;
 
     struct callchain_ctx *cc;
 };
+
+static void event_care_binding_free(void *ptr)
+{
+    struct event_care_binding *state = ptr;
+    free(state->event);
+}
 
 static int monitor_ctx_init(struct prof_dev *dev)
 {
@@ -36,9 +44,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx->tp_list)
         goto failed;
 
-    ctx->perins_info = calloc(prof_dev_nr_ins(dev), sizeof(*ctx->perins_info));
-    if (!ctx->perins_info)
-        goto free_tp_list;
+    ctx->bindings.size = sizeof(struct event_care_binding) + ctx->tp_list->nr_tp * sizeof(unsigned long);
+    ctx->bindings.destroy = event_care_binding_free;
 
     if (env->callchain) {
         ctx->cc = callchain_ctx_new(callchain_flags(dev, CALLCHAIN_KERNEL), stderr);
@@ -48,8 +55,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     dev->private = ctx;
     return 0;
 
-free_tp_list:
-    tp_list_free(ctx->tp_list);
 failed:
     tep__unref();
     free(ctx);
@@ -61,15 +66,9 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     struct event_care_ctx *ctx = dev->private;
 
     if (dev->env->callchain) {
-        int i, nr_ins = prof_dev_nr_ins(dev);
-
-        for (i = 0; i < nr_ins; i++)
-            if (ctx->perins_info[i].event)
-                free(ctx->perins_info[i].event);
-
         callchain_ctx_free(ctx->cc);
     }
-    free(ctx->perins_info);
+    prof_bindings_exit(&ctx->bindings);
     tp_list_free(ctx->tp_list);
     tep__unref();
     free(ctx);
@@ -106,10 +105,6 @@ static int event_care_init(struct prof_dev *dev)
     prof_dev_env2attr(dev, &attr);
 
     for_each_real_tp(tp_list, tp, i) {
-        tp->private = calloc(prof_dev_nr_ins(dev), sizeof(unsigned long));
-        if (!tp->private)
-            goto failed;
-
         evsel = tp_evsel_new(tp, &attr);
         if (!evsel) {
             goto failed;
@@ -192,15 +187,26 @@ found:
         print_callchain_common(ctx->cc, &hdr->callchain, 0);
 }
 
-static void event_care_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int event_care_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct event_care_ctx *ctx = dev->private;
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static void event_care_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    struct event_care_ctx *ctx = dev->private;
+    struct event_care_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct tp_list *tp_list = ctx->tp_list;
     struct sample_type_header *hdr = (void *)event->sample.array;
     struct perf_evsel *evsel;
     struct tp *tp = NULL;
     unsigned long *counters;
     int i;
+
+    if (!state)
+        return;
 
     evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
     if (!evsel) {
@@ -216,28 +222,27 @@ static void event_care_sample(struct prof_dev *dev, union perf_event *event, int
     return ;
 
 found:
-    counters = tp->private;
+    counters = &state->counters[tp->idx];
     // prof_dev_atomic_enable() will discard some events, and counters will no longer be used to detect
     // lost for the first time.
-    if (counters[instance] && hdr->counter - counters[instance] != hdr->period) {
-        fprintf(stderr, "%s:%s lost %lu events\n", tp->sys, tp->name, hdr->counter - counters[instance] - 1);
+    if (*counters && hdr->counter - *counters != hdr->period) {
+        fprintf(stderr, "%s:%s lost %lu events\n", tp->sys, tp->name, hdr->counter - *counters - 1);
     }
-    counters[instance] = hdr->counter;
+    *counters = hdr->counter;
 
-    if (hdr->time < ctx->perins_info[instance].evtime) {
+    if (hdr->time < state->evtime) {
         print_time(stderr);
-        fprintf(stderr, " %s:%s out-of-order %llu < %lu\n", tp->sys, tp->name, hdr->time, ctx->perins_info[instance].evtime);
+        fprintf(stderr, " %s:%s out-of-order %llu < %lu\n", tp->sys, tp->name, hdr->time, state->evtime);
         if (dev->env->callchain) {
-            print_unorder_event(dev, ctx->perins_info[instance].event);
+            print_unorder_event(dev, state->event);
             print_unorder_event(dev, event);
         }
     } else {
         if (dev->env->callchain) {
-            if (ctx->perins_info[instance].event)
-                free(ctx->perins_info[instance].event);
-            ctx->perins_info[instance].event = memdup(event, event->header.size);
+            free(state->event);
+            state->event = memdup(event, event->header.size);
         }
-        ctx->perins_info[instance].evtime = hdr->time;
+        state->evtime = hdr->time;
     }
 }
 
@@ -258,7 +263,7 @@ static profiler event_care = {
     .init = event_care_init,
     .filter = event_care_filter,
     .deinit = event_care_exit,
+    .del_thread = event_care_del_thread,
     .sample = event_care_sample,
 };
 PROFILER_REGISTER(event_care);
-

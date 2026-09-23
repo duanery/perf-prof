@@ -2,7 +2,7 @@ perf-prof-y += trace_helpers.o uprobe_helpers.o stack_helpers.o latency_helpers.
 perf-prof-y += count_helpers.o localtime.o
 perf-prof-$(CONFIG_LIBUNWIND) += dwarf_unwind.o
 perf-prof-y += filter/
-perf-prof-y += monitor.o tep.o timer.o convert.o net.o event-spread.o vcpu_info.o
+perf-prof-y += monitor.o bindings.o tep.o timer.o convert.o net.o event-spread.o vcpu_info.o
 perf-prof-y += sched.o comm.o perfeval.o ptrace.o pystack.o
 CFLAGS_pystack.o := -Wno-address-of-packed-member
 perf-prof-$(CONFIG_LIBBPF) += bpf-skel/
@@ -47,4 +47,3 @@ perf-prof-$(CONFIG_LIBPYTHON) += python.o
 ifneq ($(PYTHON_HOME),)
 CFLAGS_python.o := -DPYTHON_HOME=$(PYTHON_HOME)
 endif
-

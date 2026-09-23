@@ -10,13 +10,17 @@
 #include <count_helpers.h>
 
 
+struct hrcount_binding {
+    struct prof_binding binding;
+    u64 pos;
+    u64 counters[];
+};
+
 struct hrcount_ctx {
     struct perf_evsel *leader;
     struct tp_list *tp_list;
-    int nr_ins;
+    struct prof_bindings bindings;
     int ins_oncpu;
-    u64 *counters;
-    u64 *perins_pos;
     struct count_dist *count_dist;
     int hist_size;
     u64 period;
@@ -93,15 +97,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx->tp_list)
         goto failed;
 
-    ctx->ins_oncpu = prof_dev_ins_oncpu(dev);
-    ctx->nr_ins = prof_dev_nr_ins(dev);
-    ctx->counters = calloc(ctx->nr_ins, (ctx->tp_list->nr_tp + 1) * sizeof(u64));
-    if (!ctx->counters)
-        goto failed;
-
-    ctx->perins_pos = calloc(ctx->nr_ins, sizeof(u64));
-    if (!ctx->perins_pos)
-        goto failed;
+    ctx->ins_oncpu = prof_dev_oncpu(dev);
+    ctx->bindings.size = sizeof(struct hrcount_binding) + (ctx->tp_list->nr_tp + 1) * sizeof(u64);
 
     ctx->rounds = 0;
     ctx->slots = 2;
@@ -152,10 +149,7 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct hrcount_ctx *ctx = dev->private;
     count_dist_free(ctx->count_dist);
-    if (ctx->counters)
-        free(ctx->counters);
-    if (ctx->perins_pos)
-        free(ctx->perins_pos);
+    prof_bindings_exit(&ctx->bindings);
     if (ctx->pertp_max_len)
         free(ctx->pertp_max_len);
     tp_list_free(ctx->tp_list);
@@ -197,7 +191,7 @@ static int hrcount_init(struct prof_dev *dev)
     // For hrcount, it can only be attached to cpu.
     // For stat, it can be attached to cpu and pid.
     if (strcmp(dev->prof->name, "hrcount") == 0 &&
-        !prof_dev_ins_oncpu(dev)) {
+        !prof_dev_oncpu(dev)) {
         fprintf(stderr, "hrcount can only be attached to cpu.\n");
         return -1;
     }
@@ -258,12 +252,14 @@ static void hrcount_sigusr(struct prof_dev *dev, int signum)
 static void hrcount_reset(struct prof_dev *dev)
 {
     struct hrcount_ctx *ctx = dev->private;
+    struct hrcount_binding *state;
     print_time(stdout);
     printf("hrcount reset\n");
     perf_evsel__disable(ctx->leader);
     perf_evsel__enable(ctx->leader);
     count_dist_reset(ctx->count_dist);
-    memset(ctx->perins_pos, 0, ctx->nr_ins * sizeof(u64));
+    prof_bindings_for_each(&ctx->bindings, state)
+        state->pos = 0;
     ctx->rounds = 0;
     ctx->round_nr = 0;
 }
@@ -286,7 +282,7 @@ static void direct_print(void *opaque, struct count_node *node)
 
     if (dev->env->perins)
         printf(ctx->ins_oncpu ? "[%03d] " : "[%6d] ",
-               ctx->ins_oncpu ? prof_dev_ins_cpu(dev, node->ins) : prof_dev_ins_thread(dev, node->ins));
+               prof_binding_id(node->ins));
     printf("%*s ", ctx->tp_sys_name_max_len, buf);
 
     h = (ctx->rounds % ctx->slots) * ctx->hist_size;
@@ -364,7 +360,7 @@ static void packed_print(void *opaque, struct count_node *node)
         iter->ins = node->ins;
         iter->id = 0;
         iter->line_len = printf(ctx->ins_oncpu ? "[%03d] " : "[%6d] ",
-            ctx->ins_oncpu ? prof_dev_ins_cpu(dev, node->ins) : prof_dev_ins_thread(dev, node->ins));
+            prof_binding_id(node->ins));
     }
 
     packed_skip(opaque, node->id);
@@ -399,15 +395,16 @@ static void __hrcount_interval(struct prof_dev *dev)
     int len, i;
     u64 print_pos = (ctx->rounds + 1) * ctx->hist_size;
     u64 max_pos = 0;
+    struct hrcount_binding *state;
 
     // Determine if all instances are complete
-    for (i = 0; i < ctx->nr_ins; i++) {
-        if (ctx->perins_pos[i] < print_pos)
+    prof_bindings_for_each(&ctx->bindings, state) {
+        if (state->pos < print_pos)
             return ;
-        if (ctx->perins_pos[i] > max_pos)
-            max_pos = ctx->perins_pos[i];
+        if (state->pos > max_pos)
+            max_pos = state->pos;
     }
-    if (ctx->nr_ins >= 2 && ctx->hist_size >= 2 &&
+    if (ctx->bindings.nr >= 2 && ctx->hist_size >= 2 &&
         max_pos - print_pos >= ctx->hist_size/2)
         ctx->need_reset = true;
 
@@ -454,11 +451,32 @@ static void hrcount_interval(struct prof_dev *dev)
     }
 }
 
-static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static struct hrcount_binding *hrcount_binding(struct prof_dev *dev, int cpu, int tid)
 {
     struct hrcount_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ
+    struct hrcount_binding *state = prof_binding_find(&ctx->bindings, cpu, tid);
+
+    if (!state) {
+        state = prof_binding_get(&ctx->bindings, cpu, tid);
+        if (state)
+            state->pos = ctx->rounds * ctx->hist_size;
+    }
+    return state;
+}
+
+static int hrcount_del_thread(struct prof_dev *dev, pid_t tid)
+{
+    struct hrcount_ctx *ctx = dev->private;
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    u64 binding = prof_binding_key(cpu, tid);
+    struct hrcount_ctx *ctx = dev->private;
+    struct hrcount_binding *state = hrcount_binding(dev, cpu, tid);
+    /* PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ */
     struct sample_type_data {
         struct {
             __u32    pid;
@@ -478,11 +496,15 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int in
         } groups;
     } *data = (void *)event->sample.array;
     int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter = ctx->counters + instance * (n + 1);
+    u64 *ins_counter;
     u64 counter, cpu_clock = 0;
     u64 i, j;
     int verbose = dev->env->verbose;
     u64 print_pos = (ctx->rounds + 1) * ctx->hist_size;
+
+    if (!state)
+        return;
+    ins_counter = state->counters;
 
     for (i = 0; i < data->groups.nr; i++) {
         struct perf_evsel *evsel;
@@ -494,7 +516,7 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int in
             cpu_clock = data->groups.ctnr[i].value - ins_counter[n];
             ins_counter[n] = data->groups.ctnr[i].value;
             if (cpu_clock >= ctx->period * 2) {
-                ctx->perins_pos[instance] += cpu_clock / ctx->period - 1;
+                state->pos += cpu_clock / ctx->period - 1;
                 verbose = VERBOSE_NOTICE;
             }
             continue;
@@ -504,11 +526,11 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int in
             j = tp->idx;
             counter = data->groups.ctnr[i].value - ins_counter[j];
             ins_counter[j] = data->groups.ctnr[i].value;
-            count_dist_insert(ctx->count_dist, instance, j, 0, ctx->perins_pos[instance], counter);
+            count_dist_insert(ctx->count_dist, binding, j, 0, state->pos, counter);
         }
     }
 
-    ctx->perins_pos[instance] ++;
+    state->pos ++;
 
     if (verbose) {
         if (dev->print_title) prof_dev_print_time(dev, data->time, stdout);
@@ -526,9 +548,9 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int in
      * After the perf event is throttled, it needs to wait for a tick to resume.
      * However, tick may be closed by nohz. It takes a long time to be unthrottled.
     **/
-    if (ctx->perins_pos[instance] >= print_pos) {
+    if (state->pos >= print_pos) {
         ctx->round_nr ++;
-        if (ctx->round_nr >= ctx->nr_ins) {
+        if (ctx->round_nr >= ctx->bindings.nr) {
             ctx->round_nr = 0;
             __hrcount_interval(dev);
         }
@@ -612,6 +634,7 @@ static profiler hrcount = {
     .init = hrcount_init,
     .filter = hrcount_filter,
     .deinit = hrcount_exit,
+    .del_thread = hrcount_del_thread,
     .sigusr = hrcount_sigusr,
     .interval = hrcount_interval,
     .sample = hrcount_sample,
@@ -623,9 +646,11 @@ static void stat_help(struct help_ctx *hctx)
     __common_help(hctx, "stat");
 }
 
-static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct perf_counts_values *count, int instance)
+static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct perf_counts_values *count, int cpu, int tid)
 {
     struct hrcount_ctx *ctx = dev->private;
+    struct hrcount_binding *state = hrcount_binding(dev, cpu, tid);
+    u64 binding = prof_binding_key(cpu, tid);
     struct perf_counts {
         u64 nr;
         struct {
@@ -634,12 +659,15 @@ static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct per
         } ctnr[0];
     } *groups = (void *)count;
     int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter = ctx->counters + instance * (n + 1);
+    u64 *ins_counter;
     u64 counter, cpu_clock;
     u64 i, j;
 
     if (leader != ctx->leader)
         return 0;
+    if (!state)
+        return 0;
+    ins_counter = state->counters;
 
     for (i = 0; i < groups->nr; i++) {
         struct perf_evsel *evsel;
@@ -651,7 +679,7 @@ static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct per
             cpu_clock = groups->ctnr[i].value - ins_counter[n];
             ins_counter[n] = groups->ctnr[i].value;
             if (cpu_clock >= ctx->period * 2) {
-                ctx->perins_pos[instance] += cpu_clock / ctx->period - 1;
+                state->pos += cpu_clock / ctx->period - 1;
             }
             continue;
         }
@@ -660,11 +688,11 @@ static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct per
             j = tp->idx;
             counter = groups->ctnr[i].value - ins_counter[j];
             ins_counter[j] = groups->ctnr[i].value;
-            count_dist_insert(ctx->count_dist, instance, j, 0, ctx->perins_pos[instance], counter);
+            count_dist_insert(ctx->count_dist, binding, j, 0, state->pos, counter);
         }
     }
 
-    ctx->perins_pos[instance] ++;
+    state->pos ++;
     return 1;
 }
 
@@ -704,9 +732,9 @@ static profiler stat = {
     .init = hrcount_init,
     .filter = hrcount_filter,
     .deinit = hrcount_exit,
+    .del_thread = hrcount_del_thread,
     .sigusr = hrcount_sigusr,
     .interval = hrcount_interval,
     .read = stat_read,
 };
 PROFILER_REGISTER(stat);
-

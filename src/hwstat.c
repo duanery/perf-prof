@@ -43,7 +43,7 @@ static int hwstat_init(struct prof_dev *dev)
     };
     struct perf_evsel *evsel;
 
-    if (!prof_dev_ins_oncpu(dev)) {
+    if (!prof_dev_oncpu(dev)) {
         fprintf(stderr, "can only be bound to CPU\n");
         return -1;
     }
@@ -104,8 +104,9 @@ if (groups->c > hwc->c.accum) {  \
      hwc->c.increased = 0; \
 
 
-static int hwstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int hwstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
+    int cpu_index = perf_cpu_map__idx(dev->cpus, cpu);
     struct hwstat_ctx *ctx = dev->private;
     struct perf_counts {
         u64 nr;
@@ -114,7 +115,11 @@ static int hwstat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct pe
         u64 cycles;
         u64 insns;
     } *groups = (void *)count;
-    struct hw_counter *hwc = &ctx->hwc[instance];
+    struct hw_counter *hwc;
+
+    if (cpu_index < 0)
+        return 0;
+    hwc = &ctx->hwc[cpu_index];
 
     if (evsel != ctx->leader)
         return 0;
@@ -136,9 +141,10 @@ static void hwstat_interval(struct prof_dev *dev)
     for (ins = 0; ins < ctx->nr_ins; ins ++) {
         float ipc = 0.0;
         float run = 0.0;
+
         ipc = ctx->hwc[ins].insns.increased * 1.0 / ctx->hwc[ins].cycles.increased;
         run = ctx->hwc[ins].total_time_running.increased * 100.0 / ctx->hwc[ins].total_time_enabled.increased;
-        printf("[%03d] %10lu %10lu   %4.2f  %6.2f%%\n", prof_dev_ins_cpu(dev, ins),
+        printf("[%03d] %10lu %10lu   %4.2f  %6.2f%%\n", perf_cpu_map__cpu(dev->cpus, ins),
                 ctx->hwc[ins].cycles.increased, ctx->hwc[ins].insns.increased, ipc, run);
     }
 }
@@ -167,4 +173,3 @@ static profiler hwstat = {
     .read = hwstat_read,
 };
 PROFILER_REGISTER(hwstat)
-

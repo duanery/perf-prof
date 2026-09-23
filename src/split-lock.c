@@ -32,17 +32,18 @@ static void *do_split_lock(void *unused) {
 /******************************************************
 split-lock ctx
 ******************************************************/
-struct split_lock_ctx {
-    int nr_ins;
-    int print;
-    struct lock_info {
+struct lock_info {
+        struct prof_binding binding;
         uint64_t counter; // sample counter
         uint64_t polling; // read
         uint64_t ena;
         uint64_t run;
         uint64_t interval_counter;
         uint32_t interval_run;
-    } *p;
+};
+struct split_lock_ctx {
+    struct prof_bindings bindings;
+    int print;
     struct callchain_ctx *cc;
     struct key_value_paires *ips;
 };
@@ -54,10 +55,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx)
         return -1;
     dev->private = ctx;
-    ctx->nr_ins = prof_dev_nr_ins(dev);
-    ctx->p = calloc(ctx->nr_ins, sizeof(*ctx->p));
-    if (!ctx->p)
-        goto failed;
+    ctx->bindings.size = sizeof(struct lock_info);
 
     if (dev->env->callchain) {
         ctx->cc = callchain_ctx_new(callchain_flags(dev, CALLCHAIN_KERNEL | CALLCHAIN_USER), stdout);
@@ -77,8 +75,7 @@ failed:
 static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct split_lock_ctx *ctx = dev->private;
-    if (ctx->p)
-        free(ctx->p);
+    prof_bindings_exit(&ctx->bindings);
     if (ctx->cc)
         callchain_ctx_free(ctx->cc);
     if (ctx->ips)
@@ -154,27 +151,38 @@ static void split_lock_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static int split_lock_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int instance)
+static int split_lock_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct split_lock_ctx *ctx = dev->private;
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static int split_lock_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
+{
+    struct split_lock_ctx *ctx = dev->private;
+    struct lock_info *state = prof_binding_get(&ctx->bindings, cpu, tid);
     uint64_t counter = 0;
     uint64_t enabled = 0;
     uint64_t running = 0;
 
-    if (count->val > ctx->p[instance].polling) {
-        counter = count->val - ctx->p[instance].polling;
-        ctx->p[instance].polling = count->val;
+    if (!state)
+        return 0;
+
+    if (count->val > state->polling) {
+        counter = count->val - state->polling;
+        state->polling = count->val;
     }
-    if (count->ena > ctx->p[instance].ena) {
-        enabled = count->ena - ctx->p[instance].ena;
-        ctx->p[instance].ena = count->ena;
+    if (count->ena > state->ena) {
+        enabled = count->ena - state->ena;
+        state->ena = count->ena;
     }
-    if (count->run > ctx->p[instance].run) {
-        running = count->run - ctx->p[instance].run;
-        ctx->p[instance].run = count->run;
+    if (count->run > state->run) {
+        running = count->run - state->run;
+        state->run = count->run;
     }
-    ctx->p[instance].interval_counter = counter;
-    ctx->p[instance].interval_run = running*100/enabled;
+    state->interval_counter = counter;
+    state->interval_run = enabled ? running*100/enabled : 0;
     if (!ctx->print)
         ctx->print = counter > 0;
     return 0;
@@ -201,7 +209,7 @@ static void print_ip(void *opaque, struct_key *key, void *value, unsigned int n)
 static void split_lock_interval(struct prof_dev *dev)
 {
     struct split_lock_ctx *ctx = dev->private;
-    int i;
+    struct lock_info *state;
 
     if (ctx->print) {
         print_time(stdout);
@@ -214,10 +222,10 @@ static void split_lock_interval(struct prof_dev *dev)
     }
     if (ctx->print) {
         printf(" CPU  SPLIT_LOCKS  RUN%%\n");
-        for (i = 0; i < ctx->nr_ins; i++) {
-            if (ctx->p[i].interval_counter)
-                printf(" %3d  %11lu  %4u\n", prof_dev_ins_cpu(dev, i), ctx->p[i].interval_counter,
-                        ctx->p[i].interval_run);
+        prof_bindings_for_each(&ctx->bindings, state) {
+            if (state->interval_counter)
+                printf(" %3d  %11lu  %4u\n", state->binding.cpu >= 0 ? state->binding.cpu : state->binding.tid,
+                        state->interval_counter, state->interval_run);
         }
     }
     ctx->print = 0;
@@ -242,7 +250,7 @@ struct sample_type_data {
     struct callchain callchain;
 };
 
-static void print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags, uint64_t counter)
+static void print_event(struct prof_dev *dev, union perf_event *event, int flags, uint64_t counter)
 {
     struct split_lock_ctx *ctx = dev->private;
     struct sample_type_data *data = (void *)event->sample.array;
@@ -262,27 +270,31 @@ static void print_event(struct prof_dev *dev, union perf_event *event, int insta
     }
 }
 
-static void split_lock_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void split_lock_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct sample_type_data *data = (void *)event->sample.array;
-    print_event(dev, event, instance, flags, data->counter);
+    print_event(dev, event, flags, data->counter);
 }
 
-static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct split_lock_ctx *ctx = dev->private;
+    struct lock_info *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct sample_type_data *data = (void *)event->sample.array;
     uint64_t counter = 0;
     struct misc_ip_key key = {2, event->header.misc, data->ip};
 
+    if (!state)
+        return;
+
     keyvalue_pairs_add_key(ctx->ips, (struct_key *)&key);
 
-    if (data->counter > ctx->p[instance].counter) {
-        counter = data->counter - ctx->p[instance].counter;
-        ctx->p[instance].counter = data->counter;
+    if (data->counter > state->counter) {
+        counter = data->counter - state->counter;
+        state->counter = data->counter;
     }
     if ((dev->env->verbose || dev->env->callchain) && counter) {
-        print_event(dev, event, instance, 0, counter);
+        print_event(dev, event, 0, counter);
     }
 }
 
@@ -306,10 +318,10 @@ struct monitor split_lock = {
     .pages = 1,
     .init = split_lock_init,
     .deinit = split_lock_exit,
+    .del_thread = split_lock_del_thread,
     .read = split_lock_read,
     .interval = split_lock_interval,
     .print_event = split_lock_print_event,
     .sample = split_lock_sample,
 };
 MONITOR_REGISTER(split_lock)
-

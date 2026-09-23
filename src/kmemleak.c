@@ -43,7 +43,7 @@ struct perf_event_backup {
 
 struct kmemleak_lost_node {
     struct list_head lost_link;
-    int ins;
+    int cpu, tid;
     bool reclaim;
     u64 start_time;
     u64 end_time;
@@ -318,7 +318,13 @@ static inline void lost_reclaim(struct prof_dev *dev)
         };
         if (!RB_EMPTY_ROOT(&ctx->alloc))
             dev->lost_print_time = 0; // force print lost now
-        print_lost_fn(dev, (union perf_event *)&lost_event, lost->ins);
+        {
+            int lost_cpu, lost_tid;
+
+            lost_cpu = lost->cpu;
+            lost_tid = lost->tid;
+            print_lost_fn(dev, (union perf_event *)&lost_event, lost_cpu, lost_tid);
+        }
     }
 
     if (!RB_EMPTY_ROOT(&ctx->alloc)) {
@@ -329,7 +335,7 @@ static inline void lost_reclaim(struct prof_dev *dev)
     }
 }
 
-static void kmemleak_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void kmemleak_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
     struct kmemleak_ctx *ctx = dev->private;
     struct kmemleak_lost_node *pos;
@@ -339,7 +345,8 @@ static void kmemleak_lost(struct prof_dev *dev, union perf_event *event, int ins
     // needs to be processed later.
     lost = malloc(sizeof(*lost));
     if (lost) {
-        lost->ins = ins;
+        lost->cpu = cpu;
+        lost->tid = tid;
         lost->reclaim = false;
         lost->start_time = lost_start;
         lost->end_time = lost_end;
@@ -659,7 +666,7 @@ static inline int kmemleak_event_lost(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
-static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kmemleak_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -684,7 +691,7 @@ static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event
     return err;
 }
 
-static void kmemleak_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void kmemleak_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kmemleak_ctx *ctx = dev->private;
     // in linux/perf_event.h

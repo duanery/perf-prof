@@ -729,7 +729,7 @@ static inline unsigned long __mmu_valid_gen(struct kvmmmu_ctx *ctx, unsigned lon
     }
 }
 
-static long kvm_mmu_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long kvm_mmu_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kvmmmu_ctx *ctx = dev->private;
     struct sample_type_raw *raw = (void *)event->sample.array;
@@ -747,7 +747,7 @@ static long kvm_mmu_ftrace_filter(struct prof_dev *dev, union perf_event *event,
     }
 }
 
-static void kvm_mmu_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void kvm_mmu_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct kvmmmu_ctx *ctx = dev->private;
     // in linux/perf_event.h

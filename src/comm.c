@@ -292,7 +292,7 @@ static void comm_interval(struct prof_dev *dev)
     comm_gc(dev, time_before);
 }
 
-static void comm_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void comm_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct comm_ctx *ctx = dev->private;
     // PERF_SAMPLE_TIME | PERF_SAMPLE_RAW

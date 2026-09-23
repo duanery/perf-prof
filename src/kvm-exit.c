@@ -21,12 +21,16 @@
 
 struct sample_type_raw;
 
+struct kvm_exit_binding {
+    struct prof_binding binding;
+    bool valid;
+    u64 data[];
+};
+
 struct kvmexit_ctx {
-    int nr_ins;
+    struct prof_bindings bindings;
     u16 kvm_exit_size;
     u16 sample_size;
-    struct sample_type_raw *perins_kvm_exit;
-    int *perins_kvm_exit_valid;
     __u64 kvm_exit;
     __u64 kvm_entry;
     struct latency_dist *lat_dist;
@@ -134,16 +138,12 @@ static int monitor_ctx_init(struct prof_dev *dev)
     else
         tep__ref_light();
 
-    ctx->nr_ins = prof_dev_nr_ins(dev);
     id = tep__event_id("kvm", "kvm_exit");
     if (id < 0)
         goto failed;
     ctx->kvm_exit_size = tep__event_size(id);
     ctx->sample_size = offsetof(struct sample_type_raw, raw.data) + ctx->kvm_exit_size;
-    ctx->perins_kvm_exit = calloc(ctx->nr_ins, ctx->sample_size);
-    ctx->perins_kvm_exit_valid = calloc(ctx->nr_ins, sizeof(int));
-    if (!ctx->perins_kvm_exit || !ctx->perins_kvm_exit_valid)
-        goto failed;
+    ctx->bindings.size = sizeof(struct kvm_exit_binding) + ctx->sample_size;
 
     ctx->lat_dist = latency_dist_new_quantile(env->perins, true, sizeof(u64));
     if (!ctx->lat_dist)
@@ -152,7 +152,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (env->heatmap)
         ctx->heatmap = heatmap_open("ns", "ns", env->heatmap);
 
-    ctx->ins_oncpu = prof_dev_ins_oncpu(dev);
+    ctx->ins_oncpu = prof_dev_oncpu(dev);
     return 0;
 
 failed:
@@ -163,10 +163,7 @@ failed:
 static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct kvmexit_ctx *ctx = dev->private;
-    if (ctx->perins_kvm_exit)
-        free(ctx->perins_kvm_exit);
-    if (ctx->perins_kvm_exit_valid)
-        free(ctx->perins_kvm_exit_valid);
+    prof_bindings_exit(&ctx->bindings);
     latency_dist_free(ctx->lat_dist);
     if (dev->env->heatmap)
         heatmap_close(ctx->heatmap);
@@ -253,7 +250,7 @@ static void print_latency_node(void *opaque, struct latency_node *node)
     }
     if (env->perins)
         printf("[%*d] ", ctx->ins_oncpu ? 3 : 6,
-                ctx->ins_oncpu ? prof_dev_ins_cpu(dev, (int)node->instance) : prof_dev_ins_thread(dev, (int)node->instance));
+                prof_binding_id(node->instance));
     printf("%-*s %8lu %16.3f %12.3f %12.3f %12.3f %12.3f %6.2f\n", isa == KVM_ISA_VMX ? 20 : 32,
             find_exit_reason(isa, exit_reason),
             node->n, node->sum/1000.0,
@@ -298,18 +295,20 @@ static void kvm_exit_deinit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static void kvm_exit_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static void kvm_exit_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
 {
     struct kvmexit_ctx *ctx = dev->private;
+    struct kvm_exit_binding *state = prof_binding_find(&ctx->bindings, cpu, tid);
 
-    print_lost_fn(dev, event, ins);
+    print_lost_fn(dev, event, cpu, tid);
 
     if (using_order(dev)) {
         fprintf(stderr, "%s: the correctness when lost cannot be guaranteed.\n", dev->prof->name);
         return;
     }
 
-    ctx->perins_kvm_exit_valid[ins] = 0;
+    if (state)
+        state->valid = false;
 }
 
 static inline int __exit_reason(struct kvmexit_ctx *ctx, struct sample_type_raw *raw, unsigned int *exit_reason,
@@ -357,7 +356,7 @@ static void __print_raw(struct prof_dev *dev, struct sample_type_raw *raw, const
     tep__print_event(raw->time, raw->cpu_entry.cpu, raw->raw.data, raw->raw.size);
 }
 
-static void __process_fast(struct prof_dev *dev, struct sample_type_raw *rkvm_exit, struct sample_type_raw *rkvm_entry, int instance)
+static void __process_fast(struct prof_dev *dev, struct sample_type_raw *rkvm_exit, struct sample_type_raw *rkvm_entry, u64 binding)
 {
     struct env *env = dev->env;
     struct kvmexit_ctx *ctx = dev->private;
@@ -382,7 +381,7 @@ static void __process_fast(struct prof_dev *dev, struct sample_type_raw *rkvm_ex
     }
 
     key = ((u64)isa<<32)|exit_reason;
-    node = latency_dist_input(ctx->lat_dist, env->perins?instance:0, key, delta, env->greater_than);
+    node = latency_dist_input(ctx->lat_dist, env->perins?binding:0, key, delta, env->greater_than);
     if (node && guest_rip >= START_OF_KERNEL)
         node->extra[0] += delta;
 
@@ -397,16 +396,26 @@ static void __process_fast(struct prof_dev *dev, struct sample_type_raw *rkvm_ex
     }
 }
 
-static void kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static int kvm_exit_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct kvmexit_ctx *ctx = dev->private;
-    // in linux/perf_event.h
-    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
+
+static void kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    struct kvmexit_ctx *ctx = dev->private;
+    struct kvm_exit_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
+    /* PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW */
     struct sample_type_raw *raw = (void *)event->sample.array;
     unsigned short common_type = raw->raw.common_type;
     unsigned int exit_reason;
     u32 isa;
     unsigned long guest_rip;
+
+    if (!state)
+        return;
 
     if (dev->env->verbose >= VERBOSE_EVENT) {
         if (dev->print_title) prof_dev_print_time(dev, raw->time, stdout);
@@ -416,15 +425,15 @@ static void kvm_exit_sample(struct prof_dev *dev, union perf_event *event, int i
     if (common_type == ctx->kvm_exit) {
         if (__exit_reason(ctx, raw, &exit_reason, &isa, &guest_rip) < 0)
             return;
-        ctx->perins_kvm_exit_valid[instance] = 1;
-        memcpy(&ctx->perins_kvm_exit[instance], raw, ctx->sample_size);
+        state->valid = true;
+        memcpy(state->data, raw, ctx->sample_size);
     } else if (common_type == ctx->kvm_entry) {
-        if (ctx->perins_kvm_exit_valid[instance] == 1) {
-            struct sample_type_raw *raw_kvm_exit = &ctx->perins_kvm_exit[instance];
+        if (state->valid) {
+            struct sample_type_raw *raw_kvm_exit = (void *)state->data;
             if (raw->tid_entry.tid == raw_kvm_exit->tid_entry.tid &&
                 raw->time > raw_kvm_exit->time) {
-                __process_fast(dev, raw_kvm_exit, raw, instance);
-                ctx->perins_kvm_exit_valid[instance] = 0;
+                __process_fast(dev, raw_kvm_exit, raw, prof_binding_key(cpu, tid));
+                state->valid = false;
             } else {
                 if (raw->tid_entry.tid != raw_kvm_exit->tid_entry.tid) {
                     if (dev->env->verbose >= VERBOSE_NOTICE) {
@@ -466,10 +475,9 @@ struct monitor kvm_exit = {
     .init = kvm_exit_init,
     .filter = kvm_exit_filter,
     .deinit = kvm_exit_deinit,
+    .del_thread = kvm_exit_del_thread,
     .interval = kvm_exit_interval,
     .lost = kvm_exit_lost,
     .sample = kvm_exit_sample,
 };
 MONITOR_REGISTER(kvm_exit)
-
-

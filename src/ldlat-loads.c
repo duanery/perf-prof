@@ -357,7 +357,7 @@ static int perf_script__meminfo_scnprintf(char *out, size_t sz, struct mem_info 
 static void ldlat_print_node(void *opaque, struct latency_node *node)
 {
     struct prof_dev *dev = opaque;
-    int oncpu = prof_dev_ins_oncpu(dev);
+    int oncpu = prof_dev_oncpu(dev);
     struct mem_info mem_info;
     char buf[128];
 
@@ -366,9 +366,9 @@ static void ldlat_print_node(void *opaque, struct latency_node *node)
 
     if (dev->env->perins) {
         if (oncpu)
-            printf("[%03d] ", prof_dev_ins_cpu(dev, node->instance));
+            printf("[%03d] ", prof_binding_cpu(node->instance));
         else
-            printf("%-8d ", prof_dev_ins_thread(dev, node->instance));
+            printf("%-8d ", prof_binding_tid(node->instance));
     }
     printf("%-60s %8lu %16lu %12lu %12lu %12lu\n", buf,
         node->n, node->sum, node->min, node->sum/node->n, node->max);
@@ -379,7 +379,7 @@ static void ldlat_loads_interval(struct prof_dev *dev)
     struct env *env = dev->env;
     struct ldlat_ctx *ctx = dev->private;
     int i;
-    int oncpu = prof_dev_ins_oncpu(dev);
+    int oncpu = prof_dev_oncpu(dev);
 
     if (latency_dist_empty(ctx->lat_dist))
         return ;
@@ -403,7 +403,7 @@ static void ldlat_loads_interval(struct prof_dev *dev)
     return ;
 }
 
-static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct ldlat_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -431,17 +431,19 @@ static void ldlat_loads_print_event(struct prof_dev *dev, union perf_event *even
     print_callchain(ctx->ccx, (struct callchain *)&callchain, data->tid_entry.pid);
 }
 
-static void ldlat_loads_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void ldlat_loads_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
+    u64 binding = prof_binding_key(cpu, tid);
+
     struct env *env = dev->env;
     struct ldlat_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
 
     if (env->verbose || (env->greater_than &&
         data->weight.full > env->greater_than))
-        ldlat_loads_print_event(dev, event, instance, 0);
+        ldlat_loads_print_event(dev, event, cpu, tid, 0);
 
-    latency_dist_input(ctx->lat_dist, instance, data->data_src, data->weight.full, env->greater_than);
+    latency_dist_input(ctx->lat_dist, binding, data->data_src, data->weight.full, env->greater_than);
 }
 
 static const char *ldlat_loads_desc[] = PROFILER_DESC("ldlat-loads",
@@ -540,4 +542,3 @@ static profiler ldlat_stores = {
     .sample = ldlat_loads_sample,
 };
 PROFILER_REGISTER(ldlat_stores);
-

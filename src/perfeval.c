@@ -42,7 +42,7 @@ struct perfeval_node {
             hlist_for_each_entry(obj, &hashtable[bkt], node)
 
 
-void perfeval_sample(struct prof_dev *dev, union perf_event *event, int instance)
+void perfeval_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct perfeval_node *node;
     u32 cpu_tid[2] = {0};

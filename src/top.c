@@ -457,7 +457,7 @@ struct sample_type_raw {
     } raw;
 };
 
-static long top_ftrace_filter(struct prof_dev *dev, union perf_event *event, int instance)
+static long top_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct top_ctx *ctx = dev->private;
     struct sample_type_raw *raw = (void *)event->sample.array;
@@ -465,7 +465,7 @@ static long top_ftrace_filter(struct prof_dev *dev, union perf_event *event, int
     return tp_list_ftrace_filter(dev, ctx->tp_list, glo);
 }
 
-static void top_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void top_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct top_ctx *ctx = dev->private;
     struct sample_type_raw *raw = (void *)event->sample.array;

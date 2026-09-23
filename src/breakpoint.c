@@ -1276,7 +1276,7 @@ decode:
 
 #endif
 
-static void print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct breakpoint_ctx *ctx = dev->private;
     struct env *env = dev->env;
@@ -1402,12 +1402,12 @@ static void print_event(struct prof_dev *dev, union perf_event *event, int insta
  * - Skip data filtering (requires continuous events)
  * - Print callchain instead of writing to flame graph
  */
-static void breakpoint_print_event(struct prof_dev *dev, union perf_event *event, int instance, int flags)
+static void breakpoint_print_event(struct prof_dev *dev, union perf_event *event, int cpu, int tid, int flags)
 {
     struct breakpoint_ctx *ctx = dev->private;
     ctx->print_event = 1;
     ctx->sample = 0;
-    print_event(dev, event, instance, flags);
+    print_event(dev, event, cpu, tid, flags);
 }
 
 /*
@@ -1418,12 +1418,12 @@ static void breakpoint_print_event(struct prof_dev *dev, union perf_event *event
  * - Execute data filtering with --filter option
  * - Write callchain to flame graph if configured
  */
-static void breakpoint_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void breakpoint_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct breakpoint_ctx *ctx = dev->private;
     ctx->print_event = 0;
     ctx->sample = 1;
-    print_event(dev, event, instance, 0);
+    print_event(dev, event, cpu, tid, 0);
 }
 
 static const char *breakpoint_desc[] = PROFILER_DESC("breakpoint",

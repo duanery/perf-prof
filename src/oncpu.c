@@ -22,7 +22,7 @@
 
 struct runtime {
     struct rb_node rbn;
-    int instance;
+    int binding_id;
     union {
         int another;
         int cpu;
@@ -36,16 +36,17 @@ struct runtime {
 
 struct oncpu_ctx {
     bool tid_to_cpumap;
-    int nr_ins;
+    struct prof_bindings bindings;
     int nr_cpus;
-    struct {
-        u64 running_time;
-        int pid;
-    } *switch_time;
     struct perf_cpu_map *prio_map;
     struct rblist runtimes;
     int *percpu_thread_siblings;
-    int *perins_vmf_sib;
+};
+
+struct oncpu_binding {
+    struct prof_binding binding;
+    u64 running_time;
+    int pid;
 };
 
 // in linux/perf_event.h
@@ -73,7 +74,7 @@ struct sample_type_data {
 };
 
 struct runtime_entry {
-    int instance;
+    int binding_id;
     union {
         int another;
         int cpu;
@@ -88,9 +89,9 @@ static int runtime_node_cmp(struct rb_node *rbn, const void *entry)
     const struct runtime_entry *e = entry;
 
     // tid
-    if (run->instance > e->instance)
+    if (run->binding_id > e->binding_id)
         return 1;
-    else if (run->instance < e->instance)
+    else if (run->binding_id < e->binding_id)
         return -1;
 
     // cpu
@@ -108,9 +109,9 @@ static int runtime_node_cmp_comm(struct rb_node *rbn, const void *entry)
     const struct runtime_entry *e = entry;
 
     // cpu
-    if (run->instance > e->instance)
+    if (run->binding_id > e->binding_id)
         return 1;
-    else if (run->instance < e->instance)
+    else if (run->binding_id < e->binding_id)
         return -1;
 
     // only-comm
@@ -126,12 +127,12 @@ static int runtime_node_cmp_comm(struct rb_node *rbn, const void *entry)
     return 0;
 }
 
-static int runtime_instance_cmp(const void *entry, const struct rb_node *rbn)
+static int runtime_binding_id_cmp(const void *entry, const struct rb_node *rbn)
 {
     const struct runtime_entry *e = entry;
     struct runtime *run = rb_entry(rbn, struct runtime, rbn);
 
-    return e->instance - run->instance;
+    return e->binding_id - run->binding_id;
 }
 
 static struct rb_node *runtime_node_new(struct rblist *rlist, const void *new_entry)
@@ -140,7 +141,7 @@ static struct rb_node *runtime_node_new(struct rblist *rlist, const void *new_en
     struct runtime *run = malloc(sizeof(*run));
     if (run) {
         RB_CLEAR_NODE(&run->rbn);
-        run->instance = e->instance;
+        run->binding_id = e->binding_id;
         run->another = e->another;
         run->runtime = 0;
         run->nr_run = 0;
@@ -166,9 +167,9 @@ static int runtime_sorted_node_cmp(struct rb_node *rbn, const void *entry)
     struct runtime *run = rb_entry(rbn, struct runtime, rbn);
     struct runtime *e = rb_entry(entry, struct runtime, rbn);
 
-    if (run->instance > e->instance)
+    if (run->binding_id > e->binding_id)
         return 1;
-    else if (run->instance < e->instance)
+    else if (run->binding_id < e->binding_id)
         return -1;
 
     if (run->runtime > e->runtime)
@@ -272,7 +273,7 @@ static int oncpu_init(struct prof_dev *dev)
     if (!ctx)
         return -1;
     dev->private = ctx;
-    ctx->tid_to_cpumap = !prof_dev_ins_oncpu(dev);
+    ctx->tid_to_cpumap = !prof_dev_oncpu(dev);
 
     if (env->prio_map) {
         if (ctx->tid_to_cpumap)
@@ -294,11 +295,8 @@ static int oncpu_init(struct prof_dev *dev)
     else
         tep__ref_light();
 
-    ctx->nr_ins = prof_dev_nr_ins(dev);
+    ctx->bindings.size = sizeof(struct oncpu_binding);
     ctx->nr_cpus = get_present_cpus();
-    ctx->switch_time = calloc(ctx->nr_ins, sizeof(*ctx->switch_time));
-    if (!ctx->switch_time)
-        goto failed;
 
     rblist__init(&ctx->runtimes);
     ctx->runtimes.node_cmp = ctx->tid_to_cpumap ? runtime_node_cmp : runtime_node_cmp_comm;
@@ -318,14 +316,6 @@ static int oncpu_init(struct prof_dev *dev)
             }
         }
 
-        // on thread
-        ctx->perins_vmf_sib = calloc(ctx->nr_ins, sizeof(int));
-        if (!ctx->perins_vmf_sib)
-            goto failed;
-        for (i = 0; i < ctx->nr_ins; i++) {
-            int vmf_sib = read_sched_vmf_sib(prof_dev_ins_thread(dev, i));
-            ctx->perins_vmf_sib[i] = perf_thread_map__idx(dev->threads, vmf_sib);
-        }
     }
 
     prof_dev_env2attr(dev, &attr);
@@ -393,23 +383,28 @@ static void oncpu_exit(struct prof_dev *dev)
 {
     struct oncpu_ctx *ctx = dev->private;
     rblist__exit(&ctx->runtimes);
-    if (ctx->switch_time)
-        free(ctx->switch_time);
+    prof_bindings_exit(&ctx->bindings);
     if (ctx->prio_map)
         perf_cpu_map__put(ctx->prio_map);
     if (ctx->percpu_thread_siblings)
         free(ctx->percpu_thread_siblings);
-    if (ctx->perins_vmf_sib)
-        free(ctx->perins_vmf_sib);
     tep__unref();
     free(ctx);
 }
 
-static void oncpu_lost(struct prof_dev *dev, union perf_event *event, int ins, u64 lost_start, u64 lost_end)
+static int oncpu_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct oncpu_ctx *ctx = dev->private;
+    prof_bindings_remove_thread(&ctx->bindings, tid);
+    return 0;
+}
 
-    print_lost_fn(dev, event, ins);
+static void oncpu_lost(struct prof_dev *dev, union perf_event *event, int cpu, int tid, u64 lost_start, u64 lost_end)
+{
+    struct oncpu_ctx *ctx = dev->private;
+    struct oncpu_binding *state = prof_binding_find(&ctx->bindings, cpu, tid);
+
+    print_lost_fn(dev, event, cpu, tid);
 
     if (using_order(dev)) {
         fprintf(stderr, "%s: the correctness when lost cannot be guaranteed.\n", dev->prof->name);
@@ -420,16 +415,17 @@ static void oncpu_lost(struct prof_dev *dev, union perf_event *event, int ins, u
         // sched:sched_stat_runtime
     } else {
         // sched:sched_switch
-        ctx->switch_time[ins].running_time = 0;
+        if (state)
+            state->running_time = 0;
     }
 }
 
-static struct runtime *find_first_sib(struct oncpu_ctx *ctx, int instance)
+static struct runtime *find_first_sib(struct oncpu_ctx *ctx, int binding_id)
 {
     struct rb_node *rbn;
-    struct runtime_entry entry = {.instance = instance,};
+    struct runtime_entry entry = {.binding_id = binding_id,};
 
-    rbn = rb_find_first(&entry, &ctx->runtimes.entries.rb_root, runtime_instance_cmp);
+    rbn = rb_find_first(&entry, &ctx->runtimes.entries.rb_root, runtime_binding_id_cmp);
     return rb_entry_safe(rbn, struct runtime, rbn);
 }
 
@@ -444,18 +440,19 @@ static void print_cpumap(struct prof_dev *dev, struct runtime *first)
     struct runtime *run;
     u64 sum = 0;
 
-    for_each_runtime(first, run, rbn, instance)
+    for_each_runtime(first, run, rbn, binding_id)
         sum += run->runtime;
 
-    printf("%-6d %-16s %-7lu ", prof_dev_ins_thread(dev, first->instance), first->comm, sum/1000000);
+    printf("%-6d %-16s %-7lu ", first->binding_id, first->comm, sum/1000000);
 
     if (ctx->percpu_thread_siblings) {
         u64 co = 0;
-        if (ctx->perins_vmf_sib[first->instance] >= 0) {
-            for_each_runtime(first, run, rbn, instance) {
-                struct runtime *first_sib = find_first_sib(ctx, ctx->perins_vmf_sib[run->instance]);
+        int sibling_tid = read_sched_vmf_sib(first->binding_id);
+        if (sibling_tid >= 0) {
+            for_each_runtime(first, run, rbn, binding_id) {
+                struct runtime *first_sib = find_first_sib(ctx, sibling_tid);
                 struct runtime *sib;
-                for_each_runtime(first_sib, sib, rbn, instance) {
+                for_each_runtime(first_sib, sib, rbn, binding_id) {
                     if (ctx->percpu_thread_siblings[sib->cpu] == run->cpu) {
                         co += min(run->runtime, sib->runtime);
                         break;
@@ -466,12 +463,12 @@ static void print_cpumap(struct prof_dev *dev, struct runtime *first)
         printf("%-6lu %-5lu  ", co/1000000, co*100/sum);
     }
 
-    for_each_runtime(first, run, rbn, instance)
+    for_each_runtime(first, run, rbn, binding_id)
         printf("%d(%lums) ", run->cpu, run->runtime/1000000);
 
     if (ctx->percpu_thread_siblings) {
         printf(", ");
-        for_each_runtime(first, run, rbn, instance)
+        for_each_runtime(first, run, rbn, binding_id)
             printf("%d ", ctx->percpu_thread_siblings[run->cpu]);
     }
     printf("\n");
@@ -482,9 +479,9 @@ static void print_tidmap(struct prof_dev *dev, struct runtime *first)
     struct runtime *run;
     u64 sum = 0;
     int nr_run = 0;
-    int cpu = prof_dev_ins_cpu(dev, first->instance);
+    int cpu = first->binding_id;
 
-    for_each_runtime(first, run, rbn, instance) {
+    for_each_runtime(first, run, rbn, binding_id) {
         sum += run->runtime;
         nr_run += run->nr_run;
     }
@@ -497,13 +494,13 @@ static void print_tidmap(struct prof_dev *dev, struct runtime *first)
         printf("%03d %-7lu ", cpu, sum/1000000);
 
     if (dev->env->only_comm) {
-        for_each_runtime(first, run, rbn, instance)
+        for_each_runtime(first, run, rbn, binding_id)
             if (dev->env->detail)
                 printf("%s(%.1fms/%lu/%.1fms) ", run->comm, run->runtime/1000000.0, run->nr_run, run->max/1000000.0);
             else
                 printf("%s(%.1fms) ", run->comm, run->runtime/1000000.0);
     } else {
-        for_each_runtime(first, run, rbn, instance)
+        for_each_runtime(first, run, rbn, binding_id)
             if (dev->env->detail)
                 printf("%s:%d(%.1fms/%lu/%.1fms) ", run->comm, run->tid, run->runtime/1000000.0, run->nr_run, run->max/1000000.0);
             else
@@ -558,7 +555,7 @@ static void oncpu_interval(struct prof_dev *dev)
     first = rb_entry_safe(next, struct runtime, rbn);
     while (first) {
         (ctx->tid_to_cpumap ? print_cpumap : print_tidmap)(dev, first);
-        for_each_runtime(first, run, rbn, instance);
+        for_each_runtime(first, run, rbn, binding_id);
         first = run;
     }
 
@@ -569,9 +566,10 @@ static void oncpu_interval(struct prof_dev *dev)
         rblist__exit(&ctx->runtimes);
 }
 
-static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int instance)
+static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int bind_cpu, int bind_tid)
 {
     struct oncpu_ctx *ctx = dev->private;
+    struct oncpu_binding *state = prof_binding_get(&ctx->bindings, bind_cpu, bind_tid);
     struct env *env = dev->env;
     struct sample_type_data *data = (void *)event->sample.array;
     struct runtime_entry entry;
@@ -580,6 +578,9 @@ static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int inst
     int tid, cpu;
     u64 runtime;
     char *comm;
+
+    if (!state)
+        return;
 
     if (env->verbose >= VERBOSE_EVENT)
         tep__print_event(data->time, data->cpu_entry.cpu, data->raw.data, data->raw.size);
@@ -600,18 +601,18 @@ static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int inst
          *
          * The runtime of sap1001:112746 is equal to 2359.772143 minus 2359.771892.
         **/
-        if (ctx->switch_time[instance].running_time == 0 ||
-            ctx->switch_time[instance].pid != data->raw.sched_switch.prev_pid) {
-            ctx->switch_time[instance].running_time = data->time;
-            ctx->switch_time[instance].pid = data->raw.sched_switch.next_pid;
+        if (state->running_time == 0 ||
+            state->pid != data->raw.sched_switch.prev_pid) {
+            state->running_time = data->time;
+            state->pid = data->raw.sched_switch.next_pid;
             return;
         }
         tid = data->raw.sched_switch.prev_pid;
         cpu = data->cpu_entry.cpu;
-        runtime = data->time - ctx->switch_time[instance].running_time;
+        runtime = data->time - state->running_time;
         comm = data->raw.sched_switch.prev_comm;
-        ctx->switch_time[instance].running_time = data->time;
-        ctx->switch_time[instance].pid = data->raw.sched_switch.next_pid;
+        state->running_time = data->time;
+        state->pid = data->raw.sched_switch.next_pid;
 
         // exclude swapper
         if (tid == 0)
@@ -652,7 +653,7 @@ static void oncpu_sample(struct prof_dev *dev, union perf_event *event, int inst
         return;
     }
 
-    entry.instance = instance;
+    entry.binding_id = bind_cpu >= 0 ? bind_cpu : bind_tid;
     entry.another = ctx->tid_to_cpumap ? cpu : (env->only_comm ? 0 : tid);
     entry.comm = comm;
     rbn = rblist__findnew(&ctx->runtimes, &entry);
@@ -695,10 +696,9 @@ static profiler oncpu = {
     .init = oncpu_init,
     .filter = oncpu_filter,
     .deinit = oncpu_exit,
+    .del_thread = oncpu_del_thread,
     .interval = oncpu_interval,
     .lost = oncpu_lost,
     .sample = oncpu_sample,
 };
 PROFILER_REGISTER(oncpu)
-
-
