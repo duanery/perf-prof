@@ -1,13 +1,13 @@
 #ifndef __LINUX_EPOLL__
 #define __LINUX_EPOLL__
 
+#include <linux/list.h>
 #include <linux/rbtree.h>
 #include <sys/epoll.h>
 
 typedef void (*handle_event)(int fd, unsigned int revents, void *ptr);
 
 struct event_poll_data {
-    struct rb_node rbn;
     int fd;
     void *ptr;
     unsigned int events;
@@ -20,7 +20,8 @@ struct event_poll {
     int maxevents;
     struct epoll_event *events;
     int nr;
-    struct rb_root root;
+    int fd_alloc;
+    struct event_poll_data **by_fd;
 };
 
 struct event_poll *event_poll__alloc(int maxevents);
@@ -30,4 +31,3 @@ int event_poll__del(struct event_poll *ep, int fd);
 int event_poll__poll(struct event_poll *ep, int timeout);
 
 #endif
-
