@@ -139,19 +139,23 @@ TESTS_SHARED = $(OUTPUT)tests-shared
 $(TESTS_IN): FORCE
 	$(Q)$(MAKE) $(build)=tests
 
+# libperf pulls strsize() out of lib/string.c, and the tests read sysfs
+# through libapi. Both come from the enclosing perf-prof build.
+TESTS_EXTRA = $(srctree)/lib/api/libapi.a $(srctree)/lib/string.o \
+	      $(srctree)/lib/ctype.o -lpthread
+
 $(TESTS_STATIC): $(TESTS_IN) $(LIBPERF_A)
-	$(QUIET_LINK)$(CC) -o $@ $^
+	$(QUIET_LINK)$(CC) -o $@ $^ $(TESTS_EXTRA)
 
 $(TESTS_SHARED): $(TESTS_IN)
-	$(QUIET_LINK)$(CC) -o $@ -L$(if $(OUTPUT),$(OUTPUT),.) $^ -lperf
+	$(QUIET_LINK)$(CC) -o $@ -L$(if $(OUTPUT),$(OUTPUT),.) $^ -lperf $(TESTS_EXTRA)
 
-make-tests: libs $(TESTS_SHARED) $(TESTS_STATIC)
+make-tests: libs $(TESTS_STATIC)
 
+# Only the static variant is built here: libperf.so resolves strsize() out of
+# perf-prof's lib/string.c, which is not built as a shared object.
 tests: make-tests
-	@echo "running static:"
 	@./$(TESTS_STATIC) $(TEST_ARGS)
-	@echo "running dynamic:"
-	@LD_LIBRARY_PATH=. ./$(TESTS_SHARED) $(TEST_ARGS)
 
 $(LIBPERF_PC):
 	$(QUIET_GEN)sed -e "s|@PREFIX@|$(prefix)|" \

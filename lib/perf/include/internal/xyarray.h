@@ -15,6 +15,7 @@ struct xyarray {
 };
 
 struct xyarray *xyarray__new(int xlen, int ylen, size_t entry_size);
+struct xyarray *xyarray__grow_y(struct xyarray *xy, int ylen);
 void xyarray__delete(struct xyarray *xy);
 void xyarray__reset(struct xyarray *xy);
 

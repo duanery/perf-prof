@@ -6,5 +6,6 @@ int test_cpumap(int argc, char **argv);
 int test_threadmap(int argc, char **argv);
 int test_evlist(int argc, char **argv);
 int test_evsel(int argc, char **argv);
+int test_bind(int argc, char **argv);
 
 #endif /* TESTS_H */
