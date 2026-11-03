@@ -11,5 +11,6 @@ int main(int argc, char **argv)
 	__T("test threadmap", !test_threadmap(argc, argv));
 	__T("test evlist", !test_evlist(argc, argv));
 	__T("test evsel", !test_evsel(argc, argv));
+	__T("test bind", !test_bind(argc, argv));
 	return 0;
 }
