@@ -99,9 +99,9 @@ evsel 级绑定（`own_cpus` / `own_threads`）和按 `(cpu, tid, overwrite)` �
 
 ---
 
-## 3 模型：fd 空间、ring、HUP 域、线程
+## 3 模型：fd 空间、ring、HUP 域、线程、监听 fd
 
-### 3.1 三个空间
+### 3.1 从 fd 空间到监听 fd
 
 **fd 空间 (event,c,t)**：每个打开的 writer fd 记为 (event,c,t)。event 是 evsel，c、t 是 evsel 的
 cpu map、thread map 中这个 fd 所在槽位的值：
@@ -140,6 +140,24 @@ ring 与域，规则相同，下文省略。
 
 **线程（`struct perf_evlist_thread`）**：只有线程退出才会 HUP，所以 t ≥ 0 的域再关联到线程 t 上，
 `th->domains` 串起线程 t 的所有 (c,t) 与 (-1,t) 域。线程退出时这些域同时离开各自的 ring。
+
+**监听 fd**：注册进 epoll 的 fd。它不是另一个空间，而是在上面三层之上的两次选择，结果落回域里：
+
+- 每个 ring 从它的域中选一个承担**数据角色**（`map->poll_domain`，EPOLLIN）；
+- 每个线程从它的 task 域中选一个承担 **HUP 角色**（`th->hup_domain`，只等 EPOLLHUP）。cpu 域不属于
+  任何线程，只参与数据角色的选择；
+- 被选中的域从自己的 fd 中任取一个注册（`dom->poll_fd`），同时承担两种角色时共用这一个 fd。
+
+即：监听 fd 集合 = { 被 ring 或线程选中的域 } 中每个域的一个 fd，注册数等于被选中的域数。
+
+于是一个 fd (event,c,t) 的完整映射是：
+
+```
+(event,c,t) ──c──▶ ring (c,-1) 或 (-1,t)
+            ──t──▶ 域 (c,t)，t ≥ 0 时再挂到线程 t
+            ──event──▶ 域内的一个 fd
+域 (c,t) 被 ring 选为数据角色、或被线程 t 选为 HUP 角色 ──▶ 域内一个 fd 注册进 epoll
+```
 
 **owner**：ring 的 VMA 所依附的 event，即创建 ring 的那个 fd。
 
@@ -180,43 +198,44 @@ ring 的共享与生命周期。
   而不必等每个 ring 各自 HUP。
 - ptrace 报告的也是"线程 t 退出"。两个信号的状态机（7.2）因此放在线程记录上。
 
-**两种角色：因为唤醒以 ring 为单位，HUP 以线程为单位。**
+**监听 fd 落在域里：逐条由内核约束推出。**
 
-- ring 上任一 writer 写入，ring 上所有 event 都被唤醒（K6）：数据只需要每个 ring 注册一个 fd。
-- 线程的所有 event 同时 HUP（K7）：退出只需要每个线程注册一个 fd。
-- 两个单位不同（ring 与线程），交点正是域，所以两种选择都在域里做：ring 从它的域中选，线程从它的
-  域中选。同一个域内的 fd 对两种角色都等价，所以每个域最多注册一个 fd，只有域死亡时角色才需要
-  转移，fd 的增减几乎不触发 epoll 操作。
-- 数据角色优先 cpu 域，因为它永远不 HUP，选中后不会转移；HUP 角色优先与数据角色重合，以减少注册
-  的 fd 数。
-- HUP 角色还让注册数反映存活线程：每个线程至少占一个注册 fd，退出时至少注销一个。没有 cpu 域时，
-  注册数归 0 就等于被跟踪的线程全部退出，不依赖 ptrace 即可主动结束（6.3）。
+1. *候选只能是域内的 fd。* fd 接入 ring（mmap 或 `SET_OUTPUT`）之前，poll 它立即返回 EPOLLHUP，
+   也收不到写入唤醒（K13）。所以能监听的只有已经接入 ring 的 writer fd，而接入 ring 的 fd 必然已按
+   t 分量放进了某个域。监听 fd 因此只能从域内选，注册必须发生在 fd 入域之后。
+2. *要监听两件事，单位不同。* 读数据要 EPOLLIN，唤醒以 ring 为单位：ring 上任一 writer 写入会唤醒
+   ring 上所有 event（K6），每个 ring 一个 fd 就够。得知退出要 EPOLLHUP，HUP 以线程为单位：线程的
+   所有 event 同时 EXIT（K7），每个线程一个 fd 就够。只按 ring 选会漏掉线程：(event,c,-1) 与
+   (event,c,t) 共存时数据 fd 在 cpu 域上，它永不 HUP，线程 t 的退出就收不到。
+3. *选择的粒度是域，不是 fd。* 同一域内的 fd 同 ring（对 K6 等价）且同 task（对 K7 等价），对两种
+   事件都完全等价；不同域则至少在一种事件上不等价。所以 ring 与线程都只需要选域，域内任取一个 fd。
+4. *结果记在域上，不记在 ring 或线程上。* ring 的域集合与线程的域集合的交点是域，同一个域可能同时被
+   ring 和线程选中。把注册的 fd 记在域上（`dom->poll_fd`），一个 fd 就能兼任两种角色，不会因为两个
+   选择各注册一次而重复；注册的生死也随域：域死亡注销，域内 fd 关闭只在域内换一个 fd。
 
-### 3.3 两种选择
+由此得到几条推论：
 
-域位于 ring 与线程的交叉点，epoll 注册由两个对称的选择决定（第 6 节）：
+- 只有域死亡（线程 HUP，或域内最后一个 fd 离开）才转移角色；fd 的增减几乎不触发 epoll 操作。
+- 数据角色优先 cpu 域：它永不 HUP，选中后不会转移。HUP 角色优先与数据角色重合，减少注册数。
+- 每个存活线程至少占一个注册 fd（HUP 角色），退出时它的域全部死亡，至少注销一个；数据角色只会转移到
+  已注册或新注册的域上而不增加总数。所以没有 cpu 域时，注册数归 0 就等于被跟踪的线程全部退出，
+  不依赖 ptrace 即可主动结束（6.3）。
 
-- ring 从它的域中选一个承担**数据角色**（`map->poll_domain`，EPOLLIN）；
-- 线程从它的域中选一个承担 **HUP 角色**（`th->hup_domain`，EPOLLHUP）。cpu 域不属于任何线程，
-  只参与数据角色的选择。
-
-被选中的域从自己的 fd 中选一个注册（`dom->poll_fd`）。一个域最多注册一个 fd，同时承担两种角色
-时共用。
-
-### 3.4 关联一览
+### 3.3 关联一览
 
 | 关联 | 正向 | 反向 |
 |---|---|---|
 | fd ↔ 域 | `entry->domain` | `dom->fds[]` |
 | 域 ↔ ring | `dom->map`（每个存活域持有 ring 的一个引用） | `map->domains`、`map->cpu_domain` |
 | 域 ↔ 线程（t ≥ 0） | `dom->thread` | `th->domains` |
-| 数据角色 | `map->poll_domain` | `dom->poll_fd` + epoll 注册 |
-| HUP 角色 | `th->hup_domain` | 同上 |
+| 数据角色（ring → 域） | `map->poll_domain` | 域上的 `dom->poll_fd` |
+| HUP 角色（线程 → 域） | `th->hup_domain` | 同上 |
+| 监听 fd（域 → fd → epoll） | `dom->poll_fd`、`dom->poll_events`，epoll.heads[] 按 fd 反查域 | `perf_evlist_poll__find(evlist, fd)` |
 | ring 登记 | evlist 查找哈希 `mmap_heads[]` + 遍历链表 `mmap_list` / `mmap_ovw_list` | |
 | 线程登记 | evlist `thread_heads[]` | |
 | fd ↔ evsel | thread map 槽位、sample id（id 哈希、`evsel->id[]`）、group_fd | |
 
-### 3.5 抽象与源码的对应
+### 3.4 抽象与源码的对应
 
 **对象**
 
