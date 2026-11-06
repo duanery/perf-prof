@@ -93,6 +93,7 @@ evsel 级绑定（`own_cpus` / `own_threads`）和按 `(cpu, tid, overwrite)` �
 | K10 | `do_exit()` 中 `perf_event_exit_task()` 早于 `exit_notify()`：ptrace（未开 `PTRACE_O_TRACEEXIT`）看到线程退出时，该线程 task-bound event 的事件已全部写入 ring | `kernel/exit.c` |
 | K11 | 已退出线程的 event 只通过 `event->hw.target` 持有 task_struct 引用（`perf_event_alloc()` 中 `get_task_struct()`，`_free_event()` 释放），不持有 `struct pid`；waitpid 照常 `release_task()`，pid 可被复用 | `kernel/events/core.c` |
 | K12 | perf trace event 过滤器只能设置一次（`-EEXIST`），BPF 程序同样只能挂一次 | `ftrace_profile_set_filter()`；`perf_event_attach_bpf_prog()` |
+| K13 | 没有 ring 的 event（既没有自己的 mmap，也没有 `SET_OUTPUT` 到别的 ring），`perf_poll()` 直接返回 EPOLLHUP；`ring_buffer_wakeup()` 也只唤醒 `rb->event_list` 上的 event | `perf_poll()` 初值 `events = EPOLLHUP`，有 rb 才读 `rb->poll`；61b67684c4a4 ("perf: Fix perf_poll to return proper POLLHUP value"), in v3.18 |
 
 简化假设：默认内核支持 HUP（v3.18+）。
 
@@ -188,6 +189,8 @@ ring 的共享与生命周期。
   转移，fd 的增减几乎不触发 epoll 操作。
 - 数据角色优先 cpu 域，因为它永远不 HUP，选中后不会转移；HUP 角色优先与数据角色重合，以减少注册
   的 fd 数。
+- HUP 角色还让注册数反映存活线程：每个线程至少占一个注册 fd，退出时至少注销一个。没有 cpu 域时，
+  注册数归 0 就等于被跟踪的线程全部退出，不依赖 ptrace 即可主动结束（6.3）。
 
 ### 3.3 两种选择
 
@@ -309,6 +312,13 @@ owner 可能是一个已退出线程的 event，它只持有 task_struct 的内�
 
 ### 6.1 数据角色与 HUP 角色
 
+**fd 只能在接入 ring 之后注册。** 一个 writer fd 在 mmap（成为 owner）或 `SET_OUTPUT`（接入已有
+ring）之前没有 ring：此时 poll 它立即返回 EPOLLHUP，也收不到任何写入唤醒（K13）。若先注册再接入，
+EPOLLHUP 会被误当作线程退出。所以注册只发生在 `perf_evlist__mmap_attach_fd()` 把 fd 放进域之后，
+由 `perf_evlist_poll__update()` 完成；`perf_evlist__open()` 打开 fd 时不注册。外部 loop 的回调参数
+`map` 也只有此时才确定。
+
+
 - **数据角色（每个 ring 一个域）**：注册 EPOLLIN。由 K6，一个 fd 足以收到 ring 上所有 writer 的
   唤醒。优先 cpu 域（不会 HUP），没有 cpu 域时选一个 task 域，优先选同时承担 HUP 角色的那个。
 - **HUP 角色（每个线程一个域）**：只等 EPOLLHUP。由 K7，线程的所有 event 同时 EXIT，一个 fd 足以
@@ -343,7 +353,25 @@ HUP 角色不能省：(event,c,-1) 与 (event,c,t) 共存时数据角色在 cpu 
   不加——否则每 detach 一个 fd 就把角色交给下一个 fd，与 evsel 的添加、拆除顺序无关。
 - 注销必须发生在 fd 关闭之前：VMA 可能撑住 file，fd 关了 epitem 仍在（K9）。
 
-### 6.3 external epoll 接口
+### 6.3 注册数与全部线程退出
+
+每个存活线程至少有一个注册的 fd（HUP 角色），线程 HUP 时它的所有域死亡，HUP 角色的 fd 随之注销，
+所以**每有一个线程退出，注册的 fd 至少少一个**（数据角色可能转移到另一个线程已注册的 fd 上，注册数
+不会因此增加）。
+
+- 没有 (event,c,-1) 时，所有域都是 task 域：最后一个线程退出后所有 ring 都失去 writer，注册数归 0。
+  外部只看注册数（perf-prof 的 `dev->nr_pollfd`，由 add/del 回调维护）就能判断被跟踪的线程是否全部
+  退出，**不需要 ptrace**。
+- 有 (event,c,-1) 时，cpu 域永不 HUP，注册数不会归 0，只能由 ptrace 判断。
+
+perf-prof 据此主动关闭 prof_dev（8.1）：
+
+| 跟踪方式 | 关闭依据 |
+|---|---|
+| 不用 ptrace（`-p`、无 `--ptrace` 的 workload） | EPOLLHUP 处理后 `dev->nr_pollfd` 归 0 → `prof->hangup()` + `prof_dev_close()` |
+| 用 ptrace（`--ptrace`） | 每个被跟踪线程通过 ptrace 链接持有一次 `prof_dev_use()`，线程退出时 `prof_dev_unuse()`；`dev->dev_users` 归 0 时关闭。此时 `dev->ptrace_list` 非空，不按 `nr_pollfd` 关闭 |
+
+### 6.4 external epoll 接口
 
 ```c
 typedef int  (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
@@ -465,7 +493,7 @@ prof_dev_hup(dev, fd):
         m.retired 且启用 order: order_mmap_del(m.map)
     hup.complete: prof_dev_thread_done(tid)
     perf_evlist__hup_done(evlist, &hup)
-    nr_pollfd == 0 且没有 ptrace 链接: hangup + prof_dev_close()
+    nr_pollfd == 0 且没有 ptrace 链接: hangup + prof_dev_close()   // 6.3
 
 __poll_add(ext, fd, events, map, new_map):
     main_epoll_add(); new_map 且启用 order: order_mmap_add(map)
