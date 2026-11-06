@@ -86,7 +86,7 @@ static void __ptrace_unlink_free(struct pid_link_dev *link)
     free(link);
 
     /*
-     * Drain this thread before dropping the ptrace use. unuse() of the
+     * Report the exit before dropping the ptrace use. unuse() of the
      * last link closes the device; del_thread must run while the evlist
      * is still alive. Skip when already closing: close -> detach walks
      * this list and must not re-enter del_thread.

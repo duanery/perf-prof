@@ -255,7 +255,11 @@ typedef struct monitor {
     int (*init)(struct prof_dev *dev);
     int (*reinit)(struct prof_dev *dev, int err);
     int (*filter)(struct prof_dev *dev);
-    /* ptrace added or removed a thread; update profiler-side filters. */
+    /*
+     * ptrace added or removed a thread; update profiler-side filters.
+     * del_thread() runs once the thread is gone from the evlist: after both
+     * its exit and the EPOLLHUP of its fds, with every event of it read.
+     */
     int (*add_thread)(struct prof_dev *dev, pid_t pid);
     int (*del_thread)(struct prof_dev *dev, pid_t pid);
     void (*enabled)(struct prof_dev *dev);
@@ -375,8 +379,6 @@ struct prof_dev {
     struct list_head dev_link;
     struct perf_cpu_map *cpus;
     struct perf_thread_map *threads;
-    struct list_head dead_threads;
-    bool reaping_threads;
     struct perf_evlist *evlist;
     struct timer timer;  // interval
     struct env *env;
@@ -672,7 +674,6 @@ void order_unregister(struct prof_dev *dev, void *stream);
 int order_mmap_add(struct prof_dev *dev, struct perf_mmap *map);
 void order_mmap_del(struct prof_dev *dev, struct perf_mmap *map);
 bool order_drain(struct prof_dev *dev, struct perf_mmap *map, u64 end);
-void prof_dev_reap_threads(struct prof_dev *dev);
 void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock_t target_tm);
 static inline void order_mmap(struct prof_dev *dev, struct perf_mmap *map) { order_process(dev, map, 0); }
 static inline void order_stream(struct prof_dev *dev) { order_process(dev, NULL, 0); }

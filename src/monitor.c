@@ -2117,10 +2117,12 @@ static void perf_event_handle_mmap(struct prof_dev *dev, struct perf_mmap *map)
         return;
     }
 
+    /*
+     * No reference is taken: a ring buffer is only released by EPOLLHUP or by
+     * perf_evlist__munmap(), neither of which can run from here.
+     */
     if (perf_mmap__read_init(map) < 0)
         return;
-
-    perf_mmap__get(map);
 
     /* Every event in this ring buffer comes from the cpu/thread it is bound to. */
     cpu = perf_mmap__cpu(map);
@@ -2132,184 +2134,92 @@ static void perf_event_handle_mmap(struct prof_dev *dev, struct perf_mmap *map)
         perf_mmap__consume(map);
     }
     perf_mmap__read_done(map);
-    perf_mmap__put(map);
 }
 
-static bool prof_dev_consume_mmap(struct prof_dev *dev, struct perf_mmap *map, u64 end)
+/* Read @map to its current head, through the order heap if enabled. */
+static void prof_dev_drain_mmap(struct prof_dev *dev, struct perf_mmap *map)
 {
     if (dev->order.enabled)
-        return order_drain(dev, map, end);
-    else {
-        union perf_event *event;
-        bool writable = false;
-        int cpu = perf_mmap__cpu(map);
-        int tid = perf_mmap__tid(map);
-
-        if (perf_mmap__read_init(map) < 0)
-            return false;
-        while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
-            perf_event_process_record(dev, event, cpu, tid, writable, false);
-            perf_mmap__consume(map);
-        }
-        perf_mmap__read_done(map);
-    }
-    return true;
+        order_drain(dev, map, perf_mmap__read_head(map));
+    else
+        perf_event_handle_mmap(dev, map);
 }
 
-struct dead_thread_map {
-    struct perf_mmap *map;
-    u64 end;
-};
-
-struct dead_thread {
-    struct list_head link;
-    pid_t tid;
-    int nr_maps;
-    struct dead_thread_map maps[];
-};
-
-void prof_dev_reap_threads(struct prof_dev *dev)
+/*
+ * The thread is gone from the evlist. Its task-bound events are all read
+ * already (EPOLLHUP drained them); the cpu ring buffers may still hold events
+ * about it from pid=-1 writers, read them before the profiler forgets it.
+ */
+static void prof_dev_thread_done(struct prof_dev *dev, pid_t tid)
 {
-    struct dead_thread *dead, *next;
+    struct perf_mmap *map;
 
-    if (dev->reaping_threads || order_main_dev(dev)->order.inprocess)
-        return;
-    dev->reaping_threads = true;
-    prof_dev_get(dev);
-    list_for_each_entry_safe(dead, next, &dev->dead_threads, link) {
-        bool drained = true;
-        int i;
-
-        for (i = 0; i < dead->nr_maps; i++) {
-            if (!prof_dev_consume_mmap(dev, dead->maps[i].map, dead->maps[i].end))
-                drained = false;
+    if (dev->pages && dev->state == PROF_DEV_STATE_ACTIVE) {
+        perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite) {
+            if (perf_mmap__oncpu(map))
+                prof_dev_drain_mmap(dev, map);
         }
-        if (!drained)
-            continue;
-        /* Leave the maps and ids live when a VMA handover cannot allocate. */
-        {
-            struct perf_evsel *evsel;
-            int cpu, thread, err = 0;
-
-            perf_evlist__for_each_evsel(dev->evlist, evsel) {
-                if (evsel->own_threads || !evsel->fd)
-                    continue;
-                thread = perf_thread_map__idx(evsel->threads, dead->tid);
-                if (thread < 0)
-                    continue;
-                for (cpu = 0; cpu < perf_cpu_map__nr(evsel->cpus); cpu++) {
-                    if (perf_evlist__prepare_remove_fd(dev->evlist,
-                            perf_evsel__fd_entry(evsel, cpu, thread)))
-                        err = -1;
-                }
-            }
-            if (err)
-                continue;
-        }
-        list_del(&dead->link);
-        if (dev->prof->del_thread)
-            dev->prof->del_thread(dev, dead->tid);
-        for (i = 0; i < dead->nr_maps; i++) {
-            struct perf_mmap *map = dead->maps[i].map;
-
-            if (map->tid == dead->tid && dev->order.enabled)
-                order_mmap_del(dev, map);
-        }
-        perf_evlist__del_thread(dev->evlist, dead->tid);
-        for (i = 0; i < dead->nr_maps; i++)
-            perf_mmap__put(dead->maps[i].map);
-        free(dead);
-        if (dev->inclose) {
-            if (dev->dev_users > 0 && --dev->dev_users == 0)
-                prof_dev_put(dev);
-        } else
-            prof_dev_unuse(dev);
     }
-    dev->reaping_threads = false;
-    prof_dev_put(dev);
+    if (dev->prof->del_thread)
+        dev->prof->del_thread(dev, tid);
 }
 
 int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
 {
-    struct perf_mmap *map;
-    int err;
-
     if (dev->inclose)
         return 0;
-    err = perf_evlist__add_thread(dev->evlist, pid);
-    if (err)
-        return err;
-    perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite) {
-        if (map->tid == pid && dev->order.enabled && order_mmap_add(dev, map) < 0) {
-            perf_evlist__del_thread(dev->evlist, pid);
-            return -1;
-        }
-    }
-    return 0;
+    /* New ring buffers join the order heap from __poll_add(). */
+    return perf_evlist__add_thread(dev->evlist, pid);
 }
 
+/*
+ * ptrace saw the thread exit. Its fds see EPOLLHUP as well, in either order;
+ * whichever comes second closes them, see perf_evlist__del_thread().
+ */
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 {
-    struct perf_mmap *map;
-    struct dead_thread *dead;
-    int nr = dev->evlist->nr_mmaps, i = 0;
+    int ret;
 
     if (dev->inclose)
         return 0;
-    list_for_each_entry(dead, &dev->dead_threads, link)
-        if (dead->tid == pid)
-            return 0;
-    dead = calloc(1, sizeof(*dead) + nr * sizeof(dead->maps[0]));
-    if (!dead)
-        return -ENOMEM;
-    dead->tid = pid;
-    perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite) {
-        /* CPU buffers can contain the last scheduler events of this thread. */
-        if (map->tid >= 0 && map->tid != pid)
-            continue;
-        perf_mmap__get(map);
-        dead->maps[i].map = map;
-        dead->maps[i++].end = perf_mmap__read_head(map);
+    ret = perf_evlist__del_thread(dev->evlist, pid);
+    if (ret == 1)
+        prof_dev_thread_done(dev, pid);
+    return ret < 0 ? ret : 0;
+}
+
+/*
+ * EPOLLHUP: the task of @fd exited. Every ring buffer it wrote into is read to
+ * the end before libperf closes its fds, so that the sample ids still resolve;
+ * the ones left without a writer leave the order heap.
+ */
+static void prof_dev_hup(struct prof_dev *dev, int fd)
+{
+    struct perf_evlist_hup hup;
+    int i;
+
+    if (perf_evlist__hup(dev->evlist, fd, &hup) < 0)
+        return;
+    for (i = 0; i < hup.nr_maps; i++) {
+        struct perf_mmap *map = hup.maps[i].map;
+
+        /* Only an active device processes events; disabled ones are flushed. */
+        if (dev->state == PROF_DEV_STATE_ACTIVE)
+            prof_dev_drain_mmap(dev, map);
+        if (hup.maps[i].retired && dev->order.enabled)
+            order_mmap_del(dev, map);
     }
-    dead->nr_maps = i;
-    prof_dev_use(dev);
-    list_add_tail(&dead->link, &dev->dead_threads);
-    return 0;
-}
+    if (hup.complete)
+        prof_dev_thread_done(dev, hup.tid);
+    perf_evlist__hup_done(dev->evlist, &hup);
 
-static void prof_dev_reap_tree(struct prof_dev *dev)
-{
-    struct prof_dev *child, *tmp;
-
-    for_each_child_dev_get(child, tmp, dev)
-        prof_dev_reap_tree(child);
-    prof_dev_reap_threads(dev);
-}
-
-static void prof_dev_reap_all(void)
-{
-    struct prof_dev *dev, *tmp;
-
-    for_each_dev_get(dev, tmp, &prof_dev_list, dev_link)
-        if (!dev->links.parent)
-            prof_dev_reap_tree(dev);
-}
-
-static void prof_dev_pollfd_gone(struct prof_dev *dev, int fd, bool hangup)
-{
-    if (main_epoll_del(fd) == 0 && dev->nr_pollfd > 0)
-        dev->nr_pollfd--;
     /*
-     * Only POLLHUP means "this fd's task exited". del_thread also
-     * removes fds; closing from there re-enters ptrace_detach.
-     *
-     * With --ptrace the workload's first thread can exit (HUP) while
-     * later threads are still attached. Those threads keep the device
-     * via ptrace_list; the last unlink's unuse() closes it.
+     * Nothing left to poll: every task exited. With --ptrace the workload's
+     * first thread can exit while later threads are still attached; those
+     * keep the device via ptrace_list, the last unlink's unuse() closes it.
      */
-    if (hangup && dev->nr_pollfd == 0 &&
-        dev->state == PROF_DEV_STATE_ACTIVE && !dev->inclose &&
-        list_empty(&dev->ptrace_list) && list_empty(&dev->dead_threads)) {
+    if (dev->nr_pollfd == 0 && !dev->inclose && dev->state != PROF_DEV_STATE_INACTIVE &&
+        list_empty(&dev->ptrace_list)) {
         if (dev->prof->hangup)
             dev->prof->hangup(dev);
         prof_dev_close(dev);
@@ -2327,46 +2237,47 @@ static void perf_event_handle(int fd, unsigned int revents, void *ptr)
      * epoll_wait batch are still being dispatched. Those mmaps and
      * poll nodes may already be gone; do not touch them.
      */
-    if (dev->inclose || dev->state != PROF_DEV_STATE_ACTIVE)
+    if (dev->inclose || dev->state == PROF_DEV_STATE_EXIT)
         return;
     prof_dev_get(dev);
-    if (!dev->inclose && dev->state == PROF_DEV_STATE_ACTIVE)
+    if (dev->state == PROF_DEV_STATE_ACTIVE)
         perf_event_handle_mmap(dev, ptr);
-    if ((revents & EPOLLHUP) && !dev->inclose &&
-        dev->state == PROF_DEV_STATE_ACTIVE)
-        prof_dev_pollfd_gone(dev, fd, true);
+    /*
+     * The fds are polled from perf_evlist__mmap() on, and EPOLLHUP is
+     * reported once: take it in any state, or the ring buffers of the
+     * thread are never let go, e.g. for a device that is still off.
+     */
+    if ((revents & EPOLLHUP) && !dev->inclose && dev->state != PROF_DEV_STATE_EXIT)
+        prof_dev_hup(dev, fd);
     prof_dev_put(dev);
 }
 
-static int __addfn(int fd, unsigned events, struct perf_mmap *mmap)
+/*
+ * libperf registers its poll fds from perf_evlist__mmap() on. Events that
+ * arrive before the device is active are left in the ring buffers, see
+ * perf_event_handle().
+ */
+static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap *map, bool new_map)
 {
-    struct prof_dev *dev = perf_evlist_poll__get_external(NULL, mmap);
-    int err = main_epoll_add(fd, events, mmap, perf_event_handle);
-    if (!err)
-        dev->nr_pollfd++;
-    return err;
-}
+    struct prof_dev *dev = external;
+    int err = main_epoll_add(fd, events, map, perf_event_handle);
 
-static int __delfn(int fd, unsigned events, struct perf_mmap *mmap)
-{
-    main_epoll_del(fd);
+    if (err)
+        return err;
+    if (new_map && dev->order.enabled && order_mmap_add(dev, map) < 0) {
+        main_epoll_del(fd);
+        return -ENOMEM;
+    }
+    dev->nr_pollfd++;
     return 0;
 }
 
-static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap *mmap)
+static void __poll_del(void *external, int fd, struct perf_mmap *map)
 {
     struct prof_dev *dev = external;
-    int err = main_epoll_add(fd, events, mmap, perf_event_handle);
 
-    if (!err)
-        dev->nr_pollfd++;
-    return err;
-}
-
-static void __poll_del(void *external, int fd, struct perf_mmap *mmap)
-{
-    (void)mmap;
-    prof_dev_pollfd_gone(external, fd, false);
+    if (main_epoll_del(fd) == 0 && dev->nr_pollfd > 0)
+        dev->nr_pollfd--;
 }
 
 static void interval_handle(struct timer *timer)
@@ -2478,7 +2389,6 @@ struct prof_dev *prof_dev_open_internal(profiler *prof, struct env *env,
     INIT_LIST_HEAD(&dev->forward.source_list);
     INIT_LIST_HEAD(&dev->forward.link_to_target);
     INIT_LIST_HEAD(&dev->ptrace_list);
-    INIT_LIST_HEAD(&dev->dead_threads);
 
     if (parent) {
         dev->clone = clone;
@@ -2508,7 +2418,7 @@ reinit:
         goto out_free;
     }
     dev->evlist = evlist;
-    perf_evlist_poll__external(evlist, dev);
+    perf_evlist_poll__external(evlist, dev, __poll_add, __poll_del);
 
     if (cpu_map || thread_map) {
         cpus = cpu_map ? perf_cpu_map__get(cpu_map) : perf_cpu_map__dummy_new();
@@ -2655,11 +2565,6 @@ reinit:
 
 out_disable:
     list_del(&dev->dev_link);
-    if (dev->pages) {
-        perf_evlist_poll__set_ops(evlist, NULL, NULL);
-        perf_evlist_poll__foreach_fd(evlist, __delfn);
-        dev->nr_pollfd = 0;
-    }
 
 out_del_timer:
     if (dev->env->interval) {
@@ -2857,7 +2762,6 @@ int prof_dev_enable(struct prof_dev *dev)
     struct prof_dev *child, *tmp;
     struct timespec before_enable, after_enable;
     u64 enable_cost;
-    int err;
 
     if (!dev ||
         dev->state == PROF_DEV_STATE_ACTIVE ||
@@ -2869,17 +2773,6 @@ int prof_dev_enable(struct prof_dev *dev)
     evlist = dev->evlist;
 
     perf_timespec_init(dev);
-
-    err = perf_evlist_poll__foreach_fd(evlist, __addfn);
-    if (err) {
-        fprintf(stderr, "monitor(%s) poll failed\n", prof->name);
-        return -1;
-    }
-    /*
-     * After the initial fds are in main_epoll, track fds created or
-     * destroyed by later add_thread/del_thread.
-     */
-    perf_evlist_poll__set_ops(evlist, __poll_add, __poll_del);
 
     prof_dev_get(dev);
 
@@ -2942,19 +2835,12 @@ int prof_dev_disable(struct prof_dev *dev)
 
     perf_evlist__disable(evlist);
 
-    // Disable subsequent perf_event_handle() calls.
-    if (dev->pages) {
-        perf_evlist_poll__set_ops(evlist, NULL, NULL);
-        perf_evlist_poll__foreach_fd(evlist, __delfn);
-    }
-
+    // Subsequent perf_event_handle() calls see the inactive state and return.
     if (dev->pages) {
         // Flush the ringbuffer and submit the remaining perf events.
         // Disabled, final flushes other buffers, such as: multi-trace timeline.
         prof_dev_flush(dev, PROF_DEV_FLUSH_FINAL);
     }
-
-    prof_dev_reap_threads(dev);
 
     prof_dev_put(dev);
 
@@ -3431,8 +3317,6 @@ int main(int argc, char *argv[])
 
     while (running > 0) {
         int fds = event_poll__poll(main_epoll, -1);
-
-        prof_dev_reap_all();
 
         // -ENOENT means there are no file descriptors in event_poll.
         if (fds == -ENOENT)
