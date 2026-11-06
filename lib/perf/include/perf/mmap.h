@@ -19,7 +19,7 @@ LIBPERF_API int perf_mmap__idx(struct perf_mmap *map);
 LIBPERF_API int perf_mmap__cpu(struct perf_mmap *map);
 LIBPERF_API pid_t perf_mmap__tid(struct perf_mmap *map);
 LIBPERF_API bool perf_mmap__oncpu(struct perf_mmap *map);
-/* Pin a mapping while processing records that can remove its last writer. */
+/* Each reference keeps the ring buffer mapped; the last put unmaps and frees it. */
 LIBPERF_API void perf_mmap__get(struct perf_mmap *map);
 LIBPERF_API void perf_mmap__put(struct perf_mmap *map);
 LIBPERF_API void perf_mmap__consume(struct perf_mmap *map);

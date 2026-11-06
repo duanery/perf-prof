@@ -4,6 +4,7 @@
 #include <asm/bug.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 #include <linux/ring_buffer.h>
 #include <linux/perf_event.h>
 #include <perf/mmap.h>
@@ -16,26 +17,22 @@
 #include <linux/zalloc.h>
 #include "internal.h"
 
-void perf_mmap__init(struct perf_mmap *map, struct perf_mmap *prev,
-		     bool overwrite, libperf_unmap_cb_t unmap_cb)
+struct perf_mmap *perf_mmap__new(int cpu, pid_t tid, bool overwrite)
 {
-	map->fd = -1;
-	map->mmap_fd = -1;
-	map->cpu = -1;
-	map->tid = -1;
-	map->overwrite = overwrite;
-	map->unmap_cb  = unmap_cb;
-	INIT_LIST_HEAD(&map->list);
-	INIT_HLIST_NODE(&map->hnode);
-	refcount_set(&map->refcnt, 0);
-	if (prev)
-		prev->next = map;
-}
+	struct perf_mmap *map = zalloc(sizeof(*map));
 
-void perf_mmap__set_bind(struct perf_mmap *map, int cpu, pid_t tid)
-{
+	if (!map)
+		return NULL;
+
 	map->cpu = cpu;
 	map->tid = tid;
+	map->idx = -1;
+	map->overwrite = overwrite;
+	INIT_LIST_HEAD(&map->list);
+	INIT_HLIST_NODE(&map->hnode);
+	INIT_LIST_HEAD(&map->domains);
+	refcount_set(&map->refcnt, 1);
+	return map;
 }
 
 size_t perf_mmap__mmap_len(struct perf_mmap *map)
@@ -43,8 +40,7 @@ size_t perf_mmap__mmap_len(struct perf_mmap *map)
 	return map->mask + 1 + page_size;
 }
 
-int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp,
-		    int fd, int cpu)
+int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp, int fd)
 {
 	map->prev = 0;
 	map->mask = mp->mask;
@@ -54,10 +50,6 @@ int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp,
 		map->base = NULL;
 		return -1;
 	}
-
-	map->fd  = fd;
-	map->mmap_fd = fd;
-	map->cpu = cpu;
 	return 0;
 }
 
@@ -76,21 +68,14 @@ bool perf_mmap__oncpu(struct perf_mmap *map)
 	return map && map->cpu != -1;
 }
 
-void perf_mmap__munmap(struct perf_mmap *map)
+static void perf_mmap__munmap(struct perf_mmap *map)
 {
-	if (!map)
-		return;
-
 	zfree(&map->event_copy);
 	map->event_copy_sz = 0;
 	if (map->base) {
 		munmap(map->base, perf_mmap__mmap_len(map));
 		map->base = NULL;
-		map->fd = -1;
-		refcount_set(&map->refcnt, 0);
 	}
-	if (map->unmap_cb)
-		map->unmap_cb(map);
 }
 
 void perf_mmap__get(struct perf_mmap *map)
@@ -98,12 +83,15 @@ void perf_mmap__get(struct perf_mmap *map)
 	refcount_inc(&map->refcnt);
 }
 
+/* The last reference unmaps and frees the ring buffer; it never touches the evlist. */
 void perf_mmap__put(struct perf_mmap *map)
 {
-	BUG_ON(map->base && refcount_read(&map->refcnt) == 0);
+	BUG_ON(refcount_read(&map->refcnt) == 0);
 
-	if (refcount_dec_and_test(&map->refcnt))
+	if (refcount_dec_and_test(&map->refcnt)) {
 		perf_mmap__munmap(map);
+		free(map);
+	}
 }
 
 int perf_mmap__idx(struct perf_mmap *map)

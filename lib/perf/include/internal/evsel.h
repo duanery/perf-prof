@@ -11,11 +11,13 @@ struct perf_cpu_map;
 struct perf_thread_map;
 struct xyarray;
 struct perf_mmap;
+struct perf_mmap_domain;
 
 struct perf_evsel_fd {
 	int fd;
 	int group_fd;
-	struct perf_mmap *mmap;
+	/* The HUP domain this fd writes into; its ring buffer is domain->map. */
+	struct perf_mmap_domain *domain;
 };
 
 /*
@@ -116,5 +118,6 @@ int perf_evsel__open_one(struct perf_evsel *evsel, int cpu, int thread);
 int perf_evsel__make_threads_private(struct perf_evsel *evsel);
 struct perf_evsel_fd *perf_evsel__fd_entry(struct perf_evsel *evsel, int cpu, int thread);
 int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group);
+void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid);
 
 #endif /* __LIBPERF_INTERNAL_EVSEL_H */

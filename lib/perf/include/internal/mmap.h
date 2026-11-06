@@ -14,14 +14,16 @@
 #define PERF_SAMPLE_MAX_SIZE (1 << 16)
 
 struct perf_mmap;
+struct perf_mmap_domain;
 struct perf_counts_values;
-
-typedef void (*libperf_unmap_cb_t)(struct perf_mmap *map);
 
 /**
  * struct perf_mmap - perf's ring buffer mmap details
  *
- * @refcnt - e.g. code using PERF_EVENT_IOC_SET_OUTPUT to share this
+ * @refcnt - every holder of the ring buffer: each live HUP domain of the
+ *   evlist (see struct perf_mmap_domain), the order heap of perf-prof, and
+ *   the results of perf_evlist__hup(). The last perf_mmap__put() unmaps and
+ *   frees it.
  *
  * @cpu, @tid - the binding of this ring buffer. Exactly one of them is set:
  *   cpu-bound    : cpu >= 0, tid == -1. Every thread of a cpu-bound evsel
@@ -29,12 +31,13 @@ typedef void (*libperf_unmap_cb_t)(struct perf_mmap *map);
  *   thread-bound : cpu == -1, tid >= 0.
  * Together with @overwrite they form the key under which evsels look up an
  * existing ring buffer to share, see perf_evlist__find_mmap().
+ *
+ * The VMA keeps the event it was mapped from alive, so no fd has to stay open
+ * for the mapping: any writer still attached serves as SET_OUTPUT target.
  */
 struct perf_mmap {
 	void			*base;
 	int			 mask;
-	int			 fd;
-	int			 mmap_fd;
 	int			 cpu;
 	pid_t			 tid;
 	int			 idx;
@@ -44,17 +47,23 @@ struct perf_mmap {
 	u64			 end;
 	bool			 overwrite;
 	u64			 flush;
-	libperf_unmap_cb_t	 unmap_cb;
 	struct perf_evlist	*evlist;
 	void			*event_copy;
 	size_t			 event_copy_sz;
-	struct perf_mmap	*next;
-	/* Linked into evlist->mmap_list / mmap_ovw_list, allocated on demand. */
+	/*
+	 * Managed by the evlist. @list links it into evlist->mmap_list /
+	 * mmap_ovw_list, @hnode into the lookup hash. @domains holds the live
+	 * HUP domains; @cpu_domain is the one of the pid=-1 writers, if any.
+	 * @poll_domain holds the fd polled for the data of the ring buffer.
+	 */
 	struct list_head	 list;
 	struct hlist_node	 hnode;
-	bool			 dynamic;
-	/* Every attached fd holds a reference, independently of its poll entry. */
-	int			 nr_fds;
+	struct list_head	 domains;
+	struct perf_mmap_domain	*cpu_domain;
+	struct perf_mmap_domain	*poll_domain;  /* registered for EPOLLIN */
+	bool			 registered;
+	/* The external poll loop has been told about this ring buffer. */
+	bool			 announced;
 };
 
 struct perf_mmap_param {
@@ -62,14 +71,9 @@ struct perf_mmap_param {
 	int	mask;
 };
 
+struct perf_mmap *perf_mmap__new(int cpu, pid_t tid, bool overwrite);
+int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp, int fd);
 size_t perf_mmap__mmap_len(struct perf_mmap *map);
-
-void perf_mmap__init(struct perf_mmap *map, struct perf_mmap *prev,
-		     bool overwrite, libperf_unmap_cb_t unmap_cb);
-void perf_mmap__set_bind(struct perf_mmap *map, int cpu, pid_t tid);
-int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp,
-		    int fd, int cpu);
-void perf_mmap__munmap(struct perf_mmap *map);
 
 u64 perf_mmap__read_head(struct perf_mmap *map);
 bool perf_mmap__empty(struct perf_mmap *map);

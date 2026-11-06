@@ -49,10 +49,14 @@ LIBPERF_API void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_
 LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads);
 /*
  * Add/remove a thread on an already open evsel. The fds are opened/closed and
- * the ring buffer of the thread is created/dropped accordingly.
+ * join/leave the ring buffers of their bindings accordingly.
  *
- * The caller must drain the ring buffer of @pid before removing it: the last
- * reference going away destroys the mapping immediately.
+ * perf_evsel__del_thread() closes the fds right away: a ring buffer left
+ * without any writer is released at once. The caller must have read it
+ * before. For a thread that exits, use perf_evlist__del_thread() instead.
+ *
+ * The fd a ring buffer was mapped from stays alive, disabled, as long as the
+ * mapping: when it is a group leader, its members stay in its group.
  */
 LIBPERF_API int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);

@@ -120,18 +120,16 @@ static int perf_evsel__mmap_one(struct perf_evsel *evsel, int cpu, int thread)
 		.mask = (evsel->mmap_pages * page_size) - 1,
 	};
 	struct perf_mmap **slot = xyarray__entry(evsel->mmap, cpu, thread);
-	struct perf_mmap *map = zalloc(sizeof(*map));
+	struct perf_mmap *map;
 	int fd = *FD(evsel, cpu, thread), err;
 
+	map = perf_mmap__new(perf_cpu_map__cpu(evsel->cpus, cpu),
+			     perf_thread_map__pid(evsel->threads, thread), false);
 	if (!map)
 		return -ENOMEM;
-	perf_mmap__init(map, NULL, false, NULL);
-	perf_mmap__set_bind(map, perf_cpu_map__cpu(evsel->cpus, cpu),
-			   perf_thread_map__pid(evsel->threads, thread));
-	refcount_set(&map->refcnt, 1);
-	err = perf_mmap__mmap(map, &mp, fd, map->cpu);
+	err = perf_mmap__mmap(map, &mp, fd);
 	if (err) {
-		free(map);
+		perf_mmap__put(map);
 		return err;
 	}
 	*slot = map;
@@ -348,7 +346,7 @@ static void perf_evsel__close_one(struct perf_evsel *evsel, int cpu, int thread)
 	/* A mapped VMA can keep the event alive after close(fd). */
 	ioctl(entry->fd, PERF_EVENT_IOC_DISABLE, 0);
 	if (evlist) {
-		perf_evlist__unmap_evsel_fd(evlist, evsel, cpu, thread);
+		perf_evlist__mmap_detach_fd(evlist, evsel, cpu, thread);
 		/* The kernel detaches siblings when their leader is closed. */
 		if (entry->group_fd < 0 && evlist->grouped)
 		perf_evlist__for_each_entry(evlist, pos) {
@@ -363,8 +361,7 @@ static void perf_evsel__close_one(struct perf_evsel *evsel, int cpu, int thread)
 		}
 	}
 	if (MMAP(evsel, cpu, thread)) {
-		perf_mmap__munmap(MMAP(evsel, cpu, thread));
-		free(MMAP(evsel, cpu, thread));
+		perf_mmap__put(MMAP(evsel, cpu, thread));
 		*(struct perf_mmap **)xyarray__entry(evsel->mmap, cpu, thread) = NULL;
 	}
 	close(entry->fd);
@@ -433,11 +430,10 @@ void perf_evsel__munmap(struct perf_evsel *evsel)
 		for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++) {
 			int *fd = FD(evsel, cpu, thread);
 
-			if (fd == NULL || *fd < 0)
+			if (fd == NULL || *fd < 0 || !MMAP(evsel, cpu, thread))
 				continue;
 
-			perf_mmap__munmap(MMAP(evsel, cpu, thread));
-			free(MMAP(evsel, cpu, thread));
+			perf_mmap__put(MMAP(evsel, cpu, thread));
 		}
 	}
 
@@ -892,6 +888,20 @@ int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group)
 	return 0;
 }
 
+void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid)
+{
+	int cpu, thread = perf_thread_map__idx(evsel->threads, pid);
+
+	if (thread < 0 || !evsel->fd)
+		return;
+	for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++) {
+		struct perf_evsel_fd *entry = perf_evsel__fd_entry(evsel, cpu, thread);
+
+		if (entry && entry->fd >= 0)
+			ioctl(entry->fd, PERF_EVENT_IOC_DISABLE, 0);
+	}
+}
+
 int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid)
 {
 	struct perf_thread_map *threads;
@@ -956,7 +966,7 @@ int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid)
 	}
 	if (evsel->evlist && !evsel->evlist->adding_thread) {
 		for (cpu = 0; cpu < nr_cpus; cpu++) {
-			err = perf_evlist__mmap_evsel_fd(evsel->evlist, evsel, cpu, thread);
+			err = perf_evlist__mmap_attach_fd(evsel->evlist, evsel, cpu, thread);
 			if (err < 0)
 				goto out_close;
 		}
@@ -979,7 +989,7 @@ out_close:
 int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid)
 {
 	struct perf_thread_map *threads;
-	int thread, err, cpu;
+	int thread, err;
 
 	if (pid < 0 || !evsel->fd)
 		return -EINVAL;
@@ -996,15 +1006,6 @@ int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid)
 	if (thread < 0)
 		return -ENOENT;
 
-	/* A shared VMA pins its creator; hand it over before closing that event. */
-	if (evsel->evlist) {
-		for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++) {
-			err = perf_evlist__prepare_remove_fd(evsel->evlist,
-						perf_evsel__fd_entry(evsel, cpu, thread));
-			if (err)
-				return err;
-		}
-	}
 	perf_evsel__close_thread(evsel, thread);
 
 	zfree(&threads->map[thread].comm);

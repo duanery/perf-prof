@@ -3,6 +3,7 @@
 #define __LIBPERF_INTERNAL_EVLIST_H
 
 #include <linux/list.h>
+#include <perf/evlist.h>
 #include <internal/evsel.h>
 #include <sys/epoll.h>
 
@@ -12,20 +13,64 @@
 #define PERF_EVLIST__MMAP_HLIST_BITS 6
 #define PERF_EVLIST__MMAP_HLIST_SIZE (1 << PERF_EVLIST__MMAP_HLIST_BITS)
 
+#define PERF_EVLIST__THREAD_HLIST_BITS 8
+#define PERF_EVLIST__THREAD_HLIST_SIZE (1 << PERF_EVLIST__THREAD_HLIST_BITS)
+
+#define PERF_EVLIST__POLL_HLIST_BITS 8
+#define PERF_EVLIST__POLL_HLIST_SIZE (1 << PERF_EVLIST__POLL_HLIST_BITS)
+
 struct perf_cpu_map;
 struct perf_thread_map;
 struct perf_mmap_param;
 
 struct perf_mmap;
+struct perf_evlist_thread;
 
 /*
- * @add/@del let the owner of an external poll loop track fds that appear or go
- * away after perf_evlist__mmap(), i.e. when threads are added or removed.
+ * The writers of one ring buffer that go away together: all pid=-1 (and
+ * cgroup) writers form the cpu domain, which never sees EPOLLHUP; the writers
+ * bound to one task form a task domain, which sees EPOLLHUP on every one of
+ * its fds once that task exits.
+ *
+ * At most one fd per domain is registered with epoll, for one of two roles:
+ * the data fd of the ring buffer (EPOLLIN; a write wakes up every event
+ * attached to it) and the hup fd of the thread (EPOLLHUP; every event of an
+ * exited task enters EXIT state). See perf_evlist_poll__pick_data().
+ *
+ * A live domain holds a reference on its ring buffer. EPOLLHUP marks the task
+ * domain dead and drops it; the fds stay open until perf_evlist__del_thread()
+ * or the evsel closes them, and the domain is freed with the last one.
  */
-typedef int (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
-				      struct perf_mmap *map);
-typedef void (*perf_evlist_poll_del_t)(void *external, int fd,
-				       struct perf_mmap *map);
+struct perf_mmap_domain {
+	struct perf_mmap	*map;          /* NULL once dead */
+	pid_t			 tid;          /* -1: cpu domain */
+	bool			 dead;
+	int			 nr_fds;
+	int			 nr_alloc;
+	struct perf_mmap_domain_fd {
+		int		 fd;
+		bool		 poll;         /* may be registered with epoll */
+	} *fds;
+	int			 poll_fd;      /* registered fd, -1 if none */
+	unsigned		 poll_events;
+	struct perf_evlist_thread *thread;     /* task domain only */
+	struct list_head	 map_node;     /* map->domains, while live */
+	struct list_head	 thread_node;  /* thread->domains */
+	struct hlist_node	 poll_node;    /* epoll.heads[], by poll_fd */
+};
+
+/*
+ * Exit state of one thread: EPOLLHUP (@hup) and perf_evlist__del_thread()
+ * (@del) may arrive in either order. The fds are closed by the second one.
+ */
+struct perf_evlist_thread {
+	pid_t			 tid;
+	bool			 hup;
+	bool			 del;
+	struct perf_mmap_domain	*hup_domain;   /* registered for its EPOLLHUP */
+	struct list_head	 domains;
+	struct hlist_node	 node;
+};
 
 struct perf_evlist_poll {
 	int epfd;
@@ -34,14 +79,8 @@ struct perf_evlist_poll {
 	void *external;
 	perf_evlist_poll_add_t add;
 	perf_evlist_poll_del_t del;
-	int nr;		/* high water mark of used slots */
-	int nr_live;	/* slots currently holding an fd */
-	int nr_alloc;
-	struct perf_evlist_poll_data {
-		int fd;
-		unsigned events;
-		struct perf_mmap *mmap;
-	} *data;
+	int nr_live;	/* registered fds */
+	struct hlist_head heads[PERF_EVLIST__POLL_HLIST_SIZE];
 };
 
 struct perf_evlist {
@@ -71,39 +110,29 @@ struct perf_evlist {
 	struct list_head	 mmap_list;
 	struct list_head	 mmap_ovw_list;
 	struct hlist_head	 mmap_heads[PERF_EVLIST__MMAP_HLIST_SIZE];
-	int			 next_mmap_idx;
+	struct hlist_head	 thread_heads[PERF_EVLIST__THREAD_HLIST_SIZE];
 	bool			 mmaped;
+	/* perf_evlist__munmap() in progress: poll fds are not registered again. */
+	bool			 munmapping;
 	bool			 grouped;
 	bool			 adding_thread;
 };
 
 void perf_evlist_poll__init(struct perf_evlist *evlist);
-int perf_evlist_poll__alloc(struct perf_evlist *evlist);
-void perf_evlist_poll__free(struct perf_evlist *evlist);
-int perf_evlist_poll__add(struct perf_evlist *evlist, int fd,
-			  struct perf_mmap *mmap, unsigned revent);
-int perf_evlist_poll__del(struct perf_evlist *evlist, int n);
-int perf_evlist_poll__del_fd(struct perf_evlist *evlist, int fd);
-void perf_evlist_poll__set_ops(struct perf_evlist *evlist,
-			       perf_evlist_poll_add_t add,
-			       perf_evlist_poll_del_t del);
-
-
 void perf_evlist__init(struct perf_evlist *evlist);
 void perf_evlist__exit(struct perf_evlist *evlist);
 
 /*
- * Attach one already open fd of @evsel to the ring buffer of its binding,
- * creating the ring buffer if this is the first fd to use it. Used both by
- * perf_evlist__mmap() and by the dynamic thread path.
+ * Attach one open fd of @evsel to the ring buffer of its binding, creating the
+ * ring buffer if this is the first fd to use it; detach it again before the fd
+ * is closed. Used by perf_evlist__mmap() and by the dynamic thread path.
  */
-int perf_evlist__mmap_evsel_fd(struct perf_evlist *evlist,
-			       struct perf_evsel *evsel,
-			       int cpu, int thread);
-void perf_evlist__unmap_evsel_fd(struct perf_evlist *evlist,
+int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
+				struct perf_evsel *evsel,
+				int cpu, int thread);
+void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
 				 struct perf_evsel *evsel,
 				 int cpu, int thread);
-int perf_evlist__prepare_remove_fd(struct perf_evlist *evlist, struct perf_evsel_fd *entry);
 
 /**
  * __perf_evlist__for_each_entry - iterate thru all the evsels
