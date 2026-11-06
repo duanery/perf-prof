@@ -119,6 +119,8 @@ def test_multi_trace_softirq_timer_detail_only_than(runtime, memleak_check):
         result_check(std, line, runtime, memleak_check)
 
 def test_multi_trace_softirq_timer_detail_tsc(runtime, memleak_check):
+    if not PerfProf.tsc_clocksource():
+        pytest.skip("--tsc needs the tsc clocksource")
     multi_trace = PerfProf(["multi-trace",
                             '-e', 'irq:softirq_entry/vec==1/',
                             '-e', 'irq:softirq_exit/vec==1/',

@@ -335,6 +335,15 @@ class PerfProf(object):
         return os.path.exists(pmu_path)
 
     @staticmethod
+    def tsc_clocksource():
+        """--tsc needs the tsc clocksource; VMs usually run on kvm-clock."""
+        try:
+            with open("/sys/devices/system/clocksource/clocksource0/current_clocksource") as f:
+                return f.read().strip() == "tsc"
+        except OSError:
+            return False
+
+    @staticmethod
     def standalone_python():
         """Return the path to standalone python3 binary, or None if not standalone."""
         perf_prof = PerfProf(['python', '-h'])

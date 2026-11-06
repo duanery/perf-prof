@@ -19,6 +19,8 @@ def test_sched_wakeup_watermark(runtime, memleak_check):
         result_check(std, line, runtime, memleak_check)
 
 def test_sched_wakeup_tsc(runtime, memleak_check):
+    if not PerfProf.tsc_clocksource():
+        pytest.skip("--tsc needs the tsc clocksource")
     #perf-prof trace -e sched:sched_wakeup -C 0
     prof = PerfProf(['trace', '-e', 'sched:sched_wakeup', '-C', '0', '-m', '64', '--tsc', '-N', '20'])
     for std, line in prof.run(runtime, memleak_check):
@@ -147,6 +149,8 @@ def test_kprobe1(runtime, memleak_check):
         result_check(std, line, runtime, memleak_check)
 
 def test_kprobe_tsc(runtime, memleak_check):
+    if not PerfProf.tsc_clocksource():
+        pytest.skip("--tsc needs the tsc clocksource")
     exist = PerfProf.pmu_exists('kprobe')
     if not exist:
         pytest.skip("'kprobe' does not exist")
