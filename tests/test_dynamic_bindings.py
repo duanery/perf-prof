@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from PerfProf import PerfProf
 from conftest import result_check
+import os
 import re
 
 
@@ -63,3 +64,29 @@ def test_task_state_forward_filter(runtime, memleak_check):
     assert switches
     assert all(prev in tids or next_tid in tids for prev, next_tid in switches)
     assert all(tid in tids for tid in wakeups)
+
+
+def _count_prctl(args, runtime, memleak_check, nr_workers):
+    workers = set()
+    counts = {}
+    for std, line in PerfProf(args).run(max(runtime, 10), memleak_check):
+        result_check(std, line, runtime, memleak_check)
+        if line.startswith('WORKER '):
+            workers.add(int(line.split()[1]))
+        match = re.search(r'\s(\d+)\s+.*\[\d+\].*syscalls:sys_enter_prctl:', line)
+        if match:
+            tid = int(match.group(1))
+            counts[tid] = counts.get(tid, 0) + 1
+    assert len(workers) == nr_workers
+    for tid in workers:
+        assert counts.get(tid) == 4
+
+
+def test_ptrace_cpu_ring_task_writers(runtime, memleak_check):
+    # cpus= binds the event to cpus while --ptrace binds it to each thread:
+    # every cpu ring has only task-bound writers, one HUP domain per thread.
+    # Each exiting thread must hand the rings over and the last one end them.
+    _count_prctl(['trace', '-e', 'syscalls:sys_enter_prctl//cpus=0-%d/' % (os.cpu_count() - 1),
+                  '--ptrace', '--order', '-m', '64', '--', './binding-workload', '24'],
+                 runtime, memleak_check, 24)
+
