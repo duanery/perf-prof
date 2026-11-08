@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <linux/perf_event.h>
@@ -142,6 +143,13 @@ static int test_stat_user_read(int event)
 	__T("failed to create evsel", evsel);
 
 	err = perf_evsel__open(evsel, NULL, threads);
+	/* No hardware PMU, e.g. in a VM. */
+	if (err == -ENOENT || err == -EOPNOTSUPP) {
+		fprintf(stdout, " no hardware counter, skipped...");
+		perf_evsel__delete(evsel);
+		perf_thread_map__put(threads);
+		return 0;
+	}
 	__T("failed to open evsel", err == 0);
 
 	err = perf_evsel__mmap(evsel, 0);
