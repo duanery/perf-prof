@@ -446,11 +446,12 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  *   writer fds            - attach/detach one fd of an evsel
  *   reap                  - hand the ring buffers of removed writers over
  *   thread exit           - perf_evlist__hup() / perf_evlist__del_thread()
+ *   cpu add / remove      - perf_evlist__add_cpu() / perf_evlist__del_cpu()
  *   mmap / munmap / poll  - the public entry points
  *
- * A ring buffer loses its last writer only through EPOLLHUP of a task domain,
- * or when its fds are closed outright (perf_evsel__del_thread(), munmap,
- * close).
+ * A ring buffer loses its last writer only through a reap - EPOLLHUP of a task
+ * domain, perf_evlist__del_cpu() - or when its fds are closed outright
+ * (perf_evsel__del_thread()/del_cpu(), munmap, close).
  */
 
 /* Ring buffer registry. */
@@ -1116,6 +1117,7 @@ static void perf_evlist__reap_init(struct perf_evlist_reap *reap)
 	memset(reap, 0, sizeof(*reap));
 	reap->type = PERF_EVLIST_REAP__NONE;
 	reap->tid = -1;
+	reap->cpu = -1;
 }
 
 static int perf_evlist__reap_alloc(struct perf_evlist_reap *reap, int nr)
@@ -1132,6 +1134,23 @@ static void perf_evlist__reap_domain(struct perf_evlist *evlist,
 	struct perf_evlist_reap_map *m = &reap->maps[reap->nr_maps++];
 
 	m->retired = perf_evlist__mmap_domain_put(evlist, dom, &m->map);
+}
+
+/*
+ * Take every domain of @map down at once: none of them is picked for a poll
+ * role on the way. The last one unregisters @map; the caller holds a
+ * reference.
+ */
+static void perf_evlist__mmap_retire(struct perf_evlist *evlist, struct perf_mmap *map)
+{
+	struct perf_mmap_domain *dom, *tmp;
+
+	list_for_each_entry(dom, &map->domain_list, map_node) {
+		perf_evlist_poll__del(evlist, dom);
+		dom->dead = true;
+	}
+	list_for_each_entry_safe(dom, tmp, &map->domain_list, map_node)
+		perf_evlist__mmap_domain_put(evlist, dom, NULL);
 }
 
 /*
@@ -1195,7 +1214,7 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	added = perf_evlist__open_order(evlist);
 	if (!added)
 		return -ENOMEM;
-	evlist->adding_thread = true;
+	evlist->adding = true;
 
 	for (i = 0; i < evlist->nr_entries; i++) {
 		evsel = added[i];
@@ -1233,13 +1252,13 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 		if (err)
 			goto out_del;
 	}
-	evlist->adding_thread = false;
+	evlist->adding = false;
 	free(added);
 
 	return 0;
 
 out_del:
-	evlist->adding_thread = false;
+	evlist->adding = false;
 	while (nr)
 		perf_evsel__del_thread(added[--nr], pid);
 	th = perf_evlist__thread_find(evlist, pid);
@@ -1323,6 +1342,216 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap
 	return 0;
 }
 
+/*
+ * Cpu add / remove.
+ *
+ * Only evsels following the evlist cpu map are driven from here, as threads
+ * are in perf_evlist__add_thread().
+ */
+
+static bool perf_evlist__cpu_evsel(struct perf_evsel *evsel)
+{
+	return !evsel->own_cpus && !evsel->system_wide && evsel->opened &&
+	       !evsel->any_cpu;
+}
+
+/* The record of @cpu on an evsel driven from here, NULL if none. */
+static struct perf_evsel_cpu *perf_evlist__cpu_rec(struct perf_evsel *evsel, int cpu)
+{
+	return perf_evlist__cpu_evsel(evsel) ? perf_evsel__cpu_find(evsel, cpu) : NULL;
+}
+
+/*
+ * Order matters as for a thread, see perf_evlist__add_thread(): open in
+ * perf_evlist__open_order(), let the watermark evsels create the ring buffers,
+ * enable once every fd is open.
+ */
+int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu)
+{
+	struct perf_evsel_cpu *c;
+	struct perf_evsel_fd *entry;
+	struct perf_evsel *evsel;
+	struct perf_evsel **added;
+	int err = 0, nr = 0, pass, i;
+
+	if (cpu < 0)
+		return -EINVAL;
+
+	perf_evlist__for_each_entry(evlist, evsel) {
+		c = perf_evlist__cpu_rec(evsel, cpu);
+		if (c && c->del)
+			return -EBUSY;
+	}
+
+	/* In open order; the evsels taking the cpu are compacted to the front. */
+	added = perf_evlist__open_order(evlist);
+	if (!added)
+		return -ENOMEM;
+	evlist->adding = true;
+
+	for (i = 0; i < evlist->nr_entries; i++) {
+		evsel = added[i];
+		if (!perf_evlist__cpu_evsel(evsel) || perf_evsel__has_cpu(evsel, cpu))
+			continue;
+
+		err = perf_evsel__add_cpu(evsel, cpu);
+		if (err < 0)
+			goto out_del;
+		added[nr++] = evsel;
+	}
+	/* Watermark evsels create the ring buffers, see perf_evlist__mmap(). */
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < nr; i++) {
+			evsel = added[i];
+			if (!!evsel->attr.watermark != !pass)
+				continue;
+			c = perf_evsel__cpu_find(evsel, cpu);
+			list_for_each_entry(entry, &c->fd_list, cpu_node) {
+				err = perf_evlist__mmap_attach_fd(evlist, entry);
+				if (err)
+					goto out_del;
+			}
+		}
+	}
+	/* Open group members before enabling any of the new leaders. */
+	for (i = 0; i < nr; i++) {
+		err = perf_evsel__enable_new_cpu(added[i], cpu, true);
+		if (err)
+			goto out_del;
+	}
+	evlist->adding = false;
+	free(added);
+
+	return 0;
+
+out_del:
+	evlist->adding = false;
+	while (nr)
+		perf_evsel__del_cpu(added[--nr], cpu);
+	free(added);
+	return err;
+}
+
+/*
+ * Reap the ring buffer @map of a cpu being removed, if the stopped fds write
+ * into it. When they are its only writers it is retired: gone from the evlist
+ * at once, as on EPOLLHUP. Otherwise other evsels keep writing into it (own
+ * cpus, system wide), it is only handed over to be read; the stopped fds
+ * leave it when perf_evlist__reap_done() closes them.
+ *
+ * Writers of dead domains (exited threads) no longer count, either way.
+ */
+static void perf_evlist__cpu_reap_mmap(struct perf_evlist *evlist, struct perf_mmap *map,
+				       struct perf_evlist_reap *reap)
+{
+	struct perf_evlist_reap_map *m;
+	struct perf_mmap_domain *dom;
+	struct perf_evsel_fd *entry;
+	struct perf_evsel *evsel;
+	struct perf_evsel_cpu *c;
+	int writers = 0, stopped = 0;
+
+	list_for_each_entry(dom, &map->domain_list, map_node)
+		writers += dom->nr_fds;
+	perf_evlist__for_each_entry(evlist, evsel) {
+		c = perf_evlist__cpu_rec(evsel, map->cpu);
+		if (!c || !c->del)
+			continue;
+		list_for_each_entry(entry, &c->fd_list, cpu_node)
+			if (entry->domain && entry->domain->map == map)
+				stopped++;
+	}
+	if (!stopped)
+		return;
+
+	perf_mmap__get(map);
+	m = &reap->maps[reap->nr_maps++];
+	m->map = map;
+	m->retired = stopped == writers;
+	if (m->retired)
+		perf_evlist__mmap_retire(evlist, map);
+}
+
+/*
+ * Kernel constraint: PERF_EVENT_IOC_DISABLE of a cpu bound event runs on its
+ * cpu (event_function_call()) and returns once the event is scheduled out:
+ * it writes nothing afterwards. A cpu gone offline has its events off
+ * already.
+ *
+ * The fds of @cpu write into the ring buffers of @cpu only, one per overwrite
+ * mode, see perf_evlist__mmap_attach_fd().
+ */
+int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu, struct perf_evlist_reap *reap)
+{
+	struct perf_evsel *evsel;
+	struct perf_evsel_cpu *c;
+	struct perf_mmap *map;
+	int nr = 0, err;
+
+	perf_evlist__reap_init(reap);
+	if (cpu < 0)
+		return -EINVAL;
+
+	perf_evlist__for_each_entry(evlist, evsel) {
+		c = perf_evlist__cpu_rec(evsel, cpu);
+		if (!c)
+			continue;
+		if (c->del)
+			return -EBUSY;
+		nr++;
+	}
+	if (!nr)
+		return -ENOENT;
+	err = perf_evlist__reap_alloc(reap, 2);
+	if (err)
+		return err;
+
+	/* Stop. */
+	perf_evlist__for_each_entry(evlist, evsel) {
+		c = perf_evlist__cpu_rec(evsel, cpu);
+		if (!c)
+			continue;
+		c->del = true;
+		perf_evsel__disable_cpu(evsel, cpu);
+	}
+	/* Reap. */
+	map = perf_evlist__find_mmap(evlist, cpu, -1, false);
+	if (map)
+		perf_evlist__cpu_reap_mmap(evlist, map, reap);
+	map = perf_evlist__find_mmap(evlist, cpu, -1, true);
+	if (map)
+		perf_evlist__cpu_reap_mmap(evlist, map, reap);
+
+	reap->type = PERF_EVLIST_REAP__CPU;
+	reap->cpu = cpu;
+	reap->complete = true;
+	return 0;
+}
+
+/* Close the stopped fds of @cpu, in the reverse open order. */
+static void perf_evlist__cpu_close(struct perf_evlist *evlist, int cpu)
+{
+	struct perf_evsel *evsel, **order = perf_evlist__open_order(evlist);
+	struct perf_evsel_cpu *c;
+	int i;
+
+	if (order) {
+		for (i = evlist->nr_entries - 1; i >= 0; i--) {
+			evsel = order[i];
+			c = perf_evlist__cpu_rec(evsel, cpu);
+			if (c && c->del)
+				perf_evsel__del_cpu(evsel, cpu);
+		}
+		free(order);
+	} else {
+		perf_evlist__for_each_entry_reverse(evlist, evsel) {
+			c = perf_evlist__cpu_rec(evsel, cpu);
+			if (c && c->del)
+				perf_evsel__del_cpu(evsel, cpu);
+		}
+	}
+}
+
 void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
 {
 	struct perf_evlist_thread *th;
@@ -1340,6 +1569,9 @@ void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap 
 		th = perf_evlist__thread_find(evlist, reap->tid);
 		if (th && th->hup && th->del)
 			perf_evlist__thread_close(evlist, reap->tid);
+		break;
+	case PERF_EVLIST_REAP__CPU:
+		perf_evlist__cpu_close(evlist, reap->cpu);
 		break;
 	case PERF_EVLIST_REAP__NONE:
 	default:

@@ -124,7 +124,8 @@ struct perf_evlist {
 	/* perf_evlist__munmap() in progress: poll fds are not registered again. */
 	bool			 munmapping;
 	bool			 grouped;
-	bool			 adding_thread;
+	/* perf_evlist__add_thread()/add_cpu(): it attaches and enables the new fds. */
+	bool			 adding;
 };
 
 void perf_evlist_poll__init(struct perf_evlist *evlist);

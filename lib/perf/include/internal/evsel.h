@@ -29,13 +29,17 @@ struct perf_sample_id {
 
 /*
  * One cpu of an evsel, -1 for a dummy cpu map. Referenced by each of its fds,
- * and by the evsel from perf_evsel__open() to perf_evsel__close(): the cpu
- * stays while it has no fd, threads added later open on every cpu. Freed with
- * the last reference.
+ * and by the evsel from perf_evsel__open() or perf_evsel__add_cpu() until
+ * perf_evsel__del_cpu() or perf_evsel__close(): the cpu stays while it has no
+ * fd, threads added later open on every cpu. Freed with the last reference.
+ *
+ * @del: perf_evlist__del_cpu() stopped its fds, perf_evlist__reap_done()
+ * closes them.
  */
 struct perf_evsel_cpu {
 	int			 cpu;
 	int			 refcnt;
+	bool			 del;
 	struct list_head	 node;     /* perf_evsel::cpu_list */
 	struct hlist_node	 hnode;    /* perf_evsel::cpu_heads */
 	struct list_head	 fd_list;  /* perf_evsel_fd::cpu_node */
@@ -44,8 +48,10 @@ struct perf_evsel_cpu {
 /*
  * One thread of an evsel: @tid is the pid argument of perf_event_open(), -1
  * for any thread; for a cgroup the cgroup fd, with @cgroup set. Referenced by
- * each of its fds, and by the caller while it opens them; freed with the last
- * reference.
+ * each of its fds, and by the evsel from perf_evsel__open() or
+ * perf_evsel__add_thread() until perf_evsel__del_thread() or
+ * perf_evsel__close(): the thread stays while it has no fd, cpus added later
+ * open for every thread. Freed with the last reference.
  */
 struct perf_evsel_thread {
 	pid_t			 tid;
@@ -102,7 +108,7 @@ struct perf_evsel {
 	 * thread) value of them, and neither changes once the evsel is open;
 	 * they are handed back by perf_evsel__cpus()/perf_evsel__threads().
 	 * After the open the evsel only works on its own records, which also
-	 * hold the threads added and removed one by one later.
+	 * hold the cpus and threads added and removed one by one later.
 	 */
 	struct perf_cpu_map	*cpus;
 	struct perf_cpu_map	*own_cpus;
@@ -116,12 +122,17 @@ struct perf_evsel {
 	int			 nr_fds;
 	/* Opened for any thread (pid == -1): no thread can be added. */
 	bool			 any_thread;
+	/* Opened on any cpu (cpu == -1): no cpu can be added. */
+	bool			 any_cpu;
 	/* The rank for grouping, see perf_evsel__rank_cmp(). */
 	int			 rank_cpus;
 	int			 rank_threads;
 	/* Threads were added or removed: @threads no longer lists the fds. */
 	bool			 threads_changed;
 	struct perf_thread_map	*threads_snap;
+	/* Cpus were added or removed: @cpus no longer lists the fds. */
+	bool			 cpus_changed;
+	struct perf_cpu_map	*cpus_snap;
 	struct perf_evsel	*leader;
 	void			*external;
 	bool			 keep_disable;
@@ -171,10 +182,13 @@ struct perf_evsel_thread *perf_evsel__thread_find(struct perf_evsel *evsel,
 /* Any fd at (@cpu, @tid), the cgroup flag aside. */
 struct perf_evsel_fd *perf_evsel__fd_find(struct perf_evsel *evsel, int cpu, pid_t tid);
 bool perf_evsel__has_thread(struct perf_evsel *evsel, pid_t pid);
+bool perf_evsel__has_cpu(struct perf_evsel *evsel, int cpu);
 void perf_evsel__set_rank(struct perf_evsel *evsel, struct perf_cpu_map *cpus,
 			  struct perf_thread_map *threads);
 int perf_evsel__rank_cmp(struct perf_evsel *a, struct perf_evsel *b);
 int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group);
 void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid);
+int perf_evsel__enable_new_cpu(struct perf_evsel *evsel, int cpu, bool group);
+struct perf_evsel_cpu *perf_evsel__cpu_find(struct perf_evsel *evsel, int cpu);
 
 #endif /* __LIBPERF_INTERNAL_EVSEL_H */

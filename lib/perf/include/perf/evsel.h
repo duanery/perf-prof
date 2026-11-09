@@ -49,19 +49,33 @@ LIBPERF_API int perf_evsel__set_bpf(struct perf_evsel *evsel, unsigned int prog_
 LIBPERF_API void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_cpu_map *own_cpus);
 LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads);
 /*
- * Add/remove a thread on an already open evsel. The fds are opened/closed and
- * join/leave the ring buffers of their bindings accordingly.
+ * Add/remove a thread or a cpu on an already open evsel. The fds are
+ * opened/closed and join/leave the ring buffers of their bindings accordingly.
+ * The maps the evsel was opened with do not change: perf_evsel__cpus() and
+ * perf_evsel__threads() follow the adds and removes.
  *
- * perf_evsel__del_thread() closes the fds right away: a ring buffer left
- * without any writer is released at once. The caller must have read it
- * before. For a thread that exits, use perf_evlist__del_thread() instead.
+ * A thread opens on every cpu of the evsel, a cpu for every thread. Neither
+ * can be added to an evsel opened for any thread (pid == -1), resp. on any cpu
+ * (cpu == -1): -EINVAL.
+ *
+ * perf_evsel__del_thread()/del_cpu() close the fds right away: a ring buffer
+ * left without any writer is released at once. The caller must have read it
+ * before. For a thread that exits, use perf_evlist__del_thread(); to remove a
+ * cpu from an evlist, perf_evlist__del_cpu().
  *
  * The fd a ring buffer was mapped from stays alive, disabled, as long as the
  * mapping: when it is a group leader, its members stay in its group.
  */
 LIBPERF_API int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);
+LIBPERF_API int perf_evsel__add_cpu(struct perf_evsel *evsel, int cpu);
+LIBPERF_API int perf_evsel__del_cpu(struct perf_evsel *evsel, int cpu);
 LIBPERF_API bool perf_evsel__is_group_leader(struct perf_evsel *evsel, int cpu, pid_t tid);
+/*
+ * The cpus the evsel has fds for. Until a cpu is added or removed this is the
+ * cpu map it was opened with; after that a snapshot in ascending order, valid
+ * until the next change.
+ */
 LIBPERF_API struct perf_cpu_map *perf_evsel__cpus(struct perf_evsel *evsel);
 /*
  * The threads the evsel has fds for. Until a thread is added or removed this
