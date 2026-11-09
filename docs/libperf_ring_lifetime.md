@@ -139,7 +139,7 @@ ring 与域，规则相同，下文省略。
 （挂在各个 cpu ring 上）和一个 (-1,t) 域（挂在自己的 thread ring 上）。
 
 **线程（`struct perf_evlist_thread`）**：只有线程退出才会 HUP，所以 t ≥ 0 的域再关联到线程 t 上，
-`th->domains` 串起线程 t 的所有 (c,t) 与 (-1,t) 域。线程退出时这些域同时离开各自的 ring。
+`th->domain_list` 串起线程 t 的所有 (c,t) 与 (-1,t) 域。线程退出时这些域同时离开各自的 ring。
 
 **监听 fd**：注册进 epoll 的 fd。它不是另一个空间，而是在上面三层之上的两次选择，结果落回域里：
 
@@ -194,7 +194,7 @@ ring 的共享与生命周期。
 **域再挂到线程上：因为 HUP 和 ptrace 都以线程为单位。**
 
 - 一个线程的域分布在多个 ring 上（各 cpu ring 的 (c,t)、自己的 (-1,t)），但 K7 让它们在同一时刻
-  失效：收到其中任何一个 fd 的 HUP，就知道全部失效。`th->domains` 让一次 HUP 处理线程的所有域，
+  失效：收到其中任何一个 fd 的 HUP，就知道全部失效。`th->domain_list` 让一次 HUP 处理线程的所有域，
   而不必等每个 ring 各自 HUP。
 - ptrace 报告的也是"线程 t 退出"。两个信号的状态机（7.2）因此放在线程记录上。
 
@@ -226,14 +226,14 @@ ring 的共享与生命周期。
 | 关联 | 正向 | 反向 |
 |---|---|---|
 | fd ↔ 域 | `entry->domain` | `dom->fds[]` |
-| 域 ↔ ring | `dom->map`（每个存活域持有 ring 的一个引用） | `map->domains`、`map->cpu_domain` |
-| 域 ↔ 线程（t ≥ 0） | `dom->thread` | `th->domains` |
+| 域 ↔ ring | `dom->map`（每个存活域持有 ring 的一个引用） | `map->domain_list`、`map->cpu_domain` |
+| 域 ↔ 线程（t ≥ 0） | `dom->thread` | `th->domain_list` |
 | 数据角色（ring → 域） | `map->poll_domain` | 域上的 `dom->poll_fd` |
 | HUP 角色（线程 → 域） | `th->hup_domain` | 同上 |
-| 监听 fd（域 → fd → epoll） | `dom->poll_fd`、`dom->poll_events`，epoll.heads[] 按 fd 反查域 | `perf_evlist_poll__find(evlist, fd)` |
+| 监听 fd（域 → fd → epoll） | `dom->poll_fd`、`dom->poll_events`，`epoll.poll_fd_heads[]` 按 fd 反查域 | `perf_evlist_poll__find(evlist, fd)` |
 | ring 登记 | evlist 查找哈希 `mmap_heads[]` + 遍历链表 `mmap_list` / `mmap_ovw_list` | |
-| 线程登记 | evlist `thread_heads[]` | |
-| fd ↔ evsel | thread map 槽位、sample id（id 哈希、`evsel->id[]`）、group_fd | |
+| 线程登记 | evlist `thread_heads[]`（`struct perf_evlist_thread`） | |
+| fd ↔ evsel | `evsel->fd_heads[]` 哈希（按 (c,t) 值）；按 cpu 挂在 `struct perf_evsel_cpu` 的 `fd_list`、按线程挂在 `struct perf_evsel_thread` 的 `fd_list`；内嵌的 sample id（挂 evlist `id_heads[]`）；`entry->leader` | `perf_evsel__fd_find(evsel, c, t)` |
 
 ### 3.4 抽象与源码的对应
 
@@ -241,7 +241,7 @@ ring 的共享与生命周期。
 
 | 抽象 | 源码 |
 |---|---|
-| fd (event,c,t) | `perf_evsel__fd_entry(evsel, cpu, thread)` 返回的 `struct perf_evsel_fd`。注意 `cpu` / `thread` 是 map 下标，c、t 是值：c = `perf_cpu_map__cpu(evsel->cpus, cpu)`，t = `perf_thread_map__pid(evsel->threads, thread)` |
+| fd (event,c,t) | `struct perf_evsel_fd`：event = `entry->evsel`，c = `entry->cpu`，t = `entry->tid`（cgroup fd 时为 cgroup fd，`entry->cgroup` 置位），按值用 `perf_evsel__fd_find(evsel, c, t)` 查到 |
 | ring (c,-1) / (-1,t) | `struct perf_mmap`，键 `map->cpu` / `map->tid` / `map->overwrite`；`perf_mmap__oncpu()` 区分两类 |
 | 域 (c,t) | `struct perf_mmap_domain`：c = `dom->map->cpu`（thread ring 为 -1），t = `dom->tid` |
 | cpu 域 (-1) | `map->cpu_domain`，`dom->tid == -1`，`dom->thread == NULL` |
@@ -254,9 +254,9 @@ ring 的共享与生命周期。
 
 | 抽象步骤 | 源码 |
 |---|---|
-| c 分量 → ring 键 | `perf_evsel__mmap_bind()` 得到 `(bind_cpu, bind_tid)`：oncpu evsel 为 (c,-1)，否则 (-1,t) |
+| c 分量 → ring 键 | `(bind_cpu, bind_tid)`：c ≥ 0 为 (c,-1)，c = -1 为 (-1,t) |
 | 找到 / 创建 ring | `perf_evlist__find_mmap()` → `SET_OUTPUT` 到 `perf_evlist__mmap_output_fd()`；或 `perf_evlist__mmap_create()` + `perf_evlist__mmap_register()` |
-| t 分量 → 域 | `tid = (pid < 0 \|\| cgroup) ? -1 : pid`，`perf_evlist__mmap_domain_get(evlist, map, tid)`；t ≥ 0 时经 `perf_evlist__thread_get()` 挂到线程 |
+| t 分量 → 域 | `tid = (entry->tid < 0 \|\| entry->cgroup) ? -1 : entry->tid`，`perf_evlist__mmap_domain_get(evlist, map, tid)`；t ≥ 0 时经 `perf_evlist__thread_get()` 挂到线程 |
 | event 分量 → fd 入域 | `perf_mmap_domain__add_fd()`，`entry->domain = dom` |
 | 选择角色 | `perf_evlist_poll__update()` → `perf_evlist_poll__pick_data()` / `perf_evlist_poll__pick_hup()` → `perf_evlist_poll__sync()` → `perf_evlist_poll__add()` / `perf_evlist_poll__del()` |
 
@@ -413,8 +413,8 @@ void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 
 ### 7.1 增加
 
-`perf_evlist__add_thread(evlist, tid)`：对每个跟随 evlist 线程表的 evsel 打开 fd（group leader
-在前），按 watermark 优先的两轮 attach（第 4 节），最后统一 enable。若同一 tid 还有一个尚未完成
+`perf_evlist__add_thread(evlist, tid)`：对每个跟随 evlist 线程表的 evsel 打开 fd（按
+`perf_evlist__open_order()`，group leader 在前），按 watermark 优先的两轮 attach（第 4 节），最后统一 enable。若同一 tid 还有一个尚未完成
 退出的旧线程（tid 复用），先把旧线程彻底关闭（7.4）。
 
 ### 7.2 退出：两个信号
@@ -445,12 +445,12 @@ HUP 解除"域 ↔ ring"一侧的关联（7.3），关闭 fd 解除"fd ↔ 域 �
 1. 置 `th->hup`，此后不为 t 重选 HUP 角色；
 2. 对每个存活域：
    - 注销 `dom->poll_fd`，从 `map->poll_domain` / `th->hup_domain` 中清除；
-   - 从 `map->domains` 摘下，域标记为 dead；它的 ring 引用不释放，转入 `hup->maps[]`；
+   - 从 `map->domain_list` 摘下，域标记为 dead；它的 ring 引用不释放，转入 `hup->maps[]`；
    - ring 上没有域了 → ring 从 evlist 登记表摘除（retired）。(-1,t) 一定 retired；(c,-1) 只在没有
      其他线程的域、也没有 cpu 域时 retired；
    - 否则为该 ring 重选数据角色。
 
-**保留**：`dom->fds[]` / `entry->domain`（fd 未关闭）、`th->domains`（死亡的域仍挂在线程上）、
+**保留**：`dom->fds[]` / `entry->domain`（fd 未关闭）、`th->domain_list`（死亡的域仍挂在线程上）、
 sample id（收割事件时仍要映射回 evsel）、thread map 槽位。
 
 `perf_evlist__hup()` 的结果：
@@ -479,11 +479,12 @@ munmap 取决于 order 堆是否还持有它。
 `perf_evsel__del_thread()` → `perf_evsel__close_one()` → `perf_evlist__mmap_detach_fd()`。对线程 t
 的每个 fd (event,c,t)：
 
-1. 从 id 哈希与 `evsel->id[]` 删除它的 sample id；
+1. 从 id 哈希删除它内嵌的 sample id；
 2. 清 `entry->domain`，fd 从 `dom->fds[]` 删除；
-3. 域已因 HUP 死亡且 `dom->fds[]` 空了 → 释放域，从 `th->domains` 摘下；
-4. close(fd)；它若是 group leader，组员的 `group_fd` 置 -1；
-5. thread map 槽位置为 HOLE。
+3. 域已因 HUP 死亡且 `dom->fds[]` 空了 → 释放域，从 `th->domain_list` 摘下；
+4. 它若是 group leader，同 (c,t) 上组员的 `entry->leader` 置 NULL，按 evsel 的状态重新 enable；
+5. close(fd)，从 cpu 与线程的 `fd_list`、`evsel->fd_heads[]` 摘下并释放 `struct perf_evsel_fd`；线程的最后一个 fd 关闭时释放 `struct perf_evsel_thread`。evsel 的输入
+   thread map 不变，`perf_evsel__threads()` 返回的快照随之失效。
 
 最后释放线程记录（从 `thread_heads[]` 摘除）。
 
