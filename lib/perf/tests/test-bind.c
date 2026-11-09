@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
@@ -114,6 +115,15 @@ static void child_poke(struct child *c)
 		read(c->done[0], &buf, 1);
 }
 
+static int child_pin(struct child *c, int cpu)
+{
+	cpu_set_t set;
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	return sched_setaffinity(c->pid, sizeof(set), &set);
+}
+
 static void child_stop(struct child *c)
 {
 	write(c->go[1], "q", 1);
@@ -142,6 +152,25 @@ static int drain(struct perf_evlist *evlist, pid_t tid)
 		}
 		perf_mmap__read_done(map);
 	}
+	return nr_samples;
+}
+
+/* Drain @map, counting the samples of @pid; needs PERF_SAMPLE_TID first. */
+static int drain_map(struct perf_mmap *map, pid_t pid)
+{
+	union perf_event *event;
+	int nr_samples = 0;
+	bool writable;
+
+	if (perf_mmap__read_init(map) < 0)
+		return 0;
+	while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+		if (event->header.type == PERF_RECORD_SAMPLE &&
+		    (u32)event->sample.array[0] == (u32)pid)
+			nr_samples++;
+		perf_mmap__consume(map);
+	}
+	perf_mmap__read_done(map);
 	return nr_samples;
 }
 
@@ -911,9 +940,10 @@ static int nr_list(struct list_head *head)
 }
 
 /*
- * Every fd is on the fd_list of its cpu and of its thread. A thread record
- * goes with its last fd, a cpu record stays for the threads added later. The
- * evlist maps are fixed while the evlist is open.
+ * Every fd is on the fd_list of its cpu and of its thread. Cpu and thread
+ * records stay without fds until deleted: threads added later open on every
+ * cpu, cpus added later for every thread. The evlist maps are fixed while the
+ * evlist is open; the evsel maps follow the adds and deletes.
  */
 static int test_fd_index(int id)
 {
@@ -946,8 +976,31 @@ static int test_fd_index(int id)
 		__T("one fd per thread on every cpu", nr_list(&c->fd_list) == 2);
 	th = perf_evsel__thread_find(evsel, b.pid, false);
 	__T("the added thread has a record", th && nr_list(&th->fd_list) == 2);
-	__T("each fd holds the thread record", th->refcnt == 2);
+	__T("the evsel and each fd hold the thread record", th->refcnt == 3);
 	__T("two thread records", nr_list(&evsel->thread_list) == 2);
+	__T("the thread map follows", perf_thread_map__nr(perf_evsel__threads(evsel)) == 2);
+
+	/* Cpus, the other dimension. */
+	__T("delete a cpu", !perf_evsel__del_cpu(evsel, 1));
+	__T("deleting it again fails", perf_evsel__del_cpu(evsel, 1) == -ENOENT);
+	__T("its record goes with its fds", nr_list(&evsel->cpu_list) == 1 && evsel->nr_fds == 2);
+	__T("the cpu map follows", perf_cpu_map__nr(perf_evsel__cpus(evsel)) == 1 &&
+	    perf_cpu_map__cpu(perf_evsel__cpus(evsel), 0) == 0);
+	__T("delete the last cpu", !perf_evsel__del_cpu(evsel, 0));
+	__T("no fd left", !evsel->nr_fds && list_empty(&evsel->cpu_list));
+	__T("the thread records stay", nr_list(&evsel->thread_list) == 2);
+	list_for_each_entry(th, &evsel->thread_list, node)
+		__T("only the evsel holds a thread without fds", th->refcnt == 1);
+	__T("add a cpu back", !perf_evsel__add_cpu(evsel, 1));
+	__T("it opens for every thread", evsel->nr_fds == 2 && perf_evsel__fd(evsel, 1, a.pid) >= 0 &&
+	    perf_evsel__fd(evsel, 1, b.pid) >= 0);
+	__T("adding it again is a no-op", !perf_evsel__add_cpu(evsel, 1) && evsel->nr_fds == 2);
+	__T("add a lower cpu", !perf_evsel__add_cpu(evsel, 0));
+	__T("the cpus stay in ascending order",
+	    list_first_entry(&evsel->cpu_list, struct perf_evsel_cpu, node)->cpu == 0 &&
+	    perf_cpu_map__cpu(perf_evsel__cpus(evsel), 0) == 0 &&
+	    perf_cpu_map__cpu(perf_evsel__cpus(evsel), 1) == 1);
+	__T("no cpu -1", perf_evsel__add_cpu(evsel, -1) == -EINVAL);
 
 	__T("delete the first thread", !perf_evsel__del_thread(evsel, a.pid));
 	__T("its record goes with its fds", !perf_evsel__thread_find(evsel, a.pid, false));
@@ -1103,6 +1156,178 @@ static int test_dynamic_group(int id)
 	return 0;
 }
 
+/*
+ * Cpus come and go on the evsels following the evlist cpu map. Removing one
+ * goes stop - reap - done: a ring buffer shared with an evsel of its own cpus
+ * is only handed over to be read, one left without writers is retired.
+ */
+static int test_dynamic_cpus(int id)
+{
+	struct child a = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct ext_poll ext = { .epfd = epoll_create1(EPOLL_CLOEXEC) };
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *e1 = perf_evsel__new(&attr), *e2 = perf_evsel__new(&attr);
+	struct perf_evsel *dummy = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpu0 = perf_cpu_map__new("0"), *cpu1 = perf_cpu_map__new("1");
+	struct perf_cpu_map *any = perf_cpu_map__dummy_new();
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_evlist_reap reap;
+	struct perf_mmap *map0, *map1, *map;
+	int nr_new;
+
+	__T("start child", !child_start(&a));
+	/* e1 follows the evlist cpus, e2 and dummy have their own. */
+	perf_evsel__set_own_cpus(e2, cpu1);
+	perf_evsel__set_own_cpus(dummy, any);
+	perf_evlist__add(list, e1);
+	perf_evlist__add(list, e2);
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evsel__set_own_threads(dummy, threads);
+	perf_evlist__add(list, dummy);
+	perf_evlist__set_maps(list, cpu0, NULL);
+	perf_evlist_poll__external(list, &ext, ext_add, ext_del);
+	__T("open evlist", !perf_evlist__open(list));
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+	map0 = perf_evlist__find_mmap(list, 0, -1, false);
+	map1 = perf_evlist__find_mmap(list, 1, -1, false);
+	__T("one ring buffer per cpu, one for the dummy cpu", map0 && map1 && nr_mmaps(list) == 3);
+
+	__T("add a cpu", !perf_evlist__add_cpu(list, 1));
+	__T("the following evsel takes it", perf_evsel__fd(e1, 1, -1) >= 0 &&
+	    perf_cpu_map__nr(perf_evsel__cpus(e1)) == 2);
+	__T("the others are left alone", perf_cpu_map__nr(perf_evsel__cpus(e2)) == 1 &&
+	    !perf_evsel__has_cpu(dummy, 1));
+	__T("it joins the ring buffer of the cpu", nr_mmaps(list) == 3 &&
+	    perf_evsel__fd_find(e1, 1, -1)->domain->map == map1);
+	__T("its id maps back", perf_evlist__id_to_evsel(list, perf_evsel__get_id(e1, 1, -1), NULL) == e1);
+	__T("adding it again is a no-op", !perf_evlist__add_cpu(list, 1) && e1->nr_fds == 2);
+	__T("pin the child to cpu 1", !child_pin(&a, 1));
+	child_poke(&a);
+	__T("both evsels write on the new cpu", drain_map(map1, a.pid) == 2);
+
+	/* Shared with e2: handed over, not retired. */
+	__T("delete the cpu", !perf_evlist__del_cpu(list, 1, &reap));
+	__T("the reap names the cpu", reap.type == PERF_EVLIST_REAP__CPU && reap.cpu == 1 && reap.complete);
+	__T("the shared ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0].map == map1 &&
+	    !reap.maps[0].retired);
+	__T("it stays in the evlist", perf_evlist__find_mmap(list, 1, -1, false) == map1);
+	child_poke(&a);
+	__T("the stopped evsel writes no more", drain_map(map1, a.pid) == 1);
+	__T("the fds stay open until done", perf_evsel__fd(e1, 1, -1) >= 0);
+	__T("no add while being removed", perf_evlist__add_cpu(list, 1) == -EBUSY);
+	__T("no second delete", perf_evlist__del_cpu(list, 1, &(struct perf_evlist_reap){}) == -EBUSY);
+	perf_evlist__reap_done(list, &reap);
+	__T("done closes the fds", perf_evsel__fd(e1, 1, -1) < 0 &&
+	    perf_cpu_map__nr(perf_evsel__cpus(e1)) == 1);
+	__T("e2 keeps the ring buffer", perf_evlist__find_mmap(list, 1, -1, false) == map1 &&
+	    perf_evsel__fd(e2, 1, -1) >= 0);
+
+	/* e1 alone: retired at once. */
+	__T("pin the child to cpu 0", !child_pin(&a, 0));
+	child_poke(&a);
+	nr_new = ext.nr_new;
+	__T("delete the last cpu", !perf_evlist__del_cpu(list, 0, &reap));
+	__T("the ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map0 &&
+	    reap.maps[0].retired);
+	__T("it is gone from the evlist", !perf_evlist__find_mmap(list, 0, -1, false) && nr_mmaps(list) == 2);
+	__T("its poll fd is gone", list->epoll.nr_live == 2);
+	__T("the events before are still readable", drain_map(map0, a.pid) == 1);
+	perf_evlist__reap_done(list, &reap);
+	__T("no cpu left on the evsel", !e1->nr_fds && perf_cpu_map__nr(perf_evsel__cpus(e1)) == 0);
+
+	__T("add the cpu back", !perf_evlist__add_cpu(list, 0));
+	map = perf_evlist__find_mmap(list, 0, -1, false);
+	__T("a new ring buffer", map && nr_mmaps(list) == 3 && ext.nr_new == nr_new + 1);
+	child_poke(&a);
+	__T("the evsel writes again", drain_map(map, a.pid) == 1);
+
+	__T("unknown cpu", perf_evlist__del_cpu(list, 2, &reap) == -ENOENT &&
+	    reap.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, &reap);
+	__T("an evsel on any cpu takes none", perf_evsel__add_cpu(dummy, 1) == -EINVAL);
+
+	perf_evlist__delete(list);
+	__T("munmap unregisters the rest", ext.nr_add == ext.nr_del);
+	perf_cpu_map__put(cpu0);
+	perf_cpu_map__put(cpu1);
+	perf_cpu_map__put(any);
+	perf_thread_map__put(threads);
+	close(ext.epfd);
+	child_stop(&a);
+	return 0;
+}
+
+/*
+ * A cpu removed under a thread: its task domain on the retired ring buffer
+ * dies, the thread moves its hup fd to another cpu and still sees its
+ * EPOLLHUP. A thread exited but not yet deleted gets no fd on a new cpu.
+ */
+static int test_cpus_and_thread_exit(int id)
+{
+	struct child a = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct ext_poll ext = { .epfd = epoll_create1(EPOLL_CLOEXEC) };
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *evsel = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_evlist_reap reap;
+	struct perf_evlist_thread *th;
+	struct perf_mmap *map1;
+
+	__T("start child", !child_start(&a));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__add(list, evsel);
+	perf_evlist__set_maps(list, cpus, threads);
+	perf_evlist_poll__external(list, &ext, ext_add, ext_del);
+	__T("open evlist", !perf_evlist__open(list));
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+
+	__T("add a cpu", !perf_evlist__add_cpu(list, 1));
+	map1 = perf_evlist__find_mmap(list, 1, -1, false);
+	th = perf_evsel__fd_find(evsel, 0, a.pid)->domain->thread;
+	__T("the thread has a domain on both cpus", map1 && th && nr_list(&th->domain_list) == 2);
+	__T("pin the child to cpu 1", !child_pin(&a, 1));
+	child_poke(&a);
+
+	__T("delete the cpu", !perf_evlist__del_cpu(list, 1, &reap));
+	__T("its ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map1 &&
+	    reap.maps[0].retired);
+	__T("the thread keeps a hup fd on cpu 0", th->hup_domain && th->hup_domain->map->cpu == 0);
+	__T("the event on cpu 1 is readable", drain_map(map1, a.pid) == 1);
+	perf_evlist__reap_done(list, &reap);
+	__T("the dead domain goes with its fd", nr_list(&th->domain_list) == 1);
+
+	child_stop(&a);
+	__T("EPOLLHUP of the thread", poll_hup(list, &ext, &reap) >= 0 &&
+	    reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == a.pid && reap.nr_maps == 1);
+	perf_evlist__reap_done(list, &reap);
+
+	__T("add a cpu after the exit", !perf_evlist__add_cpu(list, 1));
+	__T("the exited thread gets no fd there", perf_evsel__fd(evsel, 1, a.pid) < 0 &&
+	    perf_evsel__has_cpu(evsel, 1));
+	__T("delete the thread", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("nothing left", !evsel->nr_fds && nr_mmaps(list) == 0);
+
+	perf_evlist__delete(list);
+	__T("munmap unregisters the rest", ext.nr_add == ext.nr_del);
+	perf_cpu_map__put(cpus);
+	perf_thread_map__put(threads);
+	close(ext.epfd);
+	return 0;
+}
+
 int test_bind(int argc, char **argv)
 {
 	int id;
@@ -1132,6 +1357,8 @@ int test_bind(int argc, char **argv)
 	test_fd_index(id);
 	test_cpu_and_thread_mmaps(id);
 	test_dynamic_group(id);
+	test_dynamic_cpus(id);
+	test_cpus_and_thread_exit(id);
 
 	__T_END;
 	return tests_failed == 0 ? 0 : -1;
