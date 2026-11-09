@@ -7,8 +7,8 @@
 #include <internal/evsel.h>
 #include <sys/epoll.h>
 
-#define PERF_EVLIST__HLIST_BITS 8
-#define PERF_EVLIST__HLIST_SIZE (1 << PERF_EVLIST__HLIST_BITS)
+#define PERF_EVLIST__ID_HLIST_BITS 8
+#define PERF_EVLIST__ID_HLIST_SIZE (1 << PERF_EVLIST__ID_HLIST_BITS)
 
 #define PERF_EVLIST__MMAP_HLIST_BITS 6
 #define PERF_EVLIST__MMAP_HLIST_SIZE (1 << PERF_EVLIST__MMAP_HLIST_BITS)
@@ -54,9 +54,9 @@ struct perf_mmap_domain {
 	int			 poll_fd;      /* registered fd, -1 if none */
 	unsigned		 poll_events;
 	struct perf_evlist_thread *thread;     /* task domain only */
-	struct list_head	 map_node;     /* map->domains, while live */
-	struct list_head	 thread_node;  /* thread->domains */
-	struct hlist_node	 poll_node;    /* epoll.heads[], by poll_fd */
+	struct list_head	 map_node;     /* perf_mmap::domain_list */
+	struct list_head	 thread_node;  /* perf_evlist_thread::domain_list */
+	struct hlist_node	 poll_node;    /* perf_evlist_poll::poll_fd_heads */
 };
 
 /*
@@ -68,8 +68,8 @@ struct perf_evlist_thread {
 	bool			 hup;
 	bool			 del;
 	struct perf_mmap_domain	*hup_domain;   /* registered for its EPOLLHUP */
-	struct list_head	 domains;
-	struct hlist_node	 node;
+	struct list_head	 domain_list;  /* perf_mmap_domain::thread_node */
+	struct hlist_node	 hnode;        /* perf_evlist::thread_heads */
 };
 
 struct perf_evlist_poll {
@@ -80,37 +80,45 @@ struct perf_evlist_poll {
 	perf_evlist_poll_add_t add;
 	perf_evlist_poll_del_t del;
 	int nr_live;	/* registered fds */
-	struct hlist_head heads[PERF_EVLIST__POLL_HLIST_SIZE];
+	/* Registered fd -> domain, see perf_evlist_poll__find(). */
+	struct hlist_head poll_fd_heads[PERF_EVLIST__POLL_HLIST_SIZE];  /* perf_mmap_domain::poll_node */
 };
 
 struct perf_evlist {
-	struct list_head	 entries;
+	struct list_head	 evsel_list;  /* perf_evsel::node */
 	int			 nr_entries;
-	bool			 has_user_cpus;
 	bool			 needs_map_propagation;
-	/**
-	 * The cpus passed from the command line or all online CPUs by
-	 * default.
+	/*
+	 * The maps the evlist is opened with, set by perf_evlist__set_maps():
+	 * the default of every evsel without its own maps, see
+	 * __perf_evlist__propagate_maps(). Fixed from perf_evlist__open() to
+	 * perf_evlist__close(), see @opened.
+	 *
+	 * @user_requested_cpus: the cpus passed from the command line or all
+	 * online CPUs by default.
+	 * @user_requested_threads: the threads passed from the command line,
+	 * or the dummy map for any thread.
 	 */
 	struct perf_cpu_map	*user_requested_cpus;
-	/** The union of all evsel cpu maps. */
-	struct perf_cpu_map	*all_cpus;
-	struct perf_thread_map	*threads;
+	struct perf_thread_map	*user_requested_threads;
+	/* perf_evlist__open() until perf_evlist__close(): the maps are fixed. */
+	bool			 opened;
 	int			 rl_file;
 	int			 nr_mmaps;
 	size_t			 mmap_len;
 	struct perf_evlist_poll epoll;
-	struct hlist_head	 heads[PERF_EVLIST__HLIST_SIZE];
+	/* Sample id -> evsel, see perf_evlist__id_to_evsel(). */
+	struct hlist_head	 id_heads[PERF_EVLIST__ID_HLIST_SIZE];  /* perf_sample_id::node */
 	/*
 	 * Ring buffers are allocated on demand and shared by every evsel with
-	 * the same (cpu, tid, overwrite) binding. @mmap_list/@mmap_ovw_list keep
-	 * them in creation order for perf_evlist__for_each_mmap(), @mmap_heads
-	 * indexes them by binding for perf_evlist__find_mmap().
+	 * the same (cpu, tid, overwrite) binding. The lists are for
+	 * perf_evlist__for_each_mmap(); @mmap_heads holds the ones new writers
+	 * may join, for perf_evlist__find_mmap().
 	 */
-	struct list_head	 mmap_list;
-	struct list_head	 mmap_ovw_list;
-	struct hlist_head	 mmap_heads[PERF_EVLIST__MMAP_HLIST_SIZE];
-	struct hlist_head	 thread_heads[PERF_EVLIST__THREAD_HLIST_SIZE];
+	struct list_head	 mmap_list;      /* perf_mmap::node */
+	struct list_head	 mmap_ovw_list;  /* perf_mmap::node */
+	struct hlist_head	 mmap_heads[PERF_EVLIST__MMAP_HLIST_SIZE];      /* perf_mmap::hnode */
+	struct hlist_head	 thread_heads[PERF_EVLIST__THREAD_HLIST_SIZE];  /* perf_evlist_thread::hnode */
 	bool			 mmaped;
 	/* perf_evlist__munmap() in progress: poll fds are not registered again. */
 	bool			 munmapping;
@@ -128,11 +136,9 @@ void perf_evlist__exit(struct perf_evlist *evlist);
  * is closed. Used by perf_evlist__mmap() and by the dynamic thread path.
  */
 int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
-				struct perf_evsel *evsel,
-				int cpu, int thread);
+				struct perf_evsel_fd *entry);
 void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
-				 struct perf_evsel *evsel,
-				 int cpu, int thread);
+				 struct perf_evsel_fd *entry);
 
 /**
  * __perf_evlist__for_each_entry - iterate thru all the evsels
@@ -148,7 +154,7 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
  * @evsel: struct perf_evsel iterator
  */
 #define perf_evlist__for_each_entry(evlist, evsel) \
-	__perf_evlist__for_each_entry(&(evlist)->entries, evsel)
+	__perf_evlist__for_each_entry(&(evlist)->evsel_list, evsel)
 
 /**
  * __perf_evlist__for_each_entry_reverse - iterate thru all the evsels in reverse order
@@ -164,7 +170,7 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
  * @evsel: struct evsel iterator
  */
 #define perf_evlist__for_each_entry_reverse(evlist, evsel) \
-	__perf_evlist__for_each_entry_reverse(&(evlist)->entries, evsel)
+	__perf_evlist__for_each_entry_reverse(&(evlist)->evsel_list, evsel)
 
 /**
  * __perf_evlist__for_each_entry_safe - safely iterate thru all the evsels
@@ -182,31 +188,28 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
  * @tmp: struct evsel temp iterator
  */
 #define perf_evlist__for_each_entry_safe(evlist, tmp, evsel) \
-	__perf_evlist__for_each_entry_safe(&(evlist)->entries, tmp, evsel)
+	__perf_evlist__for_each_entry_safe(&(evlist)->evsel_list, tmp, evsel)
 
 static inline struct perf_evsel *perf_evlist__first(struct perf_evlist *evlist)
 {
-	return list_entry(evlist->entries.next, struct perf_evsel, node);
+	return list_entry(evlist->evsel_list.next, struct perf_evsel, node);
 }
 
 static inline struct perf_evsel *perf_evlist__last(struct perf_evlist *evlist)
 {
-	return list_entry(evlist->entries.prev, struct perf_evsel, node);
+	return list_entry(evlist->evsel_list.prev, struct perf_evsel, node);
 }
 
 u64 perf_evlist__read_format(struct perf_evlist *evlist);
 
 void perf_evlist__id_add(struct perf_evlist *evlist,
-			 struct perf_evsel *evsel,
-			 int cpu, int thread, u64 id);
+			 struct perf_evsel_fd *entry, u64 id);
+void perf_evlist__id_del(struct perf_evsel_fd *entry);
 
 int perf_evlist__id_add_fd(struct perf_evlist *evlist,
-			   struct perf_evsel *evsel,
-			   int cpu, int thread, int fd);
+			   struct perf_evsel_fd *entry);
 
 void perf_evlist__reset_id_hash(struct perf_evlist *evlist);
-
-void __perf_evlist__set_leader(struct list_head *list, struct perf_evsel *leader);
 
 void perf_evlist__go_system_wide(struct perf_evlist *evlist, struct perf_evsel *evsel);
 #endif /* __LIBPERF_INTERNAL_EVLIST_H */

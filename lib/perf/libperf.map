@@ -56,6 +56,10 @@ LIBPERF_0.0.1 {
 		perf_evsel__threads;
 		perf_evsel__attr;
 		perf_evsel__get_id;
+		perf_evsel__fd;
+		perf_evsel__next_fd;
+		perf_evsel_fd__cpu;
+		perf_evsel_fd__tid;
 		perf_evlist__new;
 		perf_evlist__delete;
 		perf_evlist__open;
@@ -82,7 +86,6 @@ LIBPERF_0.0.1 {
 		perf_evlist__set_leader;
 		perf_evlist__nr_groups;
 		perf_evlist__max_read_size;
-		perf_mmap__idx;
 		perf_mmap__cpu;
 		perf_mmap__tid;
 		perf_mmap__oncpu;

@@ -26,11 +26,10 @@ struct perf_mmap *perf_mmap__new(int cpu, pid_t tid, bool overwrite)
 
 	map->cpu = cpu;
 	map->tid = tid;
-	map->idx = -1;
 	map->overwrite = overwrite;
-	INIT_LIST_HEAD(&map->list);
+	INIT_LIST_HEAD(&map->node);
 	INIT_HLIST_NODE(&map->hnode);
-	INIT_LIST_HEAD(&map->domains);
+	INIT_LIST_HEAD(&map->domain_list);
 	refcount_set(&map->refcnt, 1);
 	return map;
 }
@@ -40,6 +39,11 @@ size_t perf_mmap__mmap_len(struct perf_mmap *map)
 	return map->mask + 1 + page_size;
 }
 
+/*
+ * Kernel constraint: @fd must not be redirected into another ring buffer with
+ * PERF_EVENT_IOC_SET_OUTPUT. mmap() of a redirected event warns since v6.18
+ * (448f97fba901) and fails with -EBUSY since v6.19 (d06bf78e55d5).
+ */
 int perf_mmap__mmap(struct perf_mmap *map, struct perf_mmap_param *mp, int fd)
 {
 	map->prev = 0;
@@ -92,11 +96,6 @@ void perf_mmap__put(struct perf_mmap *map)
 		perf_mmap__munmap(map);
 		free(map);
 	}
-}
-
-int perf_mmap__idx(struct perf_mmap *map)
-{
-    return map->idx;
 }
 
 static inline void perf_mmap__write_tail(struct perf_mmap *md, u64 tail)

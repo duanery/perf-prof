@@ -9,33 +9,17 @@
 
 struct perf_cpu_map;
 struct perf_thread_map;
-struct xyarray;
 struct perf_mmap;
 struct perf_mmap_domain;
-
-struct perf_evsel_fd {
-	int fd;
-	int group_fd;
-	/* The domain this fd writes into; its ring buffer is domain->map. */
-	struct perf_mmap_domain *domain;
-};
 
 /*
  * Per fd, to map back from PERF_SAMPLE_ID to evsel, only used when there are
  * more than one entry in the evlist.
  */
 struct perf_sample_id {
-	struct hlist_node	 node;
+	struct hlist_node	 node;   /* perf_evlist::id_heads */
 	u64			 id;
 	struct perf_evsel	*evsel;
-       /*
-	* 'idx' will be used for AUX area sampling. A sample will have AUX area
-	* data that will be queued for decoding, where there are separate
-	* queues for each CPU (per-cpu tracing) or task (per-thread tracing).
-	* The sample ID can be used to lookup 'idx' which is effectively the
-	* queue number.
-	*/
-	int			 idx;
 	int			 cpu;
 	pid_t			 tid;
 
@@ -43,41 +27,120 @@ struct perf_sample_id {
 	u64			 period;
 };
 
+/*
+ * One cpu of an evsel, -1 for a dummy cpu map. Referenced by each of its fds,
+ * and by the evsel from perf_evsel__open() to perf_evsel__close(): the cpu
+ * stays while it has no fd, threads added later open on every cpu. Freed with
+ * the last reference.
+ */
+struct perf_evsel_cpu {
+	int			 cpu;
+	int			 refcnt;
+	struct list_head	 node;     /* perf_evsel::cpu_list */
+	struct hlist_node	 hnode;    /* perf_evsel::cpu_heads */
+	struct list_head	 fd_list;  /* perf_evsel_fd::cpu_node */
+};
+
+/*
+ * One thread of an evsel: @tid is the pid argument of perf_event_open(), -1
+ * for any thread; for a cgroup the cgroup fd, with @cgroup set. Referenced by
+ * each of its fds, and by the caller while it opens them; freed with the last
+ * reference.
+ */
+struct perf_evsel_thread {
+	pid_t			 tid;
+	bool			 cgroup;
+	int			 refcnt;
+	struct list_head	 node;     /* perf_evsel::thread_list */
+	struct hlist_node	 hnode;    /* perf_evsel::thread_heads */
+	struct list_head	 fd_list;  /* perf_evsel_fd::thread_node */
+};
+
+#define PERF_EVSEL__CPU_HLIST_BITS 6
+#define PERF_EVSEL__CPU_HLIST_SIZE (1 << PERF_EVSEL__CPU_HLIST_BITS)
+#define PERF_EVSEL__FD_HLIST_BITS 8
+#define PERF_EVSEL__FD_HLIST_SIZE (1 << PERF_EVSEL__FD_HLIST_BITS)
+#define PERF_EVSEL__THREAD_HLIST_BITS 6
+#define PERF_EVSEL__THREAD_HLIST_SIZE (1 << PERF_EVSEL__THREAD_HLIST_BITS)
+
+/*
+ * One open fd of an evsel, keyed by the values it was opened with: @cpu and
+ * @tid are the cpu and pid arguments of perf_event_open(), -1 included; for a
+ * cgroup fd @tid is the cgroup fd and @cgroup is set. The object never moves
+ * while the fd is open, so other structures may point at it.
+ */
+struct perf_evsel_fd {
+	struct perf_evsel	*evsel;
+	int			 cpu;
+	pid_t			 tid;
+	bool			 cgroup;
+	int			 fd;
+	struct perf_evsel_cpu	*cpu_rec;
+	struct perf_evsel_thread *thread;
+	/* The fd of the group leader, NULL when this fd leads its group or is alone. */
+	struct perf_evsel_fd	*leader;
+	/* The domain this fd writes into; its ring buffer is domain->map. */
+	struct perf_mmap_domain	*domain;
+	/* The ring buffer of perf_evsel__mmap(). */
+	struct perf_mmap	*mmap;
+	struct perf_sample_id	 sid;
+	struct list_head	 cpu_node;     /* perf_evsel_cpu::fd_list */
+	struct list_head	 thread_node;  /* perf_evsel_thread::fd_list */
+	struct hlist_node	 hnode;        /* perf_evsel::fd_heads */
+};
+
 struct perf_evsel {
-	struct list_head	 node;
+	struct list_head	 node;  /* perf_evlist::evsel_list */
 	struct perf_evlist	*evlist;
 	struct perf_event_attr	 attr;
 	/*
 	 * @cpus/@threads are the bindings in effect. @own_cpus/@own_threads are
 	 * the bindings this evsel asked for; when NULL the evlist default is
 	 * used. See __perf_evlist__propagate_maps().
+	 *
+	 * They are input only: perf_evsel__open() opens one fd per (cpu,
+	 * thread) value of them, and neither changes once the evsel is open;
+	 * they are handed back by perf_evsel__cpus()/perf_evsel__threads().
+	 * After the open the evsel only works on its own records, which also
+	 * hold the threads added and removed one by one later.
 	 */
 	struct perf_cpu_map	*cpus;
 	struct perf_cpu_map	*own_cpus;
 	struct perf_thread_map	*threads;
 	struct perf_thread_map	*own_threads;
-	struct xyarray		*fd;
-	struct xyarray		*mmap;
-	struct xyarray		*sample_id;
-	u64			*id;
-	u32			 ids;
+	struct list_head	 cpu_list;     /* perf_evsel_cpu::node */
+	struct hlist_head	 cpu_heads[PERF_EVSEL__CPU_HLIST_SIZE];        /* perf_evsel_cpu::hnode */
+	struct list_head	 thread_list;  /* perf_evsel_thread::node */
+	struct hlist_head	 thread_heads[PERF_EVSEL__THREAD_HLIST_SIZE];  /* perf_evsel_thread::hnode */
+	struct hlist_head	 fd_heads[PERF_EVSEL__FD_HLIST_SIZE];          /* perf_evsel_fd::hnode */
+	int			 nr_fds;
+	/* Opened for any thread (pid == -1): no thread can be added. */
+	bool			 any_thread;
+	/* The rank for grouping, see perf_evsel__rank_cmp(). */
+	int			 rank_cpus;
+	int			 rank_threads;
+	/* Threads were added or removed: @threads no longer lists the fds. */
+	bool			 threads_changed;
+	struct perf_thread_map	*threads_snap;
 	struct perf_evsel	*leader;
 	void			*external;
 	bool			 keep_disable;
 	bool			 init_enabled;
-	/* Set once the evsel is open: the cpu binding no longer changes. */
-	bool			 cpus_bound;
+	/*
+	 * Set by perf_evsel__open() until perf_evsel__close(): the fds are
+	 * open, the input maps no longer change.
+	 */
+	bool			 opened;
 	/* Set once perf_evlist__mmap() has run over this evsel. */
 	bool			 mmaped;
 	bool			 enabled;
-	/* The effective thread map has diverged from the initial binding. */
-	bool			 threads_private;
 	/*
 	 * Remembered so that threads added after perf_evlist__open() get the
 	 * same filter and bpf program as the fds opened up front.
 	 */
 	char			*filter;
 	int			 bpf_prog_fd;
+	/* perf_evsel__mmap() pages, -1 when not mapped. */
 	int			 mmap_pages;
 
 	/* parse modifier helper */
@@ -99,24 +162,18 @@ struct perf_evsel {
 
 void perf_evsel__init(struct perf_evsel *evsel, struct perf_event_attr *attr,
 		      int idx);
-int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthreads);
 void perf_evsel__close_fd(struct perf_evsel *evsel);
-void perf_evsel__free_fd(struct perf_evsel *evsel);
-int perf_evsel__alloc_id(struct perf_evsel *evsel, int ncpus, int nthreads);
-void perf_evsel__free_id(struct perf_evsel *evsel);
 
-/*
- * The binding dimension of an evsel. A non-empty cpu map means one ring buffer
- * per cpu (all of the evsel's threads write into the ring buffer of the cpu
- * they run on); an empty (dummy) cpu map means one ring buffer per thread.
- */
-bool perf_evsel__oncpu(struct perf_evsel *evsel);
-/* Resolve the (cpu, tid) ring buffer key for one fd of the evsel. */
-void perf_evsel__mmap_bind(struct perf_evsel *evsel, int cpu, int thread,
-			   int *bind_cpu, pid_t *bind_tid);
-int perf_evsel__open_one(struct perf_evsel *evsel, int cpu, int thread);
-int perf_evsel__make_threads_private(struct perf_evsel *evsel);
-struct perf_evsel_fd *perf_evsel__fd_entry(struct perf_evsel *evsel, int cpu, int thread);
+struct perf_evsel_fd *__perf_evsel__fd_find(struct perf_evsel *evsel, int cpu,
+					    pid_t tid, bool cgroup);
+struct perf_evsel_thread *perf_evsel__thread_find(struct perf_evsel *evsel,
+						  pid_t tid, bool cgroup);
+/* Any fd at (@cpu, @tid), the cgroup flag aside. */
+struct perf_evsel_fd *perf_evsel__fd_find(struct perf_evsel *evsel, int cpu, pid_t tid);
+bool perf_evsel__has_thread(struct perf_evsel *evsel, pid_t pid);
+void perf_evsel__set_rank(struct perf_evsel *evsel, struct perf_cpu_map *cpus,
+			  struct perf_thread_map *threads);
+int perf_evsel__rank_cmp(struct perf_evsel *a, struct perf_evsel *b);
 int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group);
 void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid);
 

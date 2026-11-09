@@ -8,7 +8,6 @@
 #include <sys/resource.h>
 #include <internal/evlist.h>
 #include <internal/evsel.h>
-#include <internal/xyarray.h>
 #include <internal/mmap.h>
 #include <internal/cpumap.h>
 #include <internal/threadmap.h>
@@ -29,7 +28,7 @@ void perf_evlist__init(struct perf_evlist *evlist)
 {
 	int i;
 
-	INIT_LIST_HEAD(&evlist->entries);
+	INIT_LIST_HEAD(&evlist->evsel_list);
 	evlist->nr_entries = 0;
 	INIT_LIST_HEAD(&evlist->mmap_list);
 	INIT_LIST_HEAD(&evlist->mmap_ovw_list);
@@ -46,13 +45,13 @@ void perf_evlist__init(struct perf_evlist *evlist)
  * thread map keeps it; the two are independent, an evsel can bind its own cpus
  * and still follow the evlist threads.
  *
- * Once the evsel is open its cpu binding is frozen: fds and ring buffers are
- * already laid out along it.
+ * Once the evsel is open both are frozen: they are the input its fds were
+ * opened from.
  */
 static void __perf_evlist__propagate_maps(struct perf_evlist *evlist,
 					  struct perf_evsel *evsel)
 {
-	if (!evsel->cpus_bound) {
+	if (!evsel->opened) {
 		struct perf_cpu_map *cpus;
 
 		if (evsel->system_wide)
@@ -66,8 +65,7 @@ static void __perf_evlist__propagate_maps(struct perf_evlist *evlist,
 		evsel->cpus = cpus;
 	}
 
-	/* A map the evsel owns is never overwritten, it may have grown. */
-	if (!evsel->cpus_bound && !evsel->threads_private) {
+	if (!evsel->opened) {
 		struct perf_thread_map *threads;
 
 		if (evsel->system_wide)
@@ -75,13 +73,11 @@ static void __perf_evlist__propagate_maps(struct perf_evlist *evlist,
 		else if (evsel->own_threads)
 			threads = perf_thread_map__get(evsel->own_threads);
 		else
-			threads = perf_thread_map__get(evlist->threads);
+			threads = perf_thread_map__get(evlist->user_requested_threads);
 
 		perf_thread_map__put(evsel->threads);
 		evsel->threads = threads;
 	}
-
-	evlist->all_cpus = perf_cpu_map__merge(evlist->all_cpus, evsel->cpus);
 }
 
 static void perf_evlist__propagate_maps(struct perf_evlist *evlist)
@@ -90,11 +86,7 @@ static void perf_evlist__propagate_maps(struct perf_evlist *evlist)
 
 	evlist->needs_map_propagation = true;
 
-	/* Clear the all_cpus set which will be merged into during propagation. */
-	perf_cpu_map__put(evlist->all_cpus);
-	evlist->all_cpus = NULL;
-
-	list_for_each_entry_safe(evsel, n, &evlist->entries, node)
+	list_for_each_entry_safe(evsel, n, &evlist->evsel_list, node)
 		__perf_evlist__propagate_maps(evlist, evsel);
 }
 
@@ -103,7 +95,7 @@ void perf_evlist__add(struct perf_evlist *evlist,
 {
 	evsel->idx = evlist->nr_entries;
 	evsel->evlist = evlist;
-	list_add_tail(&evsel->node, &evlist->entries);
+	list_add_tail(&evsel->node, &evlist->evsel_list);
 	evlist->nr_entries += 1;
 
 	if (evlist->needs_map_propagation)
@@ -134,7 +126,7 @@ perf_evlist__next(struct perf_evlist *evlist, struct perf_evsel *prev)
 	struct perf_evsel *next;
 
 	if (!prev) {
-		next = list_first_entry(&evlist->entries,
+		next = list_first_entry(&evlist->evsel_list,
 					struct perf_evsel,
 					node);
 	} else {
@@ -142,7 +134,7 @@ perf_evlist__next(struct perf_evlist *evlist, struct perf_evsel *prev)
 	}
 
 	/* Empty list is noticed here so don't need checking on entry. */
-	if (&next->node == &evlist->entries)
+	if (&next->node == &evlist->evsel_list)
 		return NULL;
 
 	return next;
@@ -163,11 +155,9 @@ static void perf_evlist__purge(struct perf_evlist *evlist)
 void perf_evlist__exit(struct perf_evlist *evlist)
 {
 	perf_cpu_map__put(evlist->user_requested_cpus);
-	perf_cpu_map__put(evlist->all_cpus);
-	perf_thread_map__put(evlist->threads);
+	perf_thread_map__put(evlist->user_requested_threads);
 	evlist->user_requested_cpus = NULL;
-	evlist->all_cpus = NULL;
-	evlist->threads = NULL;
+	evlist->user_requested_threads = NULL;
 }
 
 void perf_evlist__delete(struct perf_evlist *evlist)
@@ -182,10 +172,14 @@ void perf_evlist__delete(struct perf_evlist *evlist)
 	free(evlist);
 }
 
-void perf_evlist__set_maps(struct perf_evlist *evlist,
-			   struct perf_cpu_map *cpus,
-			   struct perf_thread_map *threads)
+int perf_evlist__set_maps(struct perf_evlist *evlist,
+			  struct perf_cpu_map *cpus,
+			  struct perf_thread_map *threads)
 {
+	/* The fds are laid out along them, see perf_evlist__open(). */
+	if (evlist->opened)
+		return -EBUSY;
+
 	/*
 	 * Allow for the possibility that one or another of the maps isn't being
 	 * changed i.e. don't put it.  Note we are assuming the maps that are
@@ -198,23 +192,56 @@ void perf_evlist__set_maps(struct perf_evlist *evlist,
 		evlist->user_requested_cpus = perf_cpu_map__get(cpus);
 	}
 
-	if (threads != evlist->threads) {
-		perf_thread_map__put(evlist->threads);
-		evlist->threads = perf_thread_map__get(threads);
+	if (threads != evlist->user_requested_threads) {
+		perf_thread_map__put(evlist->user_requested_threads);
+		evlist->user_requested_threads = perf_thread_map__get(threads);
 	}
 
 	perf_evlist__propagate_maps(evlist);
+	return 0;
+}
+
+/*
+ * The order the evsels open their fds in, also for threads added later; close
+ * in the reverse order.
+ *
+ * Kernel constraint: a group leader is open before its members, perf_event_open()
+ * takes its fd as group_fd. In a grouped evlist that is the rank order, highest
+ * first, see perf_evsel__rank_cmp(); otherwise the evlist order, explicit
+ * leaders come first.
+ */
+static struct perf_evsel **perf_evlist__open_order(struct perf_evlist *evlist)
+{
+	struct perf_evsel **order = calloc(evlist->nr_entries ?: 1, sizeof(*order));
+	struct perf_evsel *evsel;
+	int i, nr = 0;
+
+	if (!order)
+		return NULL;
+	perf_evlist__for_each_entry(evlist, evsel) {
+		for (i = nr; i > 0 && evlist->grouped &&
+			     perf_evsel__rank_cmp(evsel, order[i - 1]) > 0; i--)
+			order[i] = order[i - 1];
+		order[i] = evsel;
+		nr++;
+	}
+	return order;
 }
 
 int perf_evlist__open(struct perf_evlist *evlist)
 {
-	struct perf_evsel *evsel;
-	int err;
+	struct perf_evsel *evsel, **order;
+	struct perf_evsel_fd *entry;
+	int err, i;
 	struct rlimit rl;
 
 	perf_evlist__propagate_maps(evlist);
-	if (evlist->grouped)
-		perf_evlist__set_leader(evlist);
+	evlist->opened = true;
+	/* The open order needs the ranks before perf_evsel__open() fixes them. */
+	perf_evlist__for_each_entry(evlist, evsel) {
+		if (!evsel->opened)
+			perf_evsel__set_rank(evsel, evsel->cpus, evsel->threads);
+	}
 
 	if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
 		evlist->rl_file = 0;
@@ -232,28 +259,29 @@ int perf_evlist__open(struct perf_evlist *evlist)
 		}
 	}
 
-	perf_evlist__for_each_entry(evlist, evsel) {
-		err = perf_evsel__open(evsel, evsel->cpus, evsel->threads);
-		if (err < 0)
-			goto out_err;
+	order = perf_evlist__open_order(evlist);
+	if (!order) {
+		err = -ENOMEM;
+		goto out_err;
 	}
+	for (i = 0; i < evlist->nr_entries; i++) {
+		err = perf_evsel__open(order[i], order[i]->cpus, order[i]->threads);
+		if (err < 0)
+			break;
+	}
+	free(order);
+	if (err < 0)
+		goto out_err;
+
 	/* Count-only users also need event ids without creating ring buffers. */
 	perf_evlist__for_each_entry(evlist, evsel) {
-		int cpu, thread;
 		if (!(evsel->attr.read_format & PERF_FORMAT_ID))
 			continue;
-		err = perf_evsel__alloc_id(evsel, xyarray__max_x(evsel->fd), xyarray__max_y(evsel->fd));
-		if (err)
-			goto out_err;
-		for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++)
-			for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++) {
-				struct perf_evsel_fd *entry = perf_evsel__fd_entry(evsel, cpu, thread);
-				if (entry->fd < 0)
-					continue;
-				err = perf_evlist__id_add_fd(evlist, evsel, cpu, thread, entry->fd);
-				if (err)
-					goto out_err;
-			}
+		perf_evsel__for_each_fd(evsel, entry) {
+			err = perf_evlist__id_add_fd(evlist, entry);
+			if (err)
+				goto out_err;
+		}
 	}
 
 	return 0;
@@ -265,17 +293,26 @@ out_err:
 
 void perf_evlist__close(struct perf_evlist *evlist)
 {
-	struct perf_evsel *evsel;
+	struct perf_evsel *evsel, **order;
 	struct rlimit rl;
+	int i;
 
+	evlist->opened = false;
 	if (evlist->rl_file > 0 && getrlimit(RLIMIT_NOFILE, &rl) == 0) {
 		rl.rlim_cur -= evlist->rl_file;
 		evlist->rl_file = 0;
 		setrlimit(RLIMIT_NOFILE, &rl);
 	}
 
-	perf_evlist__for_each_entry_reverse(evlist, evsel)
-		perf_evsel__close(evsel);
+	order = perf_evlist__open_order(evlist);
+	if (order) {
+		for (i = evlist->nr_entries - 1; i >= 0; i--)
+			perf_evsel__close(order[i]);
+		free(order);
+	} else {
+		perf_evlist__for_each_entry_reverse(evlist, evsel)
+			perf_evsel__close(evsel);
+	}
 }
 
 void perf_evlist__enable(struct perf_evlist *evlist)
@@ -301,81 +338,43 @@ u64 perf_evlist__read_format(struct perf_evlist *evlist)
 	return first->attr.read_format;
 }
 
-#define SID(e, x, y) xyarray__entry(e->sample_id, x, y)
-
-static void perf_evlist__id_hash(struct perf_evlist *evlist,
-				 struct perf_evsel *evsel,
-				 int cpu, int thread, u64 id)
-{
-	int hash;
-	struct perf_sample_id *sid = SID(evsel, cpu, thread);
-
-	sid->id = id;
-	sid->evsel = evsel;
-	sid->cpu = perf_cpu_map__cpu(evsel->cpus, cpu);
-	sid->tid = perf_thread_map__pid(evsel->threads, thread);
-	hash = hash_64(sid->id, PERF_EVLIST__HLIST_BITS);
-	hlist_add_head(&sid->node, &evlist->heads[hash]);
-}
-
 void perf_evlist__reset_id_hash(struct perf_evlist *evlist)
 {
 	int i;
 
-	for (i = 0; i < PERF_EVLIST__HLIST_SIZE; ++i)
-		INIT_HLIST_HEAD(&evlist->heads[i]);
+	for (i = 0; i < PERF_EVLIST__ID_HLIST_SIZE; ++i)
+		INIT_HLIST_HEAD(&evlist->id_heads[i]);
 }
 
-static unsigned int perf_evsel__id_max(struct perf_evsel *evsel)
-{
-	if (!evsel->sample_id)
-		return 0;
-	return (unsigned int)xyarray__max_x(evsel->sample_id) *
-	       (unsigned int)xyarray__max_y(evsel->sample_id);
-}
-
-/*
- * evsel->id[] is a bag of live ids, sized to the sample_id xyarray.
- * del_thread must take the id out or the next hole-reuse id_add()
- * writes past the allocation and smashes the heap.
- */
-static void perf_evsel__id_remove(struct perf_evsel *evsel, u64 id)
-{
-	u32 i;
-
-	if (!evsel->id || !evsel->ids)
-		return;
-
-	for (i = 0; i < evsel->ids; i++) {
-		if (evsel->id[i] != id)
-			continue;
-		evsel->id[i] = evsel->id[--evsel->ids];
-		return;
-	}
-}
-
+/* The sample id of @entry, embedded in it; replaces an earlier one. */
 void perf_evlist__id_add(struct perf_evlist *evlist,
-			 struct perf_evsel *evsel,
-			 int cpu, int thread, u64 id)
+			 struct perf_evsel_fd *entry, u64 id)
 {
-	unsigned int max = perf_evsel__id_max(evsel);
-	struct perf_sample_id *sid = SID(evsel, cpu, thread);
+	struct perf_sample_id *sid = &entry->sid;
 
-	if (sid->evsel) {
-		perf_evsel__id_remove(evsel, sid->id);
-		hlist_del(&sid->node);
-	}
+	perf_evlist__id_del(entry);
+	sid->id = id;
+	sid->evsel = entry->evsel;
+	sid->cpu = entry->cpu;
+	sid->tid = entry->tid;
+	hlist_add_head(&sid->node, &evlist->id_heads[hash_64(id, PERF_EVLIST__ID_HLIST_BITS)]);
+}
 
-	perf_evlist__id_hash(evlist, evsel, cpu, thread, id);
-	if (!evsel->id || evsel->ids >= max)
+void perf_evlist__id_del(struct perf_evsel_fd *entry)
+{
+	struct perf_sample_id *sid = &entry->sid;
+
+	if (!sid->evsel)
 		return;
-	evsel->id[evsel->ids++] = id;
+	hlist_del(&sid->node);
+	memset(sid, 0, sizeof(*sid));
 }
 
 int perf_evlist__id_add_fd(struct perf_evlist *evlist,
-			   struct perf_evsel *evsel,
-			   int cpu, int thread, int fd)
+			   struct perf_evsel_fd *entry)
 {
+	struct perf_evsel *evsel = entry->evsel;
+	int fd = entry->fd;
 	u64 read_data[4] = { 0, };
 	int id_idx = 1; /* The first entry is the counter value */
 	u64 id;
@@ -409,7 +408,7 @@ int perf_evlist__id_add_fd(struct perf_evlist *evlist,
 	id = read_data[id_idx];
 
 add:
-	perf_evlist__id_add(evlist, evsel, cpu, thread, id);
+	perf_evlist__id_add(evlist, entry, id);
 	return 0;
 }
 
@@ -419,8 +418,8 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
     int hash;
     struct perf_sample_id *sid;
 
-	hash = hash_64(id, PERF_EVLIST__HLIST_BITS);
-    hlist_for_each_entry(sid, &evlist->heads[hash], node) {
+	hash = hash_64(id, PERF_EVLIST__ID_HLIST_BITS);
+    hlist_for_each_entry(sid, &evlist->id_heads[hash], node) {
         if (sid->id == id) {
             if (pcpu)
                 *pcpu = sid->cpu;
@@ -481,24 +480,12 @@ struct perf_mmap *perf_evlist__find_mmap(struct perf_evlist *evlist,
 	return NULL;
 }
 
-/*
- * Keep the old meaning of perf_mmap__idx(): the index of the cpu (or of the
- * thread, when binding per thread) in the evlist maps. Ring buffers of threads
- * added after perf_evlist__open() have no index (-1).
- */
-static int perf_evlist__mmap_idx(struct perf_evlist *evlist, int cpu, pid_t tid)
-{
-	if (cpu != -1)
-		return perf_cpu_map__idx(evlist->all_cpus, cpu);
-	return perf_thread_map__idx(evlist->threads, tid);
-}
-
 static void perf_evlist__mmap_register(struct perf_evlist *evlist,
 				       struct perf_mmap *map)
 {
 	int hash = perf_evlist__mmap_hash(map->cpu, map->tid, map->overwrite);
 
-	list_add_tail(&map->list, map->overwrite ? &evlist->mmap_ovw_list
+	list_add_tail(&map->node, map->overwrite ? &evlist->mmap_ovw_list
 						 : &evlist->mmap_list);
 	hlist_add_head(&map->hnode, &evlist->mmap_heads[hash]);
 	map->registered = true;
@@ -515,12 +502,16 @@ static void perf_evlist__mmap_unregister(struct perf_evlist *evlist,
 					 struct perf_mmap *map)
 {
 	perf_evlist__mmap_unhash(map);
-	list_del_init(&map->list);
+	list_del_init(&map->node);
 	map->registered = false;
 	evlist->nr_mmaps--;
 }
 
-/* Map the ring buffer of a binding from its first writer @fd and register it. */
+/*
+ * Map the ring buffer of a binding from its first writer @fd and register it.
+ *
+ * Kernel constraint: @fd is not redirected yet, see perf_mmap__mmap().
+ */
 static struct perf_mmap *
 perf_evlist__mmap_create(struct perf_evlist *evlist, int cpu, pid_t tid,
 			 bool overwrite, int fd)
@@ -537,7 +528,6 @@ perf_evlist__mmap_create(struct perf_evlist *evlist, int cpu, pid_t tid,
 		perf_mmap__put(map);
 		return NULL;
 	}
-	map->idx = perf_evlist__mmap_idx(evlist, cpu, tid);
 	map->evlist = evlist;
 	perf_evlist__mmap_register(evlist, map);
 	return map;
@@ -551,7 +541,7 @@ perf_evlist__thread_find(struct perf_evlist *evlist, pid_t tid)
 	int hash = hash_32((u32)tid, PERF_EVLIST__THREAD_HLIST_BITS);
 	struct perf_evlist_thread *th;
 
-	hlist_for_each_entry(th, &evlist->thread_heads[hash], node) {
+	hlist_for_each_entry(th, &evlist->thread_heads[hash], hnode) {
 		if (th->tid == tid)
 			return th;
 	}
@@ -569,8 +559,8 @@ perf_evlist__thread_get(struct perf_evlist *evlist, pid_t tid)
 	if (!th)
 		return NULL;
 	th->tid = tid;
-	INIT_LIST_HEAD(&th->domains);
-	hlist_add_head(&th->node,
+	INIT_LIST_HEAD(&th->domain_list);
+	hlist_add_head(&th->hnode,
 		&evlist->thread_heads[hash_32((u32)tid, PERF_EVLIST__THREAD_HLIST_BITS)]);
 	return th;
 }
@@ -588,12 +578,12 @@ static void perf_evlist__thread_free(struct perf_evlist *evlist,
 	struct perf_mmap_domain *dom, *tmp;
 
 	th->hup_domain = NULL;
-	list_for_each_entry_safe(dom, tmp, &th->domains, thread_node) {
+	list_for_each_entry_safe(dom, tmp, &th->domain_list, thread_node) {
 		list_del_init(&dom->thread_node);
 		dom->thread = NULL;
 		perf_evlist_poll__sync(evlist, dom);
 	}
-	hlist_del(&th->node);
+	hlist_del(&th->hnode);
 	free(th);
 }
 
@@ -601,7 +591,7 @@ static void perf_evlist__thread_free(struct perf_evlist *evlist,
  * Poll registration.
  *
  * Without an external loop the fds go into the evlist's own epoll, keyed by
- * fd; epoll.heads[] maps a registered fd back to its domain either way.
+ * fd; epoll.poll_fd_heads[] maps a registered fd back to its domain either way.
  */
 
 void perf_evlist_poll__init(struct perf_evlist *evlist)
@@ -617,7 +607,7 @@ void perf_evlist_poll__init(struct perf_evlist *evlist)
 	epoll->del = NULL;
 	epoll->nr_live = 0;
 	for (i = 0; i < PERF_EVLIST__POLL_HLIST_SIZE; i++)
-		INIT_HLIST_HEAD(&epoll->heads[i]);
+		INIT_HLIST_HEAD(&epoll->poll_fd_heads[i]);
 }
 
 void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
@@ -676,7 +666,7 @@ perf_evlist_poll__find(struct perf_evlist *evlist, int fd)
 {
 	struct perf_mmap_domain *dom;
 
-	hlist_for_each_entry(dom, &evlist->epoll.heads[perf_evlist_poll__hash(fd)], poll_node) {
+	hlist_for_each_entry(dom, &evlist->epoll.poll_fd_heads[perf_evlist_poll__hash(fd)], poll_node) {
 		if (dom->poll_fd == fd)
 			return dom;
 	}
@@ -708,12 +698,17 @@ static int perf_evlist_poll__add(struct perf_evlist *evlist,
 	map->announced = true;
 	dom->poll_fd = fd;
 	dom->poll_events = events;
-	hlist_add_head(&dom->poll_node, &epoll->heads[perf_evlist_poll__hash(fd)]);
+	hlist_add_head(&dom->poll_node, &epoll->poll_fd_heads[perf_evlist_poll__hash(fd)]);
 	epoll->nr_live++;
 	return 0;
 }
 
-/* Must run before the registered fd is closed: the VMA may keep its file alive. */
+/*
+ * Kernel constraint: must run before the registered fd is closed. epoll drops
+ * an fd only when its file is freed, and a VMA of the ring buffer may hold the
+ * file after close(); the fd would stay in the epoll and, once its task exits,
+ * keep reporting EPOLLHUP, which no event mask can turn off.
+ */
 static void perf_evlist_poll__del(struct perf_evlist *evlist,
 				  struct perf_mmap_domain *dom)
 {
@@ -752,17 +747,26 @@ static bool perf_mmap_domain__pollable(struct perf_mmap_domain *dom)
 /*
  * The registered fds serve two roles:
  *
- *   data: one fd per ring buffer, polled for EPOLLIN. A write by any writer
- *         wakes up every event attached to the ring buffer, one fd is enough.
- *         The cpu domain's if there is one: it never goes away on its own.
+ *   data: one fd per ring buffer, polled for EPOLLIN. The cpu domain's if
+ *         there is one: it never goes away on its own.
  *   hup:  one fd per thread, from one of its task domains, polled for
- *         EPOLLHUP only; the cpu domain never takes this role. Every
- *         event of the thread enters EXIT state when it exits, one fd is
- *         enough. Prefer one that is already a data fd, then a single fd
- *         serves both.
+ *         EPOLLHUP only. Prefer one that is already a data fd, then a
+ *         single fd serves both. The cpu domain never takes this role.
  *
  * A domain is registered if it holds either role, with EPOLLIN only for the
  * data role. A thread whose EPOLLHUP is taken (th->hup) needs no hup fd.
+ *
+ * Kernel constraints that make one fd enough:
+ *  - a write by any writer wakes up every event attached to the ring buffer
+ *    (ring_buffer_wakeup()): since 10c6db110d0e ("perf: Fix loss of
+ *    notification with multi-event"), in v3.2;
+ *  - when a task exits, every event in its context enters
+ *    PERF_EVENT_STATE_EXIT and perf_poll() reports EPOLLHUP, disabled events
+ *    included: since 179033b3e064 ("perf: Add PERF_EVENT_STATE_EXIT state for
+ *    events with exited task"), in v3.18.
+ * And why only fds attached to a ring buffer are registered: perf_poll() of an
+ * event without a ring buffer reports EPOLLHUP right away, since 61b67684c4a4
+ * ("perf: Fix perf_poll to return proper POLLHUP value"), in v3.18.
  */
 static struct perf_mmap_domain *
 perf_evlist_poll__pick_data(struct perf_mmap *map)
@@ -773,7 +777,7 @@ perf_evlist_poll__pick_data(struct perf_mmap *map)
 		return map->cpu_domain;
 	if (perf_mmap_domain__pollable(map->poll_domain))
 		return map->poll_domain;
-	list_for_each_entry(dom, &map->domains, map_node) {
+	list_for_each_entry(dom, &map->domain_list, map_node) {
 		if (!perf_mmap_domain__pollable(dom))
 			continue;
 		if (dom->thread && dom->thread->hup_domain == dom)
@@ -793,7 +797,7 @@ perf_evlist_poll__pick_hup(struct perf_evlist_thread *th)
 		return NULL;
 	if (perf_mmap_domain__pollable(th->hup_domain))
 		return th->hup_domain;
-	list_for_each_entry(dom, &th->domains, thread_node) {
+	list_for_each_entry(dom, &th->domain_list, thread_node) {
 		if (!perf_mmap_domain__pollable(dom))
 			continue;
 		if (dom->map->poll_domain == dom)
@@ -907,7 +911,7 @@ perf_evlist__mmap_domain_get(struct perf_evlist *evlist, struct perf_mmap *map, 
 		th = perf_evlist__thread_get(evlist, tid);
 		if (!th)
 			return NULL;
-		list_for_each_entry(dom, &th->domains, thread_node)
+		list_for_each_entry(dom, &th->domain_list, thread_node)
 			if (dom->map == map)
 				return dom;
 	}
@@ -920,10 +924,10 @@ perf_evlist__mmap_domain_get(struct perf_evlist *evlist, struct perf_mmap *map, 
 	dom->poll_fd = -1;
 	INIT_HLIST_NODE(&dom->poll_node);
 	INIT_LIST_HEAD(&dom->thread_node);
-	list_add_tail(&dom->map_node, &map->domains);
+	list_add_tail(&dom->map_node, &map->domain_list);
 	if (th) {
 		dom->thread = th;
-		list_add_tail(&dom->thread_node, &th->domains);
+		list_add_tail(&dom->thread_node, &th->domain_list);
 	} else
 		map->cpu_domain = dom;
 	perf_mmap__get(map);
@@ -950,7 +954,7 @@ static bool perf_evlist__mmap_domain_put(struct perf_evlist *evlist,
 	if (map->poll_domain == dom)
 		map->poll_domain = NULL;
 
-	lost = list_empty(&map->domains);
+	lost = list_empty(&map->domain_list);
 	if (lost)
 		perf_evlist__mmap_unregister(evlist, map);
 	else
@@ -978,21 +982,17 @@ static void perf_evlist__mmap_domain_free(struct perf_mmap_domain *dom)
 
 /* Writer fds. */
 
-static void perf_evsel__set_sid_idx(struct perf_evsel *evsel, int idx, int cpu, int thread)
-{
-	struct perf_sample_id *sid = SID(evsel, cpu, thread);
-
-	sid->idx = idx;
-	sid->cpu = perf_cpu_map__cpu(evsel->cpus, cpu);
-	sid->tid = perf_thread_map__pid(evsel->threads, thread);
-}
-
-/* Any writer still attached can be the target of PERF_EVENT_IOC_SET_OUTPUT. */
+/*
+ * Any writer still attached can be the target of PERF_EVENT_IOC_SET_OUTPUT:
+ * the kernel redirects into the ring buffer of the target, whichever event
+ * mapped it. The fd that mapped it may be closed already: the VMA holds its
+ * file, so the event and its ring buffer stay until munmap.
+ */
 static int perf_evlist__mmap_output_fd(struct perf_mmap *map)
 {
 	struct perf_mmap_domain *dom;
 
-	list_for_each_entry(dom, &map->domains, map_node)
+	list_for_each_entry(dom, &map->domain_list, map_node)
 		if (dom->nr_fds)
 			return dom->fds[0].fd;
 	return -1;
@@ -1003,27 +1003,37 @@ static int perf_evlist__mmap_output_fd(struct perf_mmap *map)
  * maps the ring buffer; every later fd - from this evsel or from any other
  * one - redirects its output into it. Either way the fd joins the domain of
  * its task, or the cpu domain for pid=-1 and cgroup fds.
+ *
+ * Kernel constraints of PERF_EVENT_IOC_SET_OUTPUT, perf_event_set_output()
+ * fails with -EINVAL otherwise, and they make the ring buffer key (cpu, tid,
+ * overwrite): the target is on the same cpu, and for cpu == -1 on the same
+ * task; both use the same clock and the same write_backward; the redirected
+ * fd has no mmap of its own. The target may be any event on the ring buffer,
+ * see perf_evlist__mmap_output_fd().
  */
 int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
-				struct perf_evsel *evsel, int cpu, int thread)
+				struct perf_evsel_fd *entry)
 {
-	struct perf_evsel_fd *entry = perf_evsel__fd_entry(evsel, cpu, thread);
+	struct perf_evsel *evsel = entry->evsel;
 	bool overwrite = evsel->attr.write_backward;
+	bool has_id = evsel->attr.read_format & PERF_FORMAT_ID;
 	struct perf_mmap_domain *dom;
 	struct perf_mmap *map;
-	pid_t bind_tid, pid, tid;
+	pid_t bind_tid, tid;
 	int bind_cpu, err;
 
-	if (!entry || entry->fd < 0)
-		return 0;
 	if (!evlist->mmaped || !evsel->mmaped)
-		return evsel->sample_id ? perf_evlist__id_add_fd(evlist, evsel, cpu, thread, entry->fd) : 0;
+		return has_id ? perf_evlist__id_add_fd(evlist, entry) : 0;
 	if (entry->domain)
 		return 0;
 
-	perf_evsel__mmap_bind(evsel, cpu, thread, &bind_cpu, &bind_tid);
-	pid = perf_thread_map__pid(evsel->threads, thread);
-	tid = (pid < 0 || evsel->threads->map[thread].cgroup) ? -1 : pid;
+	/*
+	 * A cpu-bound fd writes into the ring buffer of its cpu, whatever its
+	 * task; a fd with cpu == -1 into the one of its thread.
+	 */
+	bind_cpu = entry->cpu;
+	bind_tid = entry->cpu >= 0 ? -1 : entry->tid;
+	tid = (entry->tid < 0 || entry->cgroup) ? -1 : entry->tid;
 
 	map = perf_evlist__find_mmap(evlist, bind_cpu, bind_tid, overwrite);
 	if (map) {
@@ -1042,7 +1052,7 @@ int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
 		if (dom && !dom->nr_fds) {
 			perf_evlist__mmap_domain_put(evlist, dom, NULL);
 			perf_evlist__mmap_domain_free(dom);
-		} else if (list_empty(&map->domains))
+		} else if (list_empty(&map->domain_list))
 			perf_evlist__mmap_unregister(evlist, map);
 		perf_mmap__put(map);
 		return -ENOMEM;
@@ -1052,13 +1062,10 @@ int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
 	perf_mmap__put(map);
 
 	err = perf_evlist_poll__update(evlist, map, dom->thread, dom);
-	if (!err && (evsel->attr.read_format & PERF_FORMAT_ID)) {
-		err = perf_evlist__id_add_fd(evlist, evsel, cpu, thread, entry->fd);
-		if (!err)
-			perf_evsel__set_sid_idx(evsel, map->idx, cpu, thread);
-	}
+	if (!err && has_id)
+		err = perf_evlist__id_add_fd(evlist, entry);
 	if (err)
-		perf_evlist__mmap_detach_fd(evlist, evsel, cpu, thread);
+		perf_evlist__mmap_detach_fd(evlist, entry);
 	return err;
 }
 
@@ -1067,23 +1074,11 @@ int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
  * buffer - with it; the fds of a dead domain only free the domain.
  */
 void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
-				 struct perf_evsel *evsel, int cpu, int thread)
+				 struct perf_evsel_fd *entry)
 {
-	struct perf_evsel_fd *entry = perf_evsel__fd_entry(evsel, cpu, thread);
 	struct perf_mmap_domain *dom;
 
-	if (!entry || entry->fd < 0)
-		return;
-
-	if (evsel->sample_id) {
-		struct perf_sample_id *sid = SID(evsel, cpu, thread);
-
-		if (sid && sid->evsel) {
-			perf_evsel__id_remove(evsel, sid->id);
-			hlist_del(&sid->node);
-			memset(sid, 0, sizeof(*sid));
-		}
-	}
+	perf_evlist__id_del(entry);
 
 	dom = entry->domain;
 	if (!dom)
@@ -1121,12 +1116,21 @@ static bool perf_evlist__thread_evsel(struct perf_evsel *evsel)
 /* Close the fds of @tid, which also frees its dead domains, and forget it. */
 static void perf_evlist__thread_close(struct perf_evlist *evlist, pid_t tid)
 {
+	struct perf_evsel *evsel, **order = perf_evlist__open_order(evlist);
 	struct perf_evlist_thread *th;
-	struct perf_evsel *evsel;
+	int i;
 
-	perf_evlist__for_each_entry_reverse(evlist, evsel) {
-		if (perf_evlist__thread_evsel(evsel))
-			perf_evsel__del_thread(evsel, tid);
+	if (order) {
+		for (i = evlist->nr_entries - 1; i >= 0; i--) {
+			if (perf_evlist__thread_evsel(order[i]))
+				perf_evsel__del_thread(order[i], tid);
+		}
+		free(order);
+	} else {
+		perf_evlist__for_each_entry_reverse(evlist, evsel) {
+			if (perf_evlist__thread_evsel(evsel))
+				perf_evsel__del_thread(evsel, tid);
+		}
 	}
 	th = perf_evlist__thread_find(evlist, tid);
 	if (th)
@@ -1134,15 +1138,17 @@ static void perf_evlist__thread_close(struct perf_evlist *evlist, pid_t tid)
 }
 
 /*
- * Order matters, a group member needs the leader's fd for the new thread, and
- * the leader comes first in the list.
+ * Order matters, a group member needs the leader's fd for the new thread: open
+ * in perf_evlist__open_order().
  */
 int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 {
 	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, pid);
+	struct perf_evsel_thread *th_fds;
+	struct perf_evsel_fd *entry;
 	struct perf_evsel *evsel;
 	struct perf_evsel **added;
-	int err, nr = 0, pass, i, cpu;
+	int err, nr = 0, pass, i;
 
 	/*
 	 * A previous thread with this tid that is still on its way out - tid
@@ -1152,18 +1158,19 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	if (th && (th->hup || th->del))
 		perf_evlist__thread_close(evlist, pid);
 
-	added = calloc(evlist->nr_entries, sizeof(*added));
+	/* In open order; the evsels taking the thread are compacted to the front. */
+	added = perf_evlist__open_order(evlist);
 	if (!added)
 		return -ENOMEM;
 	evlist->adding_thread = true;
 
-	perf_evlist__for_each_entry(evlist, evsel) {
+	for (i = 0; i < evlist->nr_entries; i++) {
+		evsel = added[i];
 		if (!perf_evlist__thread_evsel(evsel))
 			continue;
-		if (perf_thread_map__nr(evsel->threads) == 1 &&
-		    perf_thread_map__pid(evsel->threads, 0) == -1)
+		if (!evsel->opened || evsel->any_thread)
 			continue;
-		if (perf_thread_map__idx(evsel->threads, pid) >= 0)
+		if (perf_evsel__has_thread(evsel, pid))
 			continue;
 
 		err = perf_evsel__add_thread(evsel, pid);
@@ -1174,13 +1181,14 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	/* Watermark evsels create the ring buffers, see perf_evlist__mmap(). */
 	for (pass = 0; pass < 2; pass++) {
 		for (i = 0; i < nr; i++) {
-			int thread;
 			evsel = added[i];
 			if (!!evsel->attr.watermark != !pass)
 				continue;
-			thread = perf_thread_map__idx(evsel->threads, pid);
-			for (cpu = 0; cpu < perf_cpu_map__nr(evsel->cpus); cpu++) {
-				err = perf_evlist__mmap_attach_fd(evlist, evsel, cpu, thread);
+			th_fds = perf_evsel__thread_find(evsel, pid, false);
+			if (!th_fds)
+				continue;
+			list_for_each_entry(entry, &th_fds->fd_list, thread_node) {
+				err = perf_evlist__mmap_attach_fd(evlist, entry);
 				if (err)
 					goto out_del;
 			}
@@ -1202,12 +1210,19 @@ out_del:
 	while (nr)
 		perf_evsel__del_thread(added[--nr], pid);
 	th = perf_evlist__thread_find(evlist, pid);
-	if (th && list_empty(&th->domains))
+	if (th && list_empty(&th->domain_list))
 		perf_evlist__thread_free(evlist, th);
 	free(added);
 	return err;
 }
 
+/*
+ * Kernel constraints:
+ *  - the events of a task are all written by the time ptrace reports its
+ *    exit: do_exit() runs perf_event_exit_task() before exit_notify();
+ *  - the EPOLLHUP comes on every fd of the task once it exits, not before.
+ *    Until then a running thread keeps writing: disable its fds.
+ */
 int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
 {
 	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, pid);
@@ -1218,7 +1233,7 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
 	if (th && th->del)
 		return 0;
 	if (th && !th->hup)
-		list_for_each_entry(dom, &th->domains, thread_node)
+		list_for_each_entry(dom, &th->domain_list, thread_node)
 			live |= !dom->dead;
 
 	/* Stop the fds and wait for the EPOLLHUP to give up the ring buffers. */
@@ -1228,7 +1243,7 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
 			if (perf_evlist__thread_evsel(evsel))
 				perf_evsel__disable_thread(evsel, pid);
 		}
-		list_for_each_entry(dom, &th->domains, thread_node) {
+		list_for_each_entry(dom, &th->domain_list, thread_node) {
 			if (dom->map && dom->map->tid == pid)
 				perf_evlist__mmap_unhash(dom->map);
 		}
@@ -1239,6 +1254,12 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
 	return 1;
 }
 
+/*
+ * Kernel constraint: when a task exits, every event in its context enters
+ * PERF_EVENT_STATE_EXIT, not only the one of @fd, so the EPOLLHUP of one fd
+ * ends every task domain of the thread. pid=-1 and cgroup events are not in a
+ * task context: the cpu domain never sees EPOLLHUP.
+ */
 int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_hup *hup)
 {
 	struct perf_mmap_domain *dom = perf_evlist_poll__find(evlist, fd), *tmp;
@@ -1248,13 +1269,11 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_hup 
 	memset(hup, 0, sizeof(*hup));
 	hup->tid = -1;
 
-	/* The cpu domain never goes away on its own. */
 	if (!dom || !dom->thread || dom->thread->hup)
 		return 0;
 	th = dom->thread;
 
-	/* The task has exited: every event of it is in EXIT state, not just @fd's. */
-	list_for_each_entry(dom, &th->domains, thread_node)
+	list_for_each_entry(dom, &th->domain_list, thread_node)
 		if (!dom->dead)
 			nr++;
 	hup->maps = calloc(nr ?: 1, sizeof(*hup->maps));
@@ -1263,7 +1282,7 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_hup 
 
 	/* Set first: a dying thread needs no replacement hup fd. */
 	th->hup = true;
-	list_for_each_entry_safe(dom, tmp, &th->domains, thread_node) {
+	list_for_each_entry_safe(dom, tmp, &th->domain_list, thread_node) {
 		struct perf_evlist_hup_map *m;
 
 		if (dom->dead)
@@ -1298,48 +1317,33 @@ void perf_evlist__hup_done(struct perf_evlist *evlist, struct perf_evlist_hup *h
 static int
 perf_evlist__mmap_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel)
 {
-	int nr_cpus = perf_cpu_map__nr(evsel->cpus);
-	int nr_threads = perf_thread_map__nr(evsel->threads);
-	int cpu, thread, err;
+	struct perf_evsel_fd *entry;
+	int err;
 
 	evsel->mmaped = true;
-	for (cpu = 0; cpu < nr_cpus; cpu++) {
-		for (thread = 0; thread < nr_threads; thread++) {
-			if (evsel->system_wide && thread)
-				continue;
-			if (!perf_thread_map__valid(evsel->threads, thread))
-				continue;
-			err = perf_evlist__mmap_attach_fd(evlist, evsel, cpu, thread);
-			if (err)
-				return err;
-		}
+	perf_evsel__for_each_fd(evsel, entry) {
+		err = perf_evlist__mmap_attach_fd(evlist, entry);
+		if (err)
+			return err;
 	}
 	return 0;
 }
 
+/*
+ * Kernel constraint: rb->watermark is a property of the ring buffer, fixed by
+ * the fd that mmap()s it; wakeup_events is a property of each event. So let
+ * the watermark evsels create the ring buffers first (pass 0) and have the
+ * wakeup_events evsels join them with SET_OUTPUT (pass 1). Within a pass,
+ * evsels are processed in the order they were added.
+ */
 int perf_evlist__mmap(struct perf_evlist *evlist, int pages)
 {
 	struct perf_evsel *evsel;
 	int pass, err;
 
 	evlist->mmap_len = (pages + 1) * page_size;
-
-	perf_evlist__for_each_entry(evlist, evsel) {
-		if ((evsel->attr.read_format & PERF_FORMAT_ID) &&
-		    evsel->sample_id == NULL &&
-		    perf_evsel__alloc_id(evsel, evsel->fd->max_x, evsel->fd->max_y) < 0)
-			return -ENOMEM;
-	}
-
 	evlist->mmaped = true;
 
-	/*
-	 * rb->watermark is a property of the ring buffer, fixed by the fd that
-	 * mmap()s it; wakeup_events is a property of each event. So let the
-	 * watermark evsels create the ring buffers first (pass 0) and have the
-	 * wakeup_events evsels join them with SET_OUTPUT (pass 1). Within a
-	 * pass, evsels are processed in the order they were added.
-	 */
 	for (pass = 0; pass < 2; pass++) {
 		perf_evlist__for_each_entry(evlist, evsel) {
 			if (!!evsel->attr.watermark != !pass)
@@ -1358,6 +1362,10 @@ int perf_evlist__mmap(struct perf_evlist *evlist, int pages)
 /*
  * Detaching every fd releases every domain, and with them the ring buffers.
  *
+ * Kernel constraint: when the last VMA of a ring buffer goes, perf_mmap_close()
+ * detaches every writer redirected into it, they drop their events from then
+ * on. So a ring buffer is unmapped only once it has no writer left.
+ *
  * Unregister all poll fds up front and keep them unregistered: detaching fds
  * one by one would otherwise hand the roles of each detached fd over to the
  * next one, whatever the order of the evsels.
@@ -1366,34 +1374,28 @@ void perf_evlist__munmap(struct perf_evlist *evlist)
 {
 	struct perf_evlist_thread *th;
 	struct perf_mmap_domain *dom;
+	struct perf_evsel_fd *entry;
 	struct hlist_node *tmp;
 	struct perf_evsel *evsel;
-	int cpu, thread, i;
+	int i;
 
 	evlist->munmapping = true;
 	for (i = 0; i < PERF_EVLIST__POLL_HLIST_SIZE; i++)
-		hlist_for_each_entry_safe(dom, tmp, &evlist->epoll.heads[i], poll_node)
+		hlist_for_each_entry_safe(dom, tmp, &evlist->epoll.poll_fd_heads[i], poll_node)
 			perf_evlist_poll__del(evlist, dom);
 
+	/* Also drops the sample ids. */
 	perf_evlist__for_each_entry(evlist, evsel) {
-		if (!evsel->fd)
-			continue;
-		for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++)
-			for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++)
-				perf_evlist__mmap_detach_fd(evlist, evsel, cpu, thread);
+		perf_evsel__for_each_fd(evsel, entry)
+			perf_evlist__mmap_detach_fd(evlist, entry);
 	}
 	for (i = 0; i < PERF_EVLIST__THREAD_HLIST_SIZE; i++)
-		hlist_for_each_entry_safe(th, tmp, &evlist->thread_heads[i], node)
+		hlist_for_each_entry_safe(th, tmp, &evlist->thread_heads[i], hnode)
 			perf_evlist__thread_free(evlist, th);
 	perf_evlist_poll__free(evlist);
 
-	perf_evlist__reset_id_hash(evlist);
-
-	perf_evlist__for_each_entry(evlist, evsel) {
-		if (evsel->attr.read_format & PERF_FORMAT_ID)
-			perf_evsel__free_id(evsel);
+	perf_evlist__for_each_entry(evlist, evsel)
 		evsel->mmaped = false;
-	}
 
 	evlist->mmaped = false;
 	evlist->munmapping = false;
@@ -1405,9 +1407,9 @@ perf_evlist__next_mmap(struct perf_evlist *evlist, struct perf_mmap *map,
 {
 	struct list_head *head = overwrite ? &evlist->mmap_ovw_list
 					   : &evlist->mmap_list;
-	struct list_head *next = map ? map->list.next : head->next;
+	struct list_head *next = map ? map->node.next : head->next;
 
-	return next == head ? NULL : list_entry(next, struct perf_mmap, list);
+	return next == head ? NULL : list_entry(next, struct perf_mmap, node);
 }
 
 /*
@@ -1455,74 +1457,51 @@ int perf_evlist__poll(struct perf_evlist *evlist, int timeout)
 	return perf_evlist__poll_mmap(evlist, timeout, NULL);
 }
 
-void __perf_evlist__set_leader(struct list_head *list, struct perf_evsel *leader)
-{
-	struct perf_evsel *evsel;
-	int n = 0;
-
-	__perf_evlist__for_each_entry(list, evsel) {
-		evsel->leader = leader;
-		n++;
-	}
-	leader->nr_members = n;
-}
-
-static bool perf_cpu_map__equal(struct perf_cpu_map *a, struct perf_cpu_map *b)
-{
-	if (a == b)
-		return true;
-	if (!a || !b || a->nr != b->nr)
-		return false;
-	return memcmp(a->map, b->map, a->nr * sizeof(a->map[0])) == 0;
-}
-
-static bool perf_thread_map__equal(struct perf_thread_map *a,
-				   struct perf_thread_map *b)
-{
-	int i;
-
-	if (a == b)
-		return true;
-	if (!a || !b || a->nr != b->nr)
-		return false;
-	for (i = 0; i < a->nr; i++)
-		if (a->map[i].pid != b->map[i].pid)
-			return false;
-	return true;
-}
-
 /*
- * The kernel only groups events that live in the same (cpu, pid) context, so
- * evsels are grouped by binding: each evsel joins the first earlier evsel with
- * the same cpu and thread map, and starts a group of its own otherwise. With a
- * uniformly bound evlist this is a single group led by the first evsel.
+ * Group every evsel of the evlist, as far as the kernel allows: a group lives
+ * in one (cpu, task or cgroup) context, so the group is decided per fd rather
+ * than per evsel, and the maps of the evsels need not match.
+ *
+ * The evsels are ranked by how much they cover: more cpus in their cpu map
+ * first, then more threads in their thread map, then the evlist order, see
+ * perf_evsel__rank_cmp(). On each (cpu, tid) the fd of the highest ranked
+ * evsel that has one there leads, the others there are its members, as far
+ * as perf_evsel__can_group() allows. E.g. with
+ * event1 on cpu 0-7 and event2 on cpu 0-3, event1 leads everywhere; the group
+ * on cpu 0 has two events, the one on cpu 7 only event1.
+ *
+ * The rank follows the maps the evsels are opened with; threads added later
+ * do not change it. PERF_FORMAT_GROUP reads return as many members as the
+ * group has on that (cpu, tid).
  */
 void perf_evlist__set_leader(struct perf_evlist *evlist)
 {
-	struct perf_evsel *evsel, *pos;
+	struct perf_evsel *evsel;
 
 	evlist->grouped = true;
 
 	perf_evlist__for_each_entry(evlist, evsel) {
-		struct perf_evsel *leader = evsel;
-
-		perf_evlist__for_each_entry(evlist, pos) {
-			if (pos == evsel)
-				break;
-			if (!pos->keep_disable && !evsel->keep_disable && pos->leader == pos &&
-			    perf_cpu_map__equal(pos->cpus, evsel->cpus) &&
-			    perf_thread_map__equal(pos->threads, evsel->threads)) {
-				leader = pos;
-				break;
-			}
-		}
-
-		evsel->leader = leader;
-		if (leader == evsel)
-			evsel->nr_members = 1;
-		else
-			leader->nr_members++;
+		evsel->leader = evsel;
+		evsel->nr_members = 1;
 	}
+}
+
+/* Whether some fd of @evsel leads a group with members. */
+static bool perf_evsel__leads_members(struct perf_evlist *evlist, struct perf_evsel *evsel)
+{
+	struct perf_evsel_fd *entry, *member;
+	struct perf_evsel *pos;
+
+	perf_evsel__for_each_fd(evsel, entry) {
+		if (entry->leader)
+			continue;
+		perf_evlist__for_each_entry(evlist, pos) {
+			member = __perf_evsel__fd_find(pos, entry->cpu, entry->tid, entry->cgroup);
+			if (member && member->leader == entry)
+				return true;
+		}
+	}
+	return false;
 }
 
 int perf_evlist__nr_groups(struct perf_evlist *evlist)
@@ -1531,6 +1510,12 @@ int perf_evlist__nr_groups(struct perf_evlist *evlist)
 	int nr_groups = 0;
 
 	perf_evlist__for_each_evsel(evlist, evsel) {
+		/* Grouped per fd: count the evsels leading somewhere, once open. */
+		if (evlist->grouped) {
+			if (perf_evsel__leads_members(evlist, evsel))
+				nr_groups++;
+			continue;
+		}
 		/*
 		 * evsels by default have a nr_members of 1, and they are their
 		 * own leader. If the nr_members is >1 then this is an

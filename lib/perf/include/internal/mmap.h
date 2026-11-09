@@ -40,7 +40,6 @@ struct perf_mmap {
 	int			 mask;
 	int			 cpu;
 	pid_t			 tid;
-	int			 idx;
 	refcount_t		 refcnt;
 	u64			 prev;
 	u64			 start;
@@ -51,14 +50,13 @@ struct perf_mmap {
 	void			*event_copy;
 	size_t			 event_copy_sz;
 	/*
-	 * Managed by the evlist. @list links it into evlist->mmap_list /
-	 * mmap_ovw_list, @hnode into the lookup hash. @domains holds the live
-	 * domains; @cpu_domain is the cpu domain of the pid=-1 writers, if any.
-	 * @poll_domain holds the fd polled for the data of the ring buffer.
+	 * Managed by the evlist. @cpu_domain is the cpu domain of the pid=-1
+	 * writers, if any. @poll_domain holds the fd polled for the data of
+	 * the ring buffer.
 	 */
-	struct list_head	 list;
-	struct hlist_node	 hnode;
-	struct list_head	 domains;
+	struct list_head	 node;         /* perf_evlist::mmap_list / mmap_ovw_list */
+	struct hlist_node	 hnode;        /* perf_evlist::mmap_heads */
+	struct list_head	 domain_list;  /* perf_mmap_domain::map_node */
 	struct perf_mmap_domain	*cpu_domain;
 	struct perf_mmap_domain	*poll_domain;  /* registered for EPOLLIN */
 	bool			 registered;

@@ -94,9 +94,9 @@ SYNOPSIS
 
   #define perf_evlist__for_each_evsel(evlist, pos)
 
-  void perf_evlist__set_maps(struct perf_evlist *evlist,
-                             struct perf_cpu_map *cpus,
-                             struct perf_thread_map *threads);
+  int perf_evlist__set_maps(struct perf_evlist *evlist,
+                            struct perf_cpu_map *cpus,
+                            struct perf_thread_map *threads);
   int perf_evlist__poll(struct perf_evlist *evlist, int timeout);
 
   int perf_evlist__mmap(struct perf_evlist *evlist, int pages);
@@ -136,8 +136,8 @@ SYNOPSIS
   void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu);
   int perf_evsel__mmap(struct perf_evsel *evsel, int pages);
   void perf_evsel__munmap(struct perf_evsel *evsel);
-  void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, int thread);
-  int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
+  void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, pid_t tid);
+  int perf_evsel__read(struct perf_evsel *evsel, int cpu, pid_t tid,
                        struct perf_counts_values *count);
   int perf_evsel__enable(struct perf_evsel *evsel);
   int perf_evsel__enable_cpu(struct perf_evsel *evsel, int cpu);
@@ -148,6 +148,14 @@ SYNOPSIS
   struct perf_cpu_map *perf_evsel__cpus(struct perf_evsel *evsel);
   struct perf_thread_map *perf_evsel__threads(struct perf_evsel *evsel);
   struct perf_event_attr *perf_evsel__attr(struct perf_evsel *evsel);
+  uint64_t perf_evsel__get_id(struct perf_evsel *evsel, int cpu, pid_t tid);
+  int perf_evsel__fd(struct perf_evsel *evsel, int cpu, pid_t tid);
+  struct perf_evsel_fd *perf_evsel__next_fd(struct perf_evsel *evsel,
+                                            struct perf_evsel_fd *prev);
+  int perf_evsel_fd__cpu(struct perf_evsel_fd *pos);
+  pid_t perf_evsel_fd__tid(struct perf_evsel_fd *pos);
+
+  #define perf_evsel__for_each_fd(evsel, pos)
 --
 
 *API to handle maps (perf ring buffers):*
@@ -158,7 +166,6 @@ SYNOPSIS
 
   struct perf_mmap;
 
-  int perf_mmap__idx(struct perf_mmap *map);
   void perf_mmap__consume(struct perf_mmap *map);
   int perf_mmap__read_init(struct perf_mmap *map);
   void perf_mmap__read_done(struct perf_mmap *map);

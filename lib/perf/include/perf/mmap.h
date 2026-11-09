@@ -10,7 +10,6 @@
 struct perf_mmap;
 union perf_event;
 
-LIBPERF_API int perf_mmap__idx(struct perf_mmap *map);
 /*
  * The binding of the ring buffer. A ring buffer is bound either to a cpu
  * (perf_mmap__cpu() >= 0, perf_mmap__tid() == -1) or to a thread

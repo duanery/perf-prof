@@ -31,9 +31,14 @@ LIBPERF_API void perf_evlist__disable(struct perf_evlist *evlist);
 	     (pos) != NULL;				\
 	     (pos) = perf_evlist__next((evlist), (pos)))
 
-LIBPERF_API void perf_evlist__set_maps(struct perf_evlist *evlist,
-				       struct perf_cpu_map *cpus,
-				       struct perf_thread_map *threads);
+/*
+ * The maps every evsel without its own maps opens on. They are fixed from
+ * perf_evlist__open() to perf_evlist__close(): -EBUSY in between. Threads
+ * come and go with perf_evlist__add_thread()/perf_evlist__del_thread().
+ */
+LIBPERF_API int perf_evlist__set_maps(struct perf_evlist *evlist,
+				      struct perf_cpu_map *cpus,
+				      struct perf_thread_map *threads);
 /*
  * Hand the poll fds over to an external poll loop. libperf decides which fds
  * to poll (one per domain of a ring buffer) and calls @add / @del as they

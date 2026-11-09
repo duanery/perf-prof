@@ -5,7 +5,6 @@ libperf-y += evsel.o
 libperf-y += evlist.o
 libperf-y += mmap.o
 libperf-y += zalloc.o
-libperf-y += xyarray.o
 libperf-y += lib.o
 
 $(OUTPUT)zalloc.o: ../../lib/zalloc.c FORCE

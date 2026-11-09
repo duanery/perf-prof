@@ -8,6 +8,7 @@
 #include <perf/core.h>
 
 struct perf_evsel;
+struct perf_evsel_fd;
 struct perf_event_attr;
 struct perf_cpu_map;
 struct perf_thread_map;
@@ -31,9 +32,9 @@ LIBPERF_API void perf_evsel__close(struct perf_evsel *evsel);
 LIBPERF_API void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu);
 LIBPERF_API int perf_evsel__mmap(struct perf_evsel *evsel, int pages);
 LIBPERF_API void perf_evsel__munmap(struct perf_evsel *evsel);
-LIBPERF_API void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, int thread);
+LIBPERF_API void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, pid_t tid);
 LIBPERF_API int perf_evsel__read_size(struct perf_evsel *evsel);
-LIBPERF_API int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
+LIBPERF_API int perf_evsel__read(struct perf_evsel *evsel, int cpu, pid_t tid,
 				 struct perf_counts_values *count);
 LIBPERF_API int perf_evsel__enable(struct perf_evsel *evsel);
 LIBPERF_API int perf_evsel__enable_cpu(struct perf_evsel *evsel, int cpu);
@@ -60,10 +61,31 @@ LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct pe
  */
 LIBPERF_API int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);
-LIBPERF_API bool perf_evsel__is_group_leader(struct perf_evsel *evsel, int cpu, int thread);
+LIBPERF_API bool perf_evsel__is_group_leader(struct perf_evsel *evsel, int cpu, pid_t tid);
 LIBPERF_API struct perf_cpu_map *perf_evsel__cpus(struct perf_evsel *evsel);
+/*
+ * The threads the evsel has fds for. Until a thread is added or removed this
+ * is the thread map it was opened with; after that a snapshot in open order,
+ * valid until the next change.
+ */
 LIBPERF_API struct perf_thread_map *perf_evsel__threads(struct perf_evsel *evsel);
 LIBPERF_API struct perf_event_attr *perf_evsel__attr(struct perf_evsel *evsel);
-LIBPERF_API uint64_t perf_evsel__get_id(struct perf_evsel *evsel, int cpu, int thread);
+LIBPERF_API uint64_t perf_evsel__get_id(struct perf_evsel *evsel, int cpu, pid_t tid);
+
+/*
+ * The fds of an evsel, addressed by the cpu and pid values they were opened
+ * with (-1 included; for a cgroup the pid is the cgroup fd). Iterate them with
+ * perf_evsel__for_each_fd(); perf_evsel__fd() returns -1 when there is none.
+ */
+LIBPERF_API int perf_evsel__fd(struct perf_evsel *evsel, int cpu, pid_t tid);
+LIBPERF_API struct perf_evsel_fd *perf_evsel__next_fd(struct perf_evsel *evsel,
+						      struct perf_evsel_fd *prev);
+LIBPERF_API int perf_evsel_fd__cpu(struct perf_evsel_fd *pos);
+LIBPERF_API pid_t perf_evsel_fd__tid(struct perf_evsel_fd *pos);
+
+#define perf_evsel__for_each_fd(evsel, pos)			\
+	for ((pos) = perf_evsel__next_fd((evsel), NULL);	\
+	     (pos) != NULL;					\
+	     (pos) = perf_evsel__next_fd((evsel), (pos)))
 
 #endif /* __LIBPERF_EVSEL_H */
