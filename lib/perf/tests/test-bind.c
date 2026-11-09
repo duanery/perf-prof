@@ -551,11 +551,11 @@ static int ext_wait_in(struct perf_evlist *evlist, struct ext_poll *ext)
 	return -2;
 }
 
-static int poll_hup(struct perf_evlist *evlist, struct ext_poll *ext, struct perf_evlist_hup *hup)
+static int poll_hup(struct perf_evlist *evlist, struct ext_poll *ext, struct perf_evlist_reap *reap)
 {
 	int fd = ext_wait_hup(ext);
 
-	if (fd < 0 || perf_evlist__hup(evlist, fd, hup) < 0)
+	if (fd < 0 || perf_evlist__hup(evlist, fd, reap) < 0)
 		return -1;
 	return fd;
 }
@@ -578,7 +578,7 @@ static int test_poll_domains(int id)
 	struct perf_evsel *tasks = perf_evsel__new(&attr), *watermark, *cpuwide;
 	struct perf_cpu_map *all = perf_cpu_map__new(NULL);
 	struct perf_thread_map *threads = perf_thread_map__new_dummy(), *any = perf_thread_map__new_dummy();
-	struct perf_evlist_hup hup;
+	struct perf_evlist_reap reap;
 	struct perf_evsel_fd *entry;
 	struct perf_mmap *map;
 	int ncpus = perf_cpu_map__nr(all), i, retired;
@@ -609,12 +609,12 @@ static int test_poll_domains(int id)
 
 	/* The first thread to exit hands the data role to the other one. */
 	child_stop(&a);
-	__T("EPOLLHUP of the first thread", poll_hup(list, &ext, &hup) >= 0);
-	__T("EPOLLHUP names the thread", hup.tid == a.pid && !hup.complete);
-	__T("every cpu ring buffer of the thread is reported", hup.nr_maps == ncpus);
-	for (i = 0; i < hup.nr_maps; i++)
-		__T("ring buffers still have a writer", !hup.maps[i].retired);
-	perf_evlist__hup_done(list, &hup);
+	__T("EPOLLHUP of the first thread", poll_hup(list, &ext, &reap) >= 0);
+	__T("EPOLLHUP names the thread", reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == a.pid && !reap.complete);
+	__T("every cpu ring buffer of the thread is reported", reap.nr_maps == ncpus);
+	for (i = 0; i < reap.nr_maps; i++)
+		__T("ring buffers still have a writer", !reap.maps[i].retired);
+	perf_evlist__reap_done(list, &reap);
 	__T("the other thread's fds take over", list->epoll.nr_live == ncpus);
 	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
 	__T("delete after EPOLLHUP closes the thread", perf_evlist__del_thread(list, a.pid) == 1);
@@ -638,8 +638,8 @@ static int test_poll_domains(int id)
 	child_poke(&c);
 	__T("the third thread samples", drain(list, -1) == 2);
 	child_stop(&c);
-	__T("EPOLLHUP of the third thread", poll_hup(list, &ext, &hup) >= 0 && hup.tid == c.pid);
-	perf_evlist__hup_done(list, &hup);
+	__T("EPOLLHUP of the third thread", poll_hup(list, &ext, &reap) >= 0 && reap.tid == c.pid);
+	perf_evlist__reap_done(list, &reap);
 	__T("the third thread is closed", perf_evlist__del_thread(list, c.pid) == 1);
 
 	/* A pid=-1 writer takes the data role; the thread keeps one hup fd. */
@@ -656,12 +656,12 @@ static int test_poll_domains(int id)
 
 	/* The thread's EPOLLHUP still arrives through its hup fd. */
 	child_stop(&b);
-	__T("EPOLLHUP next to a pid=-1 writer", poll_hup(list, &ext, &hup) >= 0);
-	__T("EPOLLHUP names the last thread", hup.tid == b.pid && !hup.complete);
-	__T("every cpu ring buffer is reported", hup.nr_maps == ncpus);
-	for (i = 0; i < hup.nr_maps; i++)
-		__T("the pid=-1 writers keep the ring buffers", !hup.maps[i].retired);
-	perf_evlist__hup_done(list, &hup);
+	__T("EPOLLHUP next to a pid=-1 writer", poll_hup(list, &ext, &reap) >= 0);
+	__T("EPOLLHUP names the last thread", reap.tid == b.pid && !reap.complete);
+	__T("every cpu ring buffer is reported", reap.nr_maps == ncpus);
+	for (i = 0; i < reap.nr_maps; i++)
+		__T("the pid=-1 writers keep the ring buffers", !reap.maps[i].retired);
+	perf_evlist__reap_done(list, &reap);
 	__T("only the pid=-1 data fds are left", list->epoll.nr_live == ncpus);
 	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, b.pid) == 1);
 	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, b.pid));
@@ -751,7 +751,7 @@ static int test_thread_exit(int id)
 	struct perf_evsel *evsel = perf_evsel__new(&attr);
 	struct perf_cpu_map *cpus = perf_cpu_map__dummy_new();
 	struct perf_thread_map *threads = perf_thread_map__new_dummy();
-	struct perf_evlist_hup hup;
+	struct perf_evlist_reap reap;
 	struct perf_mmap *map;
 	int fd;
 
@@ -775,25 +775,25 @@ static int test_thread_exit(int id)
 	child_stop(&b);
 	__T("delete before EPOLLHUP waits", perf_evlist__del_thread(list, b.pid) == 0);
 	__T("a second delete is a no-op", perf_evlist__del_thread(list, b.pid) == 0);
-	fd = poll_hup(list, &ext, &hup);
+	fd = poll_hup(list, &ext, &reap);
 	__T("EPOLLHUP after delete", fd >= 0);
-	__T("EPOLLHUP completes the delete", hup.tid == b.pid && hup.complete);
-	__T("the thread ring buffer is retired", hup.nr_maps == 1 && hup.maps[0].map == map && hup.maps[0].retired);
+	__T("EPOLLHUP completes the delete", reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == b.pid && reap.complete);
+	__T("the thread ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map && reap.maps[0].retired);
 	__T("the retired ring buffer is gone from the evlist", nr_mmaps(list) == 2);
 	__T("events before the exit are still readable", perf_mmap__read_init(map) == 0 &&
 	    perf_mmap__read_event(map, &(bool){false}) != NULL);
 	perf_mmap__read_done(map);
 	__T("fds stay open until the EPOLLHUP is done", perf_evsel__has_thread(evsel, b.pid));
-	perf_evlist__hup_done(list, &hup);
+	perf_evlist__reap_done(list, &reap);
 	__T("done closes the thread", !perf_evsel__has_thread(evsel, b.pid));
-	__T("a second EPOLLHUP is ignored", !perf_evlist__hup(list, fd, &hup) && hup.tid == -1);
-	perf_evlist__hup_done(list, &hup);
+	__T("a second EPOLLHUP is ignored", !perf_evlist__hup(list, fd, &reap) && reap.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, &reap);
 
 	/* EPOLLHUP first: the delete completes at once. */
 	child_stop(&c);
-	__T("EPOLLHUP before delete", poll_hup(list, &ext, &hup) >= 0);
-	__T("EPOLLHUP alone does not complete", hup.tid == c.pid && !hup.complete);
-	perf_evlist__hup_done(list, &hup);
+	__T("EPOLLHUP before delete", poll_hup(list, &ext, &reap) >= 0);
+	__T("EPOLLHUP alone does not complete", reap.tid == c.pid && !reap.complete);
+	perf_evlist__reap_done(list, &reap);
 	__T("fds stay open until the delete", perf_evsel__has_thread(evsel, c.pid));
 	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, c.pid) == 1);
 	__T("delete closes the thread", !perf_evsel__has_thread(evsel, c.pid));
