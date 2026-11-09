@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <time.h>
 #include <linux/perf_event.h>
 #include <perf/core.h>
 #include <perf/cpumap.h>
@@ -20,7 +21,6 @@
 #include <perf/event.h>
 #include <internal/evlist.h>
 #include <internal/evsel.h>
-#include <internal/xyarray.h>
 #include <internal/mmap.h>
 #include <internal/threadmap.h>
 #include <internal/tests.h>
@@ -56,6 +56,17 @@ static int nr_mmaps(struct perf_evlist *evlist)
 
 	perf_evlist__for_each_mmap(evlist, map, false)
 		nr++;
+	return nr;
+}
+
+static int nr_ids(struct perf_evlist *evlist)
+{
+	struct perf_sample_id *sid;
+	int i, nr = 0;
+
+	for (i = 0; i < PERF_EVLIST__ID_HLIST_SIZE; i++)
+		hlist_for_each_entry(sid, &evlist->id_heads[i], node)
+			nr++;
 	return nr;
 }
 
@@ -199,12 +210,12 @@ static int test_mmap_sharing(int id)
 	    perf_mmap__oncpu(perf_evlist__find_mmap(evlist, 0, -1, false)));
 
 	__T("evsels sharing a ring buffer need distinct ids",
-	    perf_evsel__get_id(e1, 0, 0) != perf_evsel__get_id(e2, 0, 0));
+	    perf_evsel__get_id(e1, 0, -1) != perf_evsel__get_id(e2, 0, -1));
 	__T("id does not map back to its evsel",
-	    perf_evlist__id_to_evsel(evlist, perf_evsel__get_id(e2, 0, 0),
+	    perf_evlist__id_to_evsel(evlist, perf_evsel__get_id(e2, 0, -1),
 				     NULL) == e2);
 	__T("id does not map back to the own-cpu evsel",
-	    perf_evlist__id_to_evsel(evlist, perf_evsel__get_id(e3, 0, 0),
+	    perf_evlist__id_to_evsel(evlist, perf_evsel__get_id(e3, 0, -1),
 				     NULL) == e3);
 
 	perf_evlist__delete(evlist);
@@ -213,18 +224,23 @@ static int test_mmap_sharing(int id)
 	return 0;
 }
 
-/* Grouping follows the binding: a different binding means a different group. */
-static int test_group_by_bind(int id)
+/*
+ * Grouping is per fd: on each cpu the evsel covering the most cpus leads,
+ * whatever the evlist order, and the groups differ in size per cpu.
+ */
+static int test_group_by_rank(int id)
 {
 	struct perf_event_attr attr = {
 		.type		= PERF_TYPE_TRACEPOINT,
 		.config		= id,
 		.size		= sizeof(attr),
 		.disabled	= 1,
+		.read_format	= PERF_FORMAT_GROUP | PERF_FORMAT_ID,
 	};
 	struct perf_cpu_map *cpus, *cpu0;
 	struct perf_evsel *e1, *e2, *e3;
 	struct perf_evlist *evlist;
+	u64 counts[7];
 
 	cpus = perf_cpu_map__new("0-1");
 	cpu0 = perf_cpu_map__new("0");
@@ -232,6 +248,12 @@ static int test_group_by_bind(int id)
 
 	evlist = perf_evlist__new();
 	__T("failed to create evlist", evlist);
+
+	/* e3 comes first but covers a single cpu. */
+	e3 = perf_evsel__new(&attr);
+	__T("failed to create evsel3", e3);
+	perf_evsel__set_own_cpus(e3, cpu0);
+	perf_evlist__add(evlist, e3);
 
 	e1 = perf_evsel__new(&attr);
 	__T("failed to create evsel1", e1);
@@ -241,20 +263,21 @@ static int test_group_by_bind(int id)
 	__T("failed to create evsel2", e2);
 	perf_evlist__add(evlist, e2);
 
-	e3 = perf_evsel__new(&attr);
-	__T("failed to create evsel3", e3);
-	perf_evsel__set_own_cpus(e3, cpu0);
-	perf_evlist__add(evlist, e3);
-
-	perf_evlist__set_maps(evlist, cpus, NULL);
 	perf_evlist__set_leader(evlist);
+	perf_evlist__set_maps(evlist, cpus, NULL);
+	__T("failed to open evlist", !perf_evlist__open(evlist));
 
-	__T("evsel1 should lead", e1->leader == e1);
-	__T("evsel2 should join evsel1", e2->leader == e1);
-	__T("evsel1 should have two members", e1->nr_members == 2);
-	__T("evsel3 should lead its own group", e3->leader == e3);
-	__T("expected a single multi-member group",
-	    perf_evlist__nr_groups(evlist) == 1);
+	__T("evsel1 should lead cpu0", perf_evsel__is_group_leader(e1, 0, -1));
+	__T("evsel1 should lead cpu1", perf_evsel__is_group_leader(e1, 1, -1));
+	__T("evsel2 should be a member on cpu0", !perf_evsel__is_group_leader(e2, 0, -1));
+	__T("evsel3 should be a member on cpu0", !perf_evsel__is_group_leader(e3, 0, -1));
+	__T("evsel3 should join evsel1",
+	    perf_evsel__fd_find(e3, 0, -1)->leader == perf_evsel__fd_find(e1, 0, -1));
+	__T("expected a single leading evsel", perf_evlist__nr_groups(evlist) == 1);
+	__T("read cpu0 group", !perf_evsel__read(e1, 0, -1, (void *)counts));
+	__T("cpu0 has three events", counts[0] == 3);
+	__T("read cpu1 group", !perf_evsel__read(e1, 1, -1, (void *)counts));
+	__T("cpu1 has two events", counts[0] == 2);
 
 	perf_evlist__delete(evlist);
 	perf_cpu_map__put(cpus);
@@ -320,10 +343,10 @@ static int test_dynamic_threads(int id)
 	__T("expected a ring buffer per thread", nr_mmaps(evlist) == 2);
 	__T("no ring buffer bound to thread b",
 	    perf_evlist__find_mmap(evlist, -1, b.pid, false));
-	__T("thread b missing from the evsel thread map",
-	    perf_thread_map__idx(evsel->threads, b.pid) >= 0);
-	__T("the evlist thread map should stay untouched",
-	    perf_thread_map__nr(threads) == 1 && threads != evsel->threads);
+	__T("thread b missing from the evsel threads",
+	    perf_thread_map__idx(perf_evsel__threads(evsel), b.pid) >= 0);
+	__T("the input thread map should stay untouched",
+	    perf_thread_map__nr(threads) == 1 && threads == evsel->threads);
 
 	child_poke(&a);
 	child_poke(&b);
@@ -338,8 +361,8 @@ static int test_dynamic_threads(int id)
 	__T("the ring buffer of thread b should not be found any more",
 	    !perf_evlist__find_mmap(evlist, -1, b.pid, false));
 	__T("the ring buffer of thread b should still be readable", nr_mmaps(evlist) == 2);
-	__T("thread b keeps its slot until its fds are closed",
-	    perf_thread_map__idx(evsel->threads, b.pid) >= 0);
+	__T("thread b keeps its fds until they are closed",
+	    perf_evsel__has_thread(evsel, b.pid));
 	child_poke(&b);
 	usleep(50000);
 	__T("a deleted thread should not be sampled", drain(evlist, b.pid) == 0);
@@ -349,8 +372,9 @@ static int test_dynamic_threads(int id)
 	for (i = 0; i < 10 && nr_mmaps(evlist) == 2; i++)
 		perf_evlist__poll(evlist, 100);
 	__T("EPOLLHUP should release the ring buffer of thread b", nr_mmaps(evlist) == 1);
-	__T("thread b should leave a hole behind",
-	    perf_thread_map__idx(evsel->threads, b.pid) < 0);
+	__T("thread b should be gone from the evsel",
+	    !perf_evsel__has_thread(evsel, b.pid) &&
+	    perf_thread_map__idx(perf_evsel__threads(evsel), b.pid) < 0);
 
 	/* The remaining thread keeps being sampled. */
 	child_poke(&a);
@@ -358,28 +382,26 @@ static int test_dynamic_threads(int id)
 	__T("no sample from thread a after the delete",
 	    drain(evlist, a.pid) == 1);
 
-	/* Adding reuses the hole rather than growing the map. */
 	err = perf_evlist__add_thread(evlist, c.pid);
 	__T("failed to add thread c", !err);
-	__T("adding a thread should reuse the hole",
-	    perf_thread_map__nr(evsel->threads) == 2);
+	__T("the threads should be a and c, in open order",
+	    perf_thread_map__nr(perf_evsel__threads(evsel)) == 2 &&
+	    perf_thread_map__pid(perf_evsel__threads(evsel), 0) == a.pid &&
+	    perf_thread_map__pid(perf_evsel__threads(evsel), 1) == c.pid);
 	child_poke(&c);
 	usleep(50000);
 	__T("no sample from the added thread", drain(evlist, c.pid) == 1);
 
 	/*
 	 * Adding a tid whose delete is still pending replaces the old thread
-	 * outright. Hole reuse used to append to evsel->id[] without removing
-	 * the previous id, and overflowed the bag after a few cycles.
+	 * outright, its sample ids included.
 	 */
 	for (i = 0; i < 32; i++) {
 		err = perf_evlist__del_thread(evlist, c.pid);
 		__T("failed to delete thread c in reuse loop", !err);
 		err = perf_evlist__add_thread(evlist, c.pid);
 		__T("failed to re-add thread c in reuse loop", !err);
-		__T("id bag grew past the sample_id slots",
-		    evsel->ids <= (u32)(xyarray__max_x(evsel->sample_id) *
-					xyarray__max_y(evsel->sample_id)));
+		__T("only the ids of a and c remain", nr_ids(evlist) == 2);
 	}
 	__T("a replaced thread should not leave its ring buffer behind", nr_mmaps(evlist) == 2);
 	child_poke(&c);
@@ -393,11 +415,6 @@ static int test_dynamic_threads(int id)
 	child_stop(&a);
 	child_stop(&c);
 	return 0;
-}
-
-static int binding_fd(struct perf_evsel *evsel, int cpu, int thread)
-{
-	return perf_evsel__fd_entry(evsel, cpu, thread)->fd;
 }
 
 static int test_independent_threads(int id)
@@ -414,7 +431,7 @@ static int test_independent_threads(int id)
 	struct perf_thread_map *threads = perf_thread_map__new_dummy();
 	struct perf_mmap *map;
 	u64 first_id, second_id;
-	int i, slot;
+	int i;
 
 	__T("start first child", !child_start(&a));
 	__T("start second child", !child_start(&b));
@@ -430,9 +447,9 @@ static int test_independent_threads(int id)
 
 	__T("add only to first evsel", !perf_evsel__add_thread(first, b.pid));
 	__T("caller map remains valid", perf_thread_map__nr(threads) == 1);
-	__T("second map remains independent", perf_thread_map__idx(second->threads, b.pid) == -1);
+	__T("second evsel remains independent", !perf_evsel__has_thread(second, b.pid));
 	__T("evlist does not drive explicit bindings", !perf_evlist__add_thread(list, b.pid));
-	__T("explicit binding unchanged", perf_thread_map__idx(second->threads, b.pid) == -1);
+	__T("explicit binding unchanged", !perf_evsel__has_thread(second, b.pid));
 	child_poke(&b);
 	__T("first evsel samples added thread", drain(list, b.pid) == 1);
 	__T("delete added thread", !perf_evsel__del_thread(first, b.pid));
@@ -440,8 +457,8 @@ static int test_independent_threads(int id)
 
 	/* The ring buffer outlives the fd it was mapped from. */
 	map = perf_evlist__find_mmap(list, -1, a.pid, false);
-	first_id = perf_evsel__get_id(first, 0, 0);
-	second_id = perf_evsel__get_id(second, 0, 0);
+	first_id = perf_evsel__get_id(first, -1, a.pid);
+	second_id = perf_evsel__get_id(second, -1, a.pid);
 	__T("delete shared map creator", !perf_evsel__del_thread(first, a.pid));
 	__T("ring buffer survives its creator", perf_evlist__find_mmap(list, -1, a.pid, false) == map);
 	__T("deleted id removed", !perf_evlist__id_to_evsel(list, first_id, NULL));
@@ -449,9 +466,8 @@ static int test_independent_threads(int id)
 	child_poke(&a);
 	__T("surviving writer still samples", drain(list, a.pid) == 1);
 	__T("rejoin after creator removal", !perf_evsel__add_thread(first, a.pid));
-	slot = perf_thread_map__idx(first->threads, a.pid);
 	__T("rejoined writer is in the ring buffer domain",
-	    perf_evsel__fd_entry(first, 0, slot)->domain == perf_evsel__fd_entry(second, 0, 0)->domain);
+	    perf_evsel__fd_find(first, -1, a.pid)->domain == perf_evsel__fd_find(second, -1, a.pid)->domain);
 	child_poke(&a);
 	__T("both writers still sample", drain(list, a.pid) == 2);
 
@@ -459,9 +475,9 @@ static int test_independent_threads(int id)
 		__T("add churn thread", !perf_evsel__add_thread(first, b.pid));
 		__T("delete churn thread", !perf_evsel__del_thread(first, b.pid));
 	}
-	__T("thread storage bounded by concurrency", perf_thread_map__nr(first->threads) == 2);
+	__T("fds follow the live threads", first->nr_fds == 1);
 	__T("only live map remains", nr_mmaps(list) == 1);
-	__T("only live ids remain", first->ids == 1 && second->ids == 1);
+	__T("only live ids remain", nr_ids(list) == 2);
 	__T("one poll fd for the two writers of a thread", list->epoll.nr_live == 1);
 	perf_evlist__delete(list);
 	perf_cpu_map__put(cpus);
@@ -527,7 +543,7 @@ static int ext_wait_in(struct perf_evlist *evlist, struct ext_poll *ext)
 			if (!(events[i].events & EPOLLIN))
 				continue;
 			for (h = 0; h < PERF_EVLIST__POLL_HLIST_SIZE; h++)
-				hlist_for_each_entry(dom, &evlist->epoll.heads[h], poll_node)
+				hlist_for_each_entry(dom, &evlist->epoll.poll_fd_heads[h], poll_node)
 					if (dom->poll_fd == events[i].data.fd)
 						return dom->tid;
 		}
@@ -563,6 +579,7 @@ static int test_poll_domains(int id)
 	struct perf_cpu_map *all = perf_cpu_map__new(NULL);
 	struct perf_thread_map *threads = perf_thread_map__new_dummy(), *any = perf_thread_map__new_dummy();
 	struct perf_evlist_hup hup;
+	struct perf_evsel_fd *entry;
 	struct perf_mmap *map;
 	int ncpus = perf_cpu_map__nr(all), i, retired;
 
@@ -601,7 +618,7 @@ static int test_poll_domains(int id)
 	__T("the other thread's fds take over", list->epoll.nr_live == ncpus);
 	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
 	__T("delete after EPOLLHUP closes the thread", perf_evlist__del_thread(list, a.pid) == 1);
-	__T("the closed thread leaves a hole", perf_thread_map__idx(tasks->threads, a.pid) < 0);
+	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, a.pid));
 
 	/*
 	 * The fds the ring buffers were mapped from are closed now; the VMAs
@@ -630,10 +647,9 @@ static int test_poll_domains(int id)
 	perf_evsel__set_own_threads(cpuwide, any);
 	perf_evlist__add(list, cpuwide);
 	__T("open a pid=-1 writer", !perf_evsel__open(cpuwide, all, any));
-	perf_evsel__alloc_id(cpuwide, ncpus, 1);
 	cpuwide->mmaped = true;
-	for (i = 0; i < ncpus; i++)
-		__T("attach the pid=-1 writer", !perf_evlist__mmap_attach_fd(list, cpuwide, i, 0));
+	perf_evsel__for_each_fd(cpuwide, entry)
+		__T("attach the pid=-1 writer", !perf_evlist__mmap_attach_fd(list, entry));
 	__T("pid=-1 data fds plus one hup fd", list->epoll.nr_live == ncpus + 1);
 	perf_evlist__for_each_mmap(list, map, false)
 		__T("the cpu domain polls the data", map->poll_domain == map->cpu_domain);
@@ -648,11 +664,11 @@ static int test_poll_domains(int id)
 	perf_evlist__hup_done(list, &hup);
 	__T("only the pid=-1 data fds are left", list->epoll.nr_live == ncpus);
 	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, b.pid) == 1);
-	__T("the closed thread leaves a hole", perf_thread_map__idx(tasks->threads, b.pid) < 0);
+	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, b.pid));
 
 	/* The last writer takes the ring buffers along. */
-	for (i = 0; i < ncpus; i++)
-		perf_evlist__mmap_detach_fd(list, cpuwide, i, 0);
+	perf_evsel__for_each_fd(cpuwide, entry)
+		perf_evlist__mmap_detach_fd(list, entry);
 	retired = nr_mmaps(list);
 	__T("ring buffers without writers are gone", retired == 0);
 	__T("nothing left to poll", list->epoll.nr_live == 0 && ext.nr_add == ext.nr_del);
@@ -767,9 +783,9 @@ static int test_thread_exit(int id)
 	__T("events before the exit are still readable", perf_mmap__read_init(map) == 0 &&
 	    perf_mmap__read_event(map, &(bool){false}) != NULL);
 	perf_mmap__read_done(map);
-	__T("fds stay open until the EPOLLHUP is done", perf_thread_map__idx(evsel->threads, b.pid) >= 0);
+	__T("fds stay open until the EPOLLHUP is done", perf_evsel__has_thread(evsel, b.pid));
 	perf_evlist__hup_done(list, &hup);
-	__T("done closes the thread", perf_thread_map__idx(evsel->threads, b.pid) < 0);
+	__T("done closes the thread", !perf_evsel__has_thread(evsel, b.pid));
 	__T("a second EPOLLHUP is ignored", !perf_evlist__hup(list, fd, &hup) && hup.tid == -1);
 	perf_evlist__hup_done(list, &hup);
 
@@ -778,9 +794,9 @@ static int test_thread_exit(int id)
 	__T("EPOLLHUP before delete", poll_hup(list, &ext, &hup) >= 0);
 	__T("EPOLLHUP alone does not complete", hup.tid == c.pid && !hup.complete);
 	perf_evlist__hup_done(list, &hup);
-	__T("fds stay open until the delete", perf_thread_map__idx(evsel->threads, c.pid) >= 0);
+	__T("fds stay open until the delete", perf_evsel__has_thread(evsel, c.pid));
 	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, c.pid) == 1);
-	__T("delete closes the thread", perf_thread_map__idx(evsel->threads, c.pid) < 0);
+	__T("delete closes the thread", !perf_evsel__has_thread(evsel, c.pid));
 	__T("only the first thread is left", nr_mmaps(list) == 1 && list->epoll.nr_live == 1);
 	__T("every registered fd was unregistered", ext.nr_add - ext.nr_del == 1);
 
@@ -816,17 +832,175 @@ static int test_mixed_groups(int id)
 	perf_evlist__set_leader(list);
 	perf_evlist__set_maps(list, both, threads);
 	__T("open partially overlapping groups", !perf_evlist__open(list));
-	__T("first cpu0 event is leader", perf_evsel__is_group_leader(a, 0, 0));
-	__T("second cpu0 event joins leader", !perf_evsel__is_group_leader(b, 0, 0));
-	__T("second event leads cpu1", perf_evsel__is_group_leader(b, 1, 0));
-	__T("group member uses correct fd", perf_evsel__fd_entry(b, 0, 0)->group_fd == binding_fd(a, 0, 0));
-	__T("read cpu0 group", !perf_evsel__read(a, 0, 0, (void *)counts));
+	__T("the evsel on more cpus leads cpu0", perf_evsel__is_group_leader(b, 0, -1));
+	__T("the evsel on fewer cpus joins it", !perf_evsel__is_group_leader(a, 0, -1));
+	__T("the evsel on more cpus leads cpu1", perf_evsel__is_group_leader(b, 1, -1));
+	__T("group member uses correct leader",
+	    perf_evsel__fd_find(a, 0, -1)->leader == perf_evsel__fd_find(b, 0, -1));
+	__T("read cpu0 group", !perf_evsel__read(b, 0, -1, (void *)counts));
 	__T("cpu0 has both events", counts[0] == 2);
-	__T("read cpu1 group", !perf_evsel__read(b, 1, 0, (void *)counts));
+	__T("read cpu1 group", !perf_evsel__read(b, 1, -1, (void *)counts));
 	__T("cpu1 has one event", counts[0] == 1);
 	__T("count-only id lookup", perf_evlist__id_to_evsel(list, counts[2], NULL) == b);
 	perf_evsel__set_own_cpus(a, both);
 	__T("open cpu binding is immutable", perf_cpu_map__nr(a->cpus) == 1);
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpu0);
+	perf_cpu_map__put(both);
+	perf_thread_map__put(threads);
+	return 0;
+}
+
+/*
+ * Only a group leader can be pinned or exclusive, and a group has one clock:
+ * a pinned evsel may lead but not join, an evsel with another clock opens
+ * alone.
+ */
+static int test_group_constraints(int id)
+{
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID, .disabled = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *pinned, *member, *narrow, *clock;
+	struct perf_cpu_map *cpu0 = perf_cpu_map__new("0"), *both = perf_cpu_map__new("0-1");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	u64 counts[9];
+
+	attr.pinned = 1;
+	pinned = perf_evsel__new(&attr);
+	narrow = perf_evsel__new(&attr);
+	attr.pinned = 0;
+	member = perf_evsel__new(&attr);
+	attr.use_clockid = 1;
+	attr.clockid = CLOCK_MONOTONIC;
+	clock = perf_evsel__new(&attr);
+	perf_evsel__set_own_cpus(narrow, cpu0);
+	perf_evsel__set_own_cpus(clock, cpu0);
+	perf_evlist__add(list, pinned);
+	perf_evlist__add(list, member);
+	perf_evlist__add(list, narrow);
+	perf_evlist__add(list, clock);
+	perf_evlist__set_leader(list);
+	perf_evlist__set_maps(list, both, threads);
+	__T("open groups with pinned evsels", !perf_evlist__open(list));
+	__T("the pinned evsel leads cpu0", perf_evsel__is_group_leader(pinned, 0, -1));
+	__T("the pinned evsel leads cpu1", perf_evsel__is_group_leader(pinned, 1, -1));
+	__T("a non-pinned evsel joins it",
+	    perf_evsel__fd_find(member, 0, -1)->leader == perf_evsel__fd_find(pinned, 0, -1));
+	__T("a pinned evsel does not join", perf_evsel__is_group_leader(narrow, 0, -1));
+	__T("an evsel with another clock does not join", perf_evsel__is_group_leader(clock, 0, -1));
+	__T("read the pinned group", !perf_evsel__read(pinned, 0, -1, (void *)counts));
+	__T("the pinned group has two events", counts[0] == 2);
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpu0);
+	perf_cpu_map__put(both);
+	perf_thread_map__put(threads);
+	return 0;
+}
+
+static int nr_list(struct list_head *head)
+{
+	struct list_head *pos;
+	int nr = 0;
+
+	list_for_each(pos, head)
+		nr++;
+	return nr;
+}
+
+/*
+ * Every fd is on the fd_list of its cpu and of its thread. A thread record
+ * goes with its last fd, a cpu record stays for the threads added later. The
+ * evlist maps are fixed while the evlist is open.
+ */
+static int test_fd_index(int id)
+{
+	struct child a = {}, b = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TIME,
+		.disabled = 1, .wakeup_events = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *evsel = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0-1");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_evsel_thread *th;
+	struct perf_evsel_cpu *c;
+
+	__T("start first child", !child_start(&a));
+	__T("start second child", !child_start(&b));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__add(list, evsel);
+	__T("set maps before open", !perf_evlist__set_maps(list, cpus, threads));
+	__T("open the indexed evsel", !perf_evlist__open(list));
+	__T("maps are fixed while open", perf_evlist__set_maps(list, NULL, NULL) == -EBUSY);
+	__T("the evsel keeps its input maps",
+	    perf_evsel__cpus(evsel) == cpus && perf_evsel__threads(evsel) == threads);
+
+	__T("add a thread", !perf_evsel__add_thread(evsel, b.pid));
+	__T("two cpu records", nr_list(&evsel->cpu_list) == 2);
+	list_for_each_entry(c, &evsel->cpu_list, node)
+		__T("one fd per thread on every cpu", nr_list(&c->fd_list) == 2);
+	th = perf_evsel__thread_find(evsel, b.pid, false);
+	__T("the added thread has a record", th && nr_list(&th->fd_list) == 2);
+	__T("each fd holds the thread record", th->refcnt == 2);
+	__T("two thread records", nr_list(&evsel->thread_list) == 2);
+
+	__T("delete the first thread", !perf_evsel__del_thread(evsel, a.pid));
+	__T("its record goes with its fds", !perf_evsel__thread_find(evsel, a.pid, false));
+	list_for_each_entry(c, &evsel->cpu_list, node)
+		__T("the cpu keeps the other thread", nr_list(&c->fd_list) == 1);
+	__T("delete the second thread", !perf_evsel__del_thread(evsel, b.pid));
+	__T("no thread record left", list_empty(&evsel->thread_list) && !evsel->nr_fds);
+	__T("the cpu records stay", nr_list(&evsel->cpu_list) == 2);
+	list_for_each_entry(c, &evsel->cpu_list, node)
+		__T("only the evsel holds a cpu without fds", c->refcnt == 1);
+	__T("add a thread to an evsel without fds", !perf_evsel__add_thread(evsel, a.pid));
+	__T("it opens on every cpu", evsel->nr_fds == 2);
+
+	perf_evlist__close(list);
+	__T("maps can be set again after close", !perf_evlist__set_maps(list, NULL, NULL));
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpus);
+	perf_thread_map__put(threads);
+	child_stop(&a);
+	child_stop(&b);
+	return 0;
+}
+
+/* An explicit group member opens alone where its leader has no fd. */
+static int test_explicit_group(int id)
+{
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID, .disabled = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *a = perf_evsel__new(&attr), *b = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpu0 = perf_cpu_map__new("0"), *both = perf_cpu_map__new("0-1");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	u64 counts[5];
+
+	perf_evsel__set_own_cpus(a, cpu0);
+	perf_evsel__set_own_cpus(b, both);
+	perf_evlist__add(list, a);
+	perf_evlist__add(list, b);
+	b->leader = a;
+	a->nr_members = 2;
+	perf_evlist__set_maps(list, both, threads);
+	__T("open an explicit group wider than its leader", !perf_evlist__open(list));
+	__T("the member joins the leader on cpu0",
+	    perf_evsel__fd_find(b, 0, -1)->leader == perf_evsel__fd_find(a, 0, -1));
+	__T("the member is alone on cpu1", perf_evsel__is_group_leader(b, 1, -1));
+	__T("read cpu0 group", !perf_evsel__read(a, 0, -1, (void *)counts));
+	__T("cpu0 has both events", counts[0] == 2);
+	__T("read cpu1 alone", !perf_evsel__read(b, 1, -1, (void *)counts));
+	__T("cpu1 has the member only", counts[0] == 1);
+	__T("enable the leader's groups", !perf_evsel__enable_group(a));
+	__T("enable the member where it is alone", !perf_evsel__enable_group(b));
 	perf_evlist__delete(list);
 	perf_cpu_map__put(cpu0);
 	perf_cpu_map__put(both);
@@ -945,7 +1119,7 @@ int test_bind(int argc, char **argv)
 	}
 
 	test_mmap_sharing(id);
-	test_group_by_bind(id);
+	test_group_by_rank(id);
 	test_dynamic_threads(id);
 	test_independent_threads(id);
 	test_poll_domains(id);
@@ -953,6 +1127,9 @@ int test_bind(int argc, char **argv)
 	test_munmap_poll(id, true);
 	test_thread_exit(id);
 	test_mixed_groups(id);
+	test_explicit_group(id);
+	test_group_constraints(id);
+	test_fd_index(id);
 	test_cpu_and_thread_mmaps(id);
 	test_dynamic_group(id);
 

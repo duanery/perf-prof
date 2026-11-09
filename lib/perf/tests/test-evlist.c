@@ -59,13 +59,15 @@ static int test_stat_cpu(void)
 	perf_evlist__add(evlist, evsel);
 
 	perf_evlist__set_leader(evlist);
-	__T("failed to set leader", leader->leader == leader);
-	__T("failed to set leader", evsel->leader  == leader);
 
 	perf_evlist__set_maps(evlist, cpus, NULL);
 
 	err = perf_evlist__open(evlist);
 	__T("failed to open evsel", err == 0);
+
+	/* The group is decided per fd: the first evsel leads, the second joins it. */
+	__T("failed to set leader", perf_evsel__is_group_leader(leader, perf_cpu_map__cpu(cpus, 0), -1));
+	__T("failed to set leader", !perf_evsel__is_group_leader(evsel, perf_cpu_map__cpu(cpus, 0), -1));
 
 	perf_evlist__for_each_evsel(evlist, evsel) {
 		cpus = perf_evsel__cpus(evsel);
@@ -73,7 +75,7 @@ static int test_stat_cpu(void)
 		for (idx = 0; idx < perf_cpu_map__nr(cpus); idx++) {
 			struct perf_counts_values counts = { .val = 0 };
 
-			perf_evsel__read(evsel, idx, 0, &counts);
+			perf_evsel__read(evsel, perf_cpu_map__cpu(cpus, idx), -1, &counts);
 			__T("failed to read value for evsel", counts.val != 0);
 		}
 	}
@@ -120,16 +122,18 @@ static int test_stat_thread(void)
 	perf_evlist__add(evlist, evsel);
 
 	perf_evlist__set_leader(evlist);
-	__T("failed to set leader", leader->leader == leader);
-	__T("failed to set leader", evsel->leader  == leader);
 
 	perf_evlist__set_maps(evlist, NULL, threads);
 
 	err = perf_evlist__open(evlist);
 	__T("failed to open evsel", err == 0);
 
+	/* The group is decided per fd: the first evsel leads, the second joins it. */
+	__T("failed to set leader", perf_evsel__is_group_leader(leader, -1, 0));
+	__T("failed to set leader", !perf_evsel__is_group_leader(evsel, -1, 0));
+
 	perf_evlist__for_each_evsel(evlist, evsel) {
-		perf_evsel__read(evsel, 0, 0, &counts);
+		perf_evsel__read(evsel, -1, 0, &counts);
 		__T("failed to read value for evsel", counts.val != 0);
 	}
 
@@ -177,23 +181,25 @@ static int test_stat_thread_enable(void)
 	perf_evlist__add(evlist, evsel);
 
 	perf_evlist__set_leader(evlist);
-	__T("failed to set leader", leader->leader == leader);
-	__T("failed to set leader", evsel->leader  == leader);
 
 	perf_evlist__set_maps(evlist, NULL, threads);
 
 	err = perf_evlist__open(evlist);
 	__T("failed to open evsel", err == 0);
 
+	/* The group is decided per fd: the first evsel leads, the second joins it. */
+	__T("failed to set leader", perf_evsel__is_group_leader(leader, -1, 0));
+	__T("failed to set leader", !perf_evsel__is_group_leader(evsel, -1, 0));
+
 	perf_evlist__for_each_evsel(evlist, evsel) {
-		perf_evsel__read(evsel, 0, 0, &counts);
+		perf_evsel__read(evsel, -1, 0, &counts);
 		__T("failed to read value for evsel", counts.val == 0);
 	}
 
 	perf_evlist__enable(evlist);
 
 	perf_evlist__for_each_evsel(evlist, evsel) {
-		perf_evsel__read(evsel, 0, 0, &counts);
+		perf_evsel__read(evsel, -1, 0, &counts);
 		__T("failed to read value for evsel", counts.val != 0);
 	}
 

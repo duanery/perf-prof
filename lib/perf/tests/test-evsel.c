@@ -37,7 +37,7 @@ static int test_stat_cpu(void)
 	for (idx = 0; idx < perf_cpu_map__nr(cpus); idx++) {
 		struct perf_counts_values counts = { .val = 0 };
 
-		perf_evsel__read(evsel, idx, 0, &counts);
+		perf_evsel__read(evsel, perf_cpu_map__cpu(cpus, idx), -1, &counts);
 		__T("failed to read value for evsel", counts.val != 0);
 	}
 
@@ -70,7 +70,7 @@ static int test_stat_thread(void)
 	err = perf_evsel__open(evsel, NULL, threads);
 	__T("failed to open evsel", err == 0);
 
-	perf_evsel__read(evsel, 0, 0, &counts);
+	perf_evsel__read(evsel, -1, 0, &counts);
 	__T("failed to read value for evsel", counts.val != 0);
 
 	perf_evsel__close(evsel);
@@ -103,13 +103,13 @@ static int test_stat_thread_enable(void)
 	err = perf_evsel__open(evsel, NULL, threads);
 	__T("failed to open evsel", err == 0);
 
-	perf_evsel__read(evsel, 0, 0, &counts);
+	perf_evsel__read(evsel, -1, 0, &counts);
 	__T("failed to read value for evsel", counts.val == 0);
 
 	err = perf_evsel__enable(evsel);
 	__T("failed to enable evsel", err == 0);
 
-	perf_evsel__read(evsel, 0, 0, &counts);
+	perf_evsel__read(evsel, -1, 0, &counts);
 	__T("failed to read value for evsel", counts.val != 0);
 
 	err = perf_evsel__disable(evsel);
@@ -155,7 +155,7 @@ static int test_stat_user_read(int event)
 	err = perf_evsel__mmap(evsel, 0);
 	__T("failed to mmap evsel", err == 0);
 
-	pc = perf_evsel__mmap_base(evsel, 0, 0);
+	pc = perf_evsel__mmap_base(evsel, -1, 0);
 	__T("failed to get mmapped address", pc);
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -164,7 +164,7 @@ static int test_stat_user_read(int event)
 	__T("userspace counter width not set", pc->pmc_width >= 32);
 #endif
 
-	perf_evsel__read(evsel, 0, 0, &counts);
+	perf_evsel__read(evsel, -1, 0, &counts);
 	__T("failed to read value for evsel", counts.val != 0);
 
 	for (i = 0; i < 5; i++) {
@@ -173,12 +173,12 @@ static int test_stat_user_read(int event)
 
 		__T_VERBOSE("\tloop = %u, ", count);
 
-		perf_evsel__read(evsel, 0, 0, &counts);
+		perf_evsel__read(evsel, -1, 0, &counts);
 		start = counts.val;
 
 		while (count--) ;
 
-		perf_evsel__read(evsel, 0, 0, &counts);
+		perf_evsel__read(evsel, -1, 0, &counts);
 		end = counts.val;
 
 		__T("invalid counter data", (end - start) > last);
