@@ -434,19 +434,23 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  * Ring buffer management.
  *
  * The evlist owns the ring buffers (struct perf_mmap) of its evsels and keeps
- * them alive along the writers attached to them, grouped in HUP domains (see
- * struct perf_mmap_domain):
+ * them alive along the writers attached to them, grouped in domains (see
+ * struct perf_mmap_domain): the cpu domain of the pid=-1 and cgroup writers,
+ * which never sees EPOLLHUP, and the task domains of the writers bound to one
+ * task, which see EPOLLHUP once the task exits. HUP is a property of the task
+ * domain only.
  *
  *   ring buffer registry  - lookup by (cpu, tid, overwrite), list for iteration
  *   thread records        - exit state of each thread, see perf_evlist_thread
  *   poll registration     - one fd per domain, internal epoll or external loop
- *   HUP domains           - the references the writers hold on a ring buffer
+ *   domains               - the references the writers hold on a ring buffer
  *   writer fds            - attach/detach one fd of an evsel
  *   thread exit           - perf_evlist__hup() / perf_evlist__del_thread()
  *   mmap / munmap / poll  - the public entry points
  *
- * A ring buffer loses its last writer only through EPOLLHUP, or when its fds
- * are closed outright (perf_evsel__del_thread(), munmap, close).
+ * A ring buffer loses its last writer only through EPOLLHUP of a task domain,
+ * or when its fds are closed outright (perf_evsel__del_thread(), munmap,
+ * close).
  */
 
 /* Ring buffer registry. */
@@ -751,9 +755,11 @@ static bool perf_mmap_domain__pollable(struct perf_mmap_domain *dom)
  *   data: one fd per ring buffer, polled for EPOLLIN. A write by any writer
  *         wakes up every event attached to the ring buffer, one fd is enough.
  *         The cpu domain's if there is one: it never goes away on its own.
- *   hup:  one fd per thread, polled for EPOLLHUP only. Every event of the
- *         thread enters EXIT state when it exits, one fd is enough. Prefer
- *         one that is already a data fd, then a single fd serves both.
+ *   hup:  one fd per thread, from one of its task domains, polled for
+ *         EPOLLHUP only; the cpu domain never takes this role. Every
+ *         event of the thread enters EXIT state when it exits, one fd is
+ *         enough. Prefer one that is already a data fd, then a single fd
+ *         serves both.
  *
  * A domain is registered if it holds either role, with EPOLLIN only for the
  * data role. A thread whose EPOLLHUP is taken (th->hup) needs no hup fd.
@@ -856,7 +862,7 @@ static int perf_evlist_poll__update(struct perf_evlist *evlist, struct perf_mmap
 	return err;
 }
 
-/* HUP domains. */
+/* Domains. */
 
 static int perf_mmap_domain__add_fd(struct perf_mmap_domain *dom, int fd, bool poll)
 {

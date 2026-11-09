@@ -20,7 +20,7 @@ struct perf_counts_values;
 /**
  * struct perf_mmap - perf's ring buffer mmap details
  *
- * @refcnt - every holder of the ring buffer: each live HUP domain of the
+ * @refcnt - every holder of the ring buffer: each live domain of the
  *   evlist (see struct perf_mmap_domain), the order heap of perf-prof, and
  *   the results of perf_evlist__hup(). The last perf_mmap__put() unmaps and
  *   frees it.
@@ -53,7 +53,7 @@ struct perf_mmap {
 	/*
 	 * Managed by the evlist. @list links it into evlist->mmap_list /
 	 * mmap_ovw_list, @hnode into the lookup hash. @domains holds the live
-	 * HUP domains; @cpu_domain is the one of the pid=-1 writers, if any.
+	 * domains; @cpu_domain is the cpu domain of the pid=-1 writers, if any.
 	 * @poll_domain holds the fd polled for the data of the ring buffer.
 	 */
 	struct list_head	 list;

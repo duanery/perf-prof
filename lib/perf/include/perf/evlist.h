@@ -36,7 +36,7 @@ LIBPERF_API void perf_evlist__set_maps(struct perf_evlist *evlist,
 				       struct perf_thread_map *threads);
 /*
  * Hand the poll fds over to an external poll loop. libperf decides which fds
- * to poll (one per HUP domain of a ring buffer) and calls @add / @del as they
+ * to poll (one per domain of a ring buffer) and calls @add / @del as they
  * appear and go away, from perf_evlist__mmap() on. @new_map is true the first
  * time @map is reported. On EPOLLHUP the loop calls perf_evlist__hup().
  */

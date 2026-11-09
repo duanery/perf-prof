@@ -30,12 +30,12 @@ struct perf_evlist_thread;
  * The writers of one ring buffer that go away together: all pid=-1 (and
  * cgroup) writers form the cpu domain, which never sees EPOLLHUP; the writers
  * bound to one task form a task domain, which sees EPOLLHUP on every one of
- * its fds once that task exits.
+ * its fds once that task exits. Only a task domain can HUP.
  *
  * At most one fd per domain is registered with epoll, for one of two roles:
  * the data fd of the ring buffer (EPOLLIN; a write wakes up every event
- * attached to it) and the hup fd of the thread (EPOLLHUP; every event of an
- * exited task enters EXIT state). See perf_evlist_poll__pick_data().
+ * attached to it) and the hup fd of the thread, task domains only (EPOLLHUP;
+ * every event of an exited task enters EXIT state). See perf_evlist_poll__pick_data().
  *
  * A live domain holds a reference on its ring buffer. EPOLLHUP marks the task
  * domain dead and drops it; the fds stay open until perf_evlist__del_thread()

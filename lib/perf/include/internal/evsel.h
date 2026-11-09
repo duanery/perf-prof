@@ -16,7 +16,7 @@ struct perf_mmap_domain;
 struct perf_evsel_fd {
 	int fd;
 	int group_fd;
-	/* The HUP domain this fd writes into; its ring buffer is domain->map. */
+	/* The domain this fd writes into; its ring buffer is domain->map. */
 	struct perf_mmap_domain *domain;
 };
 
