@@ -444,6 +444,7 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  *   poll registration     - one fd per domain, internal epoll or external loop
  *   domains               - the references the writers hold on a ring buffer
  *   writer fds            - attach/detach one fd of an evsel
+ *   reap                  - hand the ring buffers of removed writers over
  *   thread exit           - perf_evlist__hup() / perf_evlist__del_thread()
  *   mmap / munmap / poll  - the public entry points
  *
@@ -1102,6 +1103,38 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
 }
 
 /*
+ * Reap.
+ *
+ * Removed writers are stopped first; the reap then takes their live domains
+ * off the ring buffers and passes on the references the domains held, so the
+ * caller can read the ring buffers to the end before perf_evlist__reap_done()
+ * drops them and finishes the removal.
+ */
+
+static void perf_evlist__reap_init(struct perf_evlist_reap *reap)
+{
+	memset(reap, 0, sizeof(*reap));
+	reap->type = PERF_EVLIST_REAP__NONE;
+	reap->tid = -1;
+}
+
+static int perf_evlist__reap_alloc(struct perf_evlist_reap *reap, int nr)
+{
+	reap->maps = calloc(nr ?: 1, sizeof(*reap->maps));
+	return reap->maps ? 0 : -ENOMEM;
+}
+
+/* @reap has room for @dom, see perf_evlist__reap_alloc(). */
+static void perf_evlist__reap_domain(struct perf_evlist *evlist,
+				     struct perf_mmap_domain *dom,
+				     struct perf_evlist_reap *reap)
+{
+	struct perf_evlist_reap_map *m = &reap->maps[reap->nr_maps++];
+
+	m->retired = perf_evlist__mmap_domain_put(evlist, dom, &m->map);
+}
+
+/*
  * Thread exit.
  *
  * Only evsels following the evlist thread map are driven from here, as in
@@ -1260,14 +1293,13 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
  * ends every task domain of the thread. pid=-1 and cgroup events are not in a
  * task context: the cpu domain never sees EPOLLHUP.
  */
-int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_hup *hup)
+int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap *reap)
 {
 	struct perf_mmap_domain *dom = perf_evlist_poll__find(evlist, fd), *tmp;
 	struct perf_evlist_thread *th;
 	int nr = 0;
 
-	memset(hup, 0, sizeof(*hup));
-	hup->tid = -1;
+	perf_evlist__reap_init(reap);
 
 	if (!dom || !dom->thread || dom->thread->hup)
 		return 0;
@@ -1276,40 +1308,44 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_hup 
 	list_for_each_entry(dom, &th->domain_list, thread_node)
 		if (!dom->dead)
 			nr++;
-	hup->maps = calloc(nr ?: 1, sizeof(*hup->maps));
-	if (!hup->maps)
+	if (perf_evlist__reap_alloc(reap, nr))
 		return -ENOMEM;
 
 	/* Set first: a dying thread needs no replacement hup fd. */
 	th->hup = true;
 	list_for_each_entry_safe(dom, tmp, &th->domain_list, thread_node) {
-		struct perf_evlist_hup_map *m;
-
-		if (dom->dead)
-			continue;
-		m = &hup->maps[hup->nr_maps++];
-		m->retired = perf_evlist__mmap_domain_put(evlist, dom, &m->map);
+		if (!dom->dead)
+			perf_evlist__reap_domain(evlist, dom, reap);
 	}
-	hup->tid = th->tid;
-	hup->complete = th->del;
+	reap->type = PERF_EVLIST_REAP__THREAD;
+	reap->tid = th->tid;
+	reap->complete = th->del;
 	return 0;
 }
 
-void perf_evlist__hup_done(struct perf_evlist *evlist, struct perf_evlist_hup *hup)
+void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
 {
 	struct perf_evlist_thread *th;
 	int i;
 
-	for (i = 0; i < hup->nr_maps; i++)
-		perf_mmap__put(hup->maps[i].map);
-	zfree(&hup->maps);
-	hup->nr_maps = 0;
+	for (i = 0; i < reap->nr_maps; i++)
+		perf_mmap__put(reap->maps[i].map);
+	zfree(&reap->maps);
+	reap->nr_maps = 0;
 
-	if (hup->complete) {
-		th = perf_evlist__thread_find(evlist, hup->tid);
+	switch (reap->type) {
+	case PERF_EVLIST_REAP__THREAD:
+		if (!reap->complete)
+			break;
+		th = perf_evlist__thread_find(evlist, reap->tid);
 		if (th && th->hup && th->del)
-			perf_evlist__thread_close(evlist, hup->tid);
+			perf_evlist__thread_close(evlist, reap->tid);
+		break;
+	case PERF_EVLIST_REAP__NONE:
+	default:
+		break;
 	}
+	reap->type = PERF_EVLIST_REAP__NONE;
 }
 
 /* mmap / munmap / poll. */
@@ -1435,7 +1471,7 @@ int perf_evlist__poll_mmap(struct perf_evlist *evlist, int timeout, handle_mmap 
 	for (i = 0; i < cnt; i++) {
 		int fd = epoll->events[i].data.fd;
 		struct perf_mmap_domain *dom = perf_evlist_poll__find(evlist, fd);
-		struct perf_evlist_hup hup;
+		struct perf_evlist_reap reap;
 
 		/* Gone with an earlier EPOLLHUP of this batch. */
 		if (!dom)
@@ -1443,11 +1479,11 @@ int perf_evlist__poll_mmap(struct perf_evlist *evlist, int timeout, handle_mmap 
 		if (handle)
 			handle(dom->map);
 		if (!(epoll->events[i].events & EPOLLHUP) ||
-		    perf_evlist__hup(evlist, fd, &hup))
+		    perf_evlist__hup(evlist, fd, &reap))
 			continue;
-		for (j = 0; handle && j < hup.nr_maps; j++)
-			handle(hup.maps[j].map);
-		perf_evlist__hup_done(evlist, &hup);
+		for (j = 0; handle && j < reap.nr_maps; j++)
+			handle(reap.maps[j].map);
+		perf_evlist__reap_done(evlist, &reap);
 	}
 	return epoll->nr_live ? cnt : -ENOENT;
 }

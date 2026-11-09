@@ -2195,23 +2195,23 @@ int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
  */
 static void prof_dev_hup(struct prof_dev *dev, int fd)
 {
-    struct perf_evlist_hup hup;
+    struct perf_evlist_reap reap;
     int i;
 
-    if (perf_evlist__hup(dev->evlist, fd, &hup) < 0)
+    if (perf_evlist__hup(dev->evlist, fd, &reap) < 0)
         return;
-    for (i = 0; i < hup.nr_maps; i++) {
-        struct perf_mmap *map = hup.maps[i].map;
+    for (i = 0; i < reap.nr_maps; i++) {
+        struct perf_mmap *map = reap.maps[i].map;
 
         /* Only an active device processes events; disabled ones are flushed. */
         if (dev->state == PROF_DEV_STATE_ACTIVE)
             prof_dev_drain_mmap(dev, map);
-        if (hup.maps[i].retired && dev->order.enabled)
+        if (reap.maps[i].retired && dev->order.enabled)
             order_mmap_del(dev, map);
     }
-    if (hup.complete)
-        prof_dev_thread_done(dev, hup.tid);
-    perf_evlist__hup_done(dev->evlist, &hup);
+    if (reap.type == PERF_EVLIST_REAP__THREAD && reap.complete)
+        prof_dev_thread_done(dev, reap.tid);
+    perf_evlist__reap_done(dev->evlist, &reap);
 
     /*
      * Nothing left to poll: every task exited. With --ptrace the workload's

@@ -22,7 +22,7 @@ struct perf_counts_values;
  *
  * @refcnt - every holder of the ring buffer: each live domain of the
  *   evlist (see struct perf_mmap_domain), the order heap of perf-prof, and
- *   the results of perf_evlist__hup(). The last perf_mmap__put() unmaps and
+ *   the reaps (struct perf_evlist_reap). The last perf_mmap__put() unmaps and
  *   frees it.
  *
  * @cpu, @tid - the binding of this ring buffer. Exactly one of them is set:

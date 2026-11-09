@@ -37,9 +37,10 @@ struct perf_evlist_thread;
  * attached to it) and the hup fd of the thread, task domains only (EPOLLHUP;
  * every event of an exited task enters EXIT state). See perf_evlist_poll__pick_data().
  *
- * A live domain holds a reference on its ring buffer. EPOLLHUP marks the task
- * domain dead and drops it; the fds stay open until perf_evlist__del_thread()
- * or the evsel closes them, and the domain is freed with the last one.
+ * A live domain holds a reference on its ring buffer. EPOLLHUP reaps the task
+ * domain: marks it dead and hands the reference over to the struct
+ * perf_evlist_reap; the fds stay open until perf_evlist__del_thread() or the
+ * evsel closes them, and the domain is freed with the last one.
  */
 struct perf_mmap_domain {
 	struct perf_mmap	*map;          /* NULL once dead */

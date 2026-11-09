@@ -78,7 +78,7 @@ LIBPERF_0.0.1 {
 		perf_evlist__add_thread;
 		perf_evlist__del_thread;
 		perf_evlist__hup;
-		perf_evlist__hup_done;
+		perf_evlist__reap_done;
 		perf_evlist__id_to_evsel;
 		perf_evlist__find_mmap;
 		perf_evlist__next_mmap;

@@ -62,16 +62,28 @@ LIBPERF_API int perf_evlist__mmap(struct perf_evlist *evlist, int pages);
 LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
 
 /*
+ * Removing writers from the evlist - a thread, and later a cpu or an evsel -
+ * goes through three steps:
+ *
+ *  stop - the writers produce no more events: DISABLE, or the kernel stopped
+ *         them (an exited task);
+ *  reap - libperf hands over every ring buffer they wrote into, see struct
+ *         perf_evlist_reap. Their fds are still open, so the caller can read
+ *         the ring buffers to the end and the sample ids still resolve;
+ *  done - perf_evlist__reap_done(): libperf drops the ring buffer references
+ *         of the reap and releases what is left, e.g. closes the fds.
+ */
+
+/*
  * Add/remove a thread on every evsel that follows the evlist thread map.
  * Evsels bound to their own thread map (perf_evsel__set_own_threads()) are
  * left alone; drive those with perf_evsel__add_thread() directly.
  *
- * A thread goes away in two steps that may come in either order: the caller
- * (ptrace) reports its exit with perf_evlist__del_thread(), and the kernel
- * reports EPOLLHUP on its fds, see perf_evlist__hup(). The first step only
- * stops the fds (DISABLE, resp. dropping the ring buffer references); the
- * second one closes them. A thread with no ring buffer to wait for is closed
- * right away.
+ * A thread goes away in two signals that may come in either order: the caller
+ * (ptrace) reports its exit with perf_evlist__del_thread(), which stops its
+ * fds (DISABLE), and the kernel reports EPOLLHUP on its fds, which reaps its
+ * ring buffers, see perf_evlist__hup(). The second one closes the fds. A
+ * thread with no ring buffer to reap is closed right away.
  *
  * perf_evlist__del_thread() returns 1 when the thread is gone: the caller may
  * now drop its own state of the thread. It returns 0 while waiting for the
@@ -80,29 +92,39 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
 LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
 LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid);
 
+enum perf_evlist_reap_type {
+	PERF_EVLIST_REAP__NONE,		/* nothing reaped */
+	PERF_EVLIST_REAP__THREAD,	/* @tid exited, perf_evlist__hup() */
+};
+
 /*
- * The result of an EPOLLHUP. @maps holds every ring buffer the exited thread
- * wrote into, each with a reference: the caller reads them to the end, so that
- * no event of @tid is left behind. @retired marks the ones left without any
- * writer: they are already gone from the evlist and the caller drops its own
- * references, e.g. the order heap. @complete: perf_evlist__del_thread() came
- * first, the thread is gone once perf_evlist__hup_done() returns.
+ * The result of the reap step. @maps holds every ring buffer the removed
+ * writers wrote into, each with a reference: the caller reads them to the
+ * end, so that no event is left behind. @retired marks the ones left without
+ * any writer: they are already gone from the evlist and the caller drops its
+ * own references, e.g. the order heap. @complete: the removal is complete
+ * once perf_evlist__reap_done() returns, e.g. perf_evlist__del_thread() came
+ * before the EPOLLHUP; the caller may drop its own state of @tid.
  *
- * @tid is -1 if @fd belongs to no exiting thread, e.g. a second EPOLLHUP.
+ * Always pass the result to perf_evlist__reap_done(), even a
+ * PERF_EVLIST_REAP__NONE one.
  */
-struct perf_evlist_hup {
-	pid_t tid;
+struct perf_evlist_reap {
+	enum perf_evlist_reap_type type;
+	pid_t tid;		/* PERF_EVLIST_REAP__THREAD, -1 otherwise */
 	bool complete;
 	int nr_maps;
-	struct perf_evlist_hup_map {
+	struct perf_evlist_reap_map {
 		struct perf_mmap *map;
 		bool retired;
 	} *maps;
 };
+/* EPOLLHUP on @fd: reap its exited thread. PERF_EVLIST_REAP__NONE if @fd
+ * belongs to no exiting thread, e.g. a second EPOLLHUP. */
 LIBPERF_API int perf_evlist__hup(struct perf_evlist *evlist, int fd,
-				 struct perf_evlist_hup *hup);
-LIBPERF_API void perf_evlist__hup_done(struct perf_evlist *evlist,
-				       struct perf_evlist_hup *hup);
+				 struct perf_evlist_reap *reap);
+LIBPERF_API void perf_evlist__reap_done(struct perf_evlist *evlist,
+					struct perf_evlist_reap *reap);
 
 /* Look up the ring buffer of a binding; see perf_mmap__cpu()/perf_mmap__tid(). */
 LIBPERF_API struct perf_mmap *perf_evlist__find_mmap(struct perf_evlist *evlist,
