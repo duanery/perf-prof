@@ -452,3 +452,99 @@ int thread_map__remove(struct perf_thread_map *threads, int idx)
 	threads->nr--;
 	return 0;
 }
+
+struct tid_node {
+	struct rb_node rb_node;
+	pid_t pid;
+};
+
+static int tid_node__cmp(struct rb_node *rbn, const void *entry)
+{
+	struct tid_node *node = container_of(rbn, struct tid_node, rb_node);
+	pid_t pid = *(const pid_t *)entry;
+
+	return node->pid < pid ? -1 : node->pid > pid;
+}
+
+static struct rb_node *tid_node__new(struct rblist *rlist __maybe_unused, const void *entry)
+{
+	struct tid_node *node = malloc(sizeof(*node));
+
+	if (!node)
+		return NULL;
+	RB_CLEAR_NODE(&node->rb_node);
+	node->pid = *(const pid_t *)entry;
+	return &node->rb_node;
+}
+
+static void tid_node__delete(struct rblist *rblist __maybe_unused, struct rb_node *rbn)
+{
+	free(container_of(rbn, struct tid_node, rb_node));
+}
+
+/* Start with the threads of @threads, cgroups and "any thread" (-1) left out. */
+int tid_set__init(struct tid_set *set, struct perf_thread_map *threads)
+{
+	int idx;
+	pid_t pid;
+
+	rblist__init(&set->tids);
+	set->tids.node_cmp = tid_node__cmp;
+	set->tids.node_new = tid_node__new;
+	set->tids.node_delete = tid_node__delete;
+
+	if (!threads)
+		return 0;
+	perf_thread_map__for_each_thread(pid, idx, threads) {
+		if (pid < 0 || threads->map[idx].cgroup)
+			continue;
+		if (tid_set__add(set, pid) < 0) {
+			tid_set__exit(set);
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+void tid_set__exit(struct tid_set *set)
+{
+	rblist__exit(&set->tids);
+}
+
+/* 1 if @pid was added, 0 if it was there already. */
+int tid_set__add(struct tid_set *set, pid_t pid)
+{
+	int err = rblist__add_node(&set->tids, &pid);
+
+	if (err == -EEXIST)
+		return 0;
+	return err < 0 ? err : 1;
+}
+
+/* Whether @pid was there. */
+bool tid_set__del(struct tid_set *set, pid_t pid)
+{
+	return rblist__find_remove(&set->tids, &pid) == 1;
+}
+
+bool tid_set__has(struct tid_set *set, pid_t pid)
+{
+	return rblist__find(&set->tids, &pid) != NULL;
+}
+
+struct perf_thread_map *tid_set__map(struct tid_set *set)
+{
+	unsigned int nr = rblist__nr_entries(&set->tids);
+	struct perf_thread_map *threads = perf_thread_map__realloc(NULL, nr ?: 1);
+	struct rb_node *rbn;
+	int i = 0;
+
+	if (!threads)
+		return NULL;
+	for (rbn = rb_first_cached(&set->tids.entries); rbn; rbn = rb_next(rbn))
+		perf_thread_map__set_pid(threads, i++,
+					 container_of(rbn, struct tid_node, rb_node)->pid);
+	threads->nr = i;
+	refcount_set(&threads->refcnt, 1);
+	return threads;
+}

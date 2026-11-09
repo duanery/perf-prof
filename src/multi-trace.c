@@ -8,13 +8,13 @@
 #include <linux/string.h>
 #include <linux/zalloc.h>
 #include <linux/strlist.h>
+#include <linux/thread_map.h>
 #include <monitor.h>
 #include <tep.h>
 #include <trace_helpers.h>
 #include <stack_helpers.h>
 #include <two-event.h>
 #include <tp_struct.h>
-#include <internal/threadmap.h>
 
 #define ENABLED_MAX ULLONG_MAX
 #define ENABLED_TP_MAX (ULLONG_MAX-1)
@@ -92,9 +92,10 @@ struct multi_trace_ctx {
     u64 event_handled;
     u64 sched_wakeup_unnecessary;
     struct callchain_ctx *cc;
-    struct perf_thread_map *thread_map; // profiler rundelay
+    struct perf_thread_map *thread_map; // profiler rundelay, the threads asked for
+    struct tid_set tids; // profiler rundelay, the threads followed now
     bool comm; // profiler rundelay, syscalls
-    /* profiler rundelay: thread_map grows via ptrace; pid is matched in
+    /* profiler rundelay: tids change via ptrace; pid is matched in
      * sample(), not SET_FILTER. */
     bool dynamic_threads;
     int level; // level = sched_init()
@@ -604,6 +605,8 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 
     while (multi_trace_first_pending(dev, NULL)) ;
 
+    if (ctx->thread_map)
+        tid_set__exit(&ctx->tids);
     perf_thread_map__put(ctx->thread_map);
 
     rblist__exit(&ctx->backup);
@@ -1661,7 +1664,7 @@ static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *ev
 /*
  * profiler rundelay: in dynamic_threads mode the kernel filter carries no
  * pid list (SET_FILTER cannot be replaced on an enabled tracepoint), so
- * match the growing thread_map here, like task_state_tracked() does.
+ * match the followed tids here, like task_state_tracked() does.
  * pid <= 0 (swapper and friends) is dropped, as the kernel `pid' filter
  * does in the static mode.
  */
@@ -1673,9 +1676,7 @@ static bool rundelay_untracked(struct multi_trace_ctx *ctx, u64 key)
         return false;
     if (pid <= 0)
         return true;
-    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
-        return false;
-    return true;
+    return !tid_set__has(&ctx->tids, pid);
 }
 
 static int multi_trace_del_thread(struct prof_dev *dev, pid_t tid)
@@ -1805,7 +1806,7 @@ found:
 
     /*
      * profiler rundelay: in dynamic_threads mode, drop events whose key pid
-     * is neither in the growing thread_map nor recently deleted. The filter
+     * is neither in the followed tids nor recently deleted. The filter
      * runs after sched_event() above, so the unnecessary-wakeup detection
      * still sees the full system state. Events without a key (untraced and
      * other auxiliary events) are never filtered: the kernel pid filter of
@@ -2496,49 +2497,16 @@ static profiler nested_trace = {
 PROFILER_REGISTER(nested_trace);
 
 
-static int rundelay_threads_cow(struct multi_trace_ctx *ctx)
-{
-    struct perf_thread_map *priv;
-
-    if (refcount_read(&ctx->thread_map->refcnt) == 1)
-        return 0;
-    priv = perf_thread_map__dup(ctx->thread_map);
-    if (!priv)
-        return -1;
-    perf_thread_map__put(ctx->thread_map);
-    ctx->thread_map = priv;
-    return 0;
-}
-
 static int rundelay_add_thread(struct prof_dev *dev, pid_t pid)
 {
     struct multi_trace_ctx *ctx = dev->private;
-    struct perf_thread_map *threads;
-    int i, nr;
+    int ret;
 
     if (!ctx->thread_map || pid < 0)
         return 0;
-    if (perf_thread_map__idx(ctx->thread_map, pid) >= 0)
-        return 0;
-    if (rundelay_threads_cow(ctx) < 0)
-        return -1;
-
-    threads = ctx->thread_map;
-    for (i = 0; i < threads->nr; i++) {
-        if (threads->map[i].pid == PERF_THREAD_MAP_HOLE)
-            break;
-    }
-    if (i == threads->nr) {
-        nr = threads->nr + 1;
-        threads = perf_thread_map__realloc(threads, nr);
-        if (!threads)
-            return -1;
-        threads->nr = nr;
-        ctx->thread_map = threads;
-        threads->map[i].pid = PERF_THREAD_MAP_HOLE;
-    }
-    threads->map[i].pid = pid;
-    threads->map[i].cgroup = 0;
+    ret = tid_set__add(&ctx->tids, pid);
+    if (ret <= 0)
+        return ret;
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
@@ -2550,21 +2518,14 @@ static int rundelay_add_thread(struct prof_dev *dev, pid_t pid)
 static int rundelay_del_thread(struct prof_dev *dev, pid_t pid)
 {
     struct multi_trace_ctx *ctx = dev->private;
-    int i;
 
     if (!ctx->thread_map || pid < 0)
         return 0;
-    i = perf_thread_map__idx(ctx->thread_map, pid);
-    if (i < 0)
+    if (!tid_set__has(&ctx->tids, pid))
         return 0;
-    if (rundelay_threads_cow(ctx) < 0)
-        return -1;
 
     reclaim(dev, pid, REMAINING_EXIT);
-    free(ctx->thread_map->map[i].comm);
-    ctx->thread_map->map[i].comm = NULL;
-    ctx->thread_map->map[i].cgroup = 0;
-    ctx->thread_map->map[i].pid = PERF_THREAD_MAP_HOLE;
+    tid_set__del(&ctx->tids, pid);
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
@@ -2585,6 +2546,11 @@ static int rundelay_init(struct prof_dev *dev)
         /**
          * sched:sched_switch and sched:sched_wakeup are not suitable for binding to threads
         **/
+        if (tid_set__init(&ctx->tids, dev->threads) < 0) {
+            free(ctx);
+            dev->private = NULL;
+            return -1;
+        }
         ctx->thread_map = dev->threads;
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
