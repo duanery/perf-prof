@@ -223,16 +223,16 @@ static int block_event_convert(struct event_block *block, union perf_event *even
         }
     }
 
-    if (sample_type & PERF_SAMPLE_ID) {
-        //u64           id;
-        *(u64 *)(data + block->id_pos) = perf_evsel__get_id(tp->evsel, cpuidx < 0 ? 0 : cpuidx,
-                                         threadidx < 0 ? 0 : threadidx);
-    }
+    if (sample_type & (PERF_SAMPLE_ID | PERF_SAMPLE_STREAM_ID)) {
+        /* The id of the fd of that instance, or of the first one if unknown. */
+        u64 id = perf_evsel__get_id(tp->evsel,
+                        perf_cpu_map__cpu(perf_evsel__cpus(tp->evsel), cpuidx < 0 ? 0 : cpuidx),
+                        perf_thread_map__pid(perf_evsel__threads(tp->evsel), threadidx < 0 ? 0 : threadidx));
 
-    if (sample_type & PERF_SAMPLE_STREAM_ID) {
-        //u64           stream_id;
-        *(u64 *)(data + block->stream_id_pos) = perf_evsel__get_id(tp->evsel, cpuidx < 0 ? 0 : cpuidx,
-                                                threadidx < 0 ? 0 : threadidx);
+        if (sample_type & PERF_SAMPLE_ID)
+            *(u64 *)(data + block->id_pos) = id; //u64           id;
+        if (sample_type & PERF_SAMPLE_STREAM_ID)
+            *(u64 *)(data + block->stream_id_pos) = id; //u64           stream_id;
     }
 
     if (tp->id != block->remote_id) {

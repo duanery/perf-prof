@@ -2330,22 +2330,18 @@ static void interval_handle(struct timer *timer)
 
     if (prof->read && dev->values) {
         struct perf_evsel *evsel;
-        int cpu, c, t;
+        struct perf_evsel_fd *pos;
+        int cpu, tid;
 
         perf_evlist__for_each_evsel(evlist, evsel) {
-            struct perf_cpu_map *cpus = perf_evsel__cpus(evsel);
-            struct perf_thread_map *threads = perf_evsel__threads(evsel);
-
-            perf_cpu_map__for_each_cpu(cpu, c, cpus) {
-                for (t = 0; t < perf_thread_map__nr(threads); t++) {
-                    if (!perf_thread_map__valid(threads, t))
-                        continue;
-                    if ((perf_evsel__attr(evsel)->read_format & PERF_FORMAT_GROUP) &&
-                        !perf_evsel__is_group_leader(evsel, c, t))
-                        continue;
-                    if (perf_evsel__read(evsel, c, t, dev->values) == 0)
-                        prof->read(dev, evsel, dev->values, cpu, perf_thread_map__pid(threads, t));
-                }
+            perf_evsel__for_each_fd(evsel, pos) {
+                cpu = perf_evsel_fd__cpu(pos);
+                tid = perf_evsel_fd__tid(pos);
+                if ((perf_evsel__attr(evsel)->read_format & PERF_FORMAT_GROUP) &&
+                    !perf_evsel__is_group_leader(evsel, cpu, tid))
+                    continue;
+                if (perf_evsel__read(evsel, cpu, tid, dev->values) == 0)
+                    prof->read(dev, evsel, dev->values, cpu, tid);
             }
         }
     }

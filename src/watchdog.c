@@ -299,9 +299,9 @@ static int watchdog_filter(struct prof_dev *dev)
                     struct perf_cpu_map *cpus = perf_evsel__cpus(evsel);
                     perf_cpu_map__for_each_cpu(cpu, idx, cpus) {
                         snprintf(filter, sizeof(filter), "hrtimer==%p", ctx->watchdog[cpu].watchdog_hrtimer);
-                        perf_evsel__apply_filter_cpu(evsel, filter, idx);
+                        perf_evsel__apply_filter_cpu(evsel, filter, cpu);
                         if (dev->env->verbose)
-                            printf("filter %s for cpu %d\n", filter, idx);
+                            printf("filter %s for cpu %d\n", filter, cpu);
                     }
                 } else if (config == ctx->sched_switch) {
                     // Starting from 4.19, softlockup uses cpu_stop_threads.

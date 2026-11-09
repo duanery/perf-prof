@@ -12,7 +12,6 @@
 #include <bpf_expr_filter.h>
 #include <bpf-skel/kvm_exit.h>
 #include <bpf-skel/kvm_exit.skel.h>
-#include <internal/xyarray.h>
 #include <internal/evsel.h>
 #include <linux/thread_map.h>
 
@@ -310,7 +309,6 @@ static void bpf_kvm_exit_fix_sample_pos(struct prof_dev *dev)
     dev->pos.cpu_pos = -1;
 }
 
-#define FD(e, x, y) ((int *) xyarray__entry(e->fd, x, y))
 static int bpf_kvm_exit_filter(struct prof_dev *dev)
 {
     struct kvmexit_ctx *ctx = dev->private;
@@ -319,7 +317,8 @@ static int bpf_kvm_exit_filter(struct prof_dev *dev)
     int err;
 
     perf_cpu_map__for_each_cpu(cpu, ins, perf_evsel__cpus(ctx->evsel)) {
-        perf_event_fd = *FD(ctx->evsel, ins, 0);
+        perf_event_fd = perf_evsel__fd(ctx->evsel, cpu,
+                                       perf_thread_map__pid(perf_evsel__threads(ctx->evsel), 0));
         err = bpf_map__update_elem(perf_events, &cpu, sizeof(cpu), &perf_event_fd, sizeof(perf_event_fd), 0);
         if (err)
             return -1;
