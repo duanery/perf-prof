@@ -257,8 +257,9 @@ typedef struct monitor {
     int (*filter)(struct prof_dev *dev);
     /*
      * ptrace added or removed a thread; update profiler-side filters.
-     * del_thread() runs once the thread is gone from the evlist: after both
-     * its exit and the EPOLLHUP of its fds, with every event of it read.
+     * del_thread() runs once the thread is gone from the evlist: after its
+     * removal by ptrace, and the EPOLLHUP of its fds if that came first,
+     * with every event of it read.
      */
     int (*add_thread)(struct prof_dev *dev, pid_t pid);
     int (*del_thread)(struct prof_dev *dev, pid_t pid);

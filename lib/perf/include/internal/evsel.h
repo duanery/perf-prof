@@ -88,8 +88,8 @@ struct perf_evsel_fd {
 	/* The domain this fd writes into; its ring buffer is domain->map. */
 	struct perf_mmap_domain	*domain;
 	/*
-	 * Stopped by perf_evlist__del_cpu()/del_evsel(), closed or taken out by
-	 * perf_evlist__reap_done().
+	 * Stopped by perf_evlist__del_thread()/del_cpu()/del_evsel(), closed or
+	 * taken out by perf_evlist__reap_done().
 	 */
 	bool			 stopped;
 	/* The ring buffer of perf_evsel__mmap(). */

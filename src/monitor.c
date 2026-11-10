@@ -2147,7 +2147,7 @@ static void prof_dev_drain_mmap(struct prof_dev *dev, struct perf_mmap *map)
 
 /*
  * The thread is gone from the evlist. Its task-bound events are all read
- * already (EPOLLHUP drained them); the cpu ring buffers may still hold events
+ * already (the reap drained them); the cpu ring buffers may still hold events
  * about it from pid=-1 writers, read them before the profiler forgets it.
  */
 static void prof_dev_thread_done(struct prof_dev *dev, pid_t tid)
@@ -2164,6 +2164,25 @@ static void prof_dev_thread_done(struct prof_dev *dev, pid_t tid)
         dev->prof->del_thread(dev, tid);
 }
 
+/*
+ * Every ring buffer the removed writers wrote into is read to the end before
+ * libperf closes their fds, so that the sample ids still resolve; the ones
+ * left without a writer retire in perf_evlist__reap_done(), see __poll_del().
+ */
+static void prof_dev_reap(struct prof_dev *dev, struct perf_evlist_reap *reap)
+{
+    int i;
+
+    for (i = 0; i < reap->nr_maps; i++) {
+        /* Only an active device processes events; disabled ones are flushed. */
+        if (dev->state == PROF_DEV_STATE_ACTIVE)
+            prof_dev_drain_mmap(dev, reap->maps[i]);
+    }
+    if (reap->type == PERF_EVLIST_REAP__THREAD && reap->complete)
+        prof_dev_thread_done(dev, reap->tid);
+    perf_evlist__reap_done(dev->evlist, reap);
+}
+
 int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
 {
     if (dev->inclose)
@@ -2174,41 +2193,30 @@ int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
 
 /*
  * ptrace saw the thread exit. Its fds see EPOLLHUP as well, in either order;
- * whichever comes second closes them, see perf_evlist__del_thread().
+ * whichever comes first reaps its ring buffers, see perf_evlist__del_thread().
  */
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 {
+    struct perf_evlist_reap reap;
     int ret;
 
     if (dev->inclose)
         return 0;
-    ret = perf_evlist__del_thread(dev->evlist, pid);
-    if (ret == 1)
-        prof_dev_thread_done(dev, pid);
-    return ret < 0 ? ret : 0;
+    ret = perf_evlist__del_thread(dev->evlist, pid, &reap);
+    if (ret < 0)
+        return ret;
+    prof_dev_reap(dev, &reap);
+    return 0;
 }
 
-/*
- * EPOLLHUP: the task of @fd exited. Every ring buffer it wrote into is read to
- * the end before libperf closes its fds, so that the sample ids still resolve;
- * the ones left without a writer retire in perf_evlist__reap_done(), see
- * __poll_del().
- */
+/* EPOLLHUP: the task of @fd exited. */
 static void prof_dev_hup(struct prof_dev *dev, int fd)
 {
     struct perf_evlist_reap reap;
-    int i;
 
     if (perf_evlist__hup(dev->evlist, fd, &reap) < 0)
         return;
-    for (i = 0; i < reap.nr_maps; i++) {
-        /* Only an active device processes events; disabled ones are flushed. */
-        if (dev->state == PROF_DEV_STATE_ACTIVE)
-            prof_dev_drain_mmap(dev, reap.maps[i]);
-    }
-    if (reap.type == PERF_EVLIST_REAP__THREAD && reap.complete)
-        prof_dev_thread_done(dev, reap.tid);
-    perf_evlist__reap_done(dev->evlist, &reap);
+    prof_dev_reap(dev, &reap);
 
     /*
      * No fd left that keeps the device alive: every task exited. With

@@ -88,9 +88,9 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *         perf_evlist_poll__external() - libperf drops the references of the
  *         reap and releases what is left, e.g. closes the fds.
  *
- * A thread is stopped by perf_evlist__del_thread() and reaped on EPOLLHUP by
- * perf_evlist__hup(), in either order; a cpu is stopped and reaped in one go
- * by perf_evlist__del_cpu(), an evsel by perf_evlist__del_evsel().
+ * A thread is stopped and reaped in one go by perf_evlist__del_thread(), or
+ * by its exit and reaped on EPOLLHUP by perf_evlist__hup(); a cpu by
+ * perf_evlist__del_cpu(), an evsel by perf_evlist__del_evsel().
  */
 
 /*
@@ -98,18 +98,24 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  * Evsels bound to their own thread map (perf_evsel__set_own_threads()) are
  * left alone; drive those with perf_evsel__add_thread() directly.
  *
- * A thread goes away in two signals that may come in either order: the caller
- * (ptrace) reports its exit with perf_evlist__del_thread(), which stops its
- * fds (DISABLE), and the kernel reports EPOLLHUP on its fds, which reaps its
- * ring buffers, see perf_evlist__hup(). The second one closes the fds. A
- * thread with no ring buffer to reap is closed right away.
+ * A thread goes away on two signals that may come in either order: the caller
+ * (ptrace) removes it with perf_evlist__del_thread(), and the kernel reports
+ * EPOLLHUP on its fds once it exits, see perf_evlist__hup(). The first one
+ * reaps its ring buffers:
  *
- * perf_evlist__del_thread() returns 1 when the thread is gone: the caller may
- * now drop its own state of the thread. It returns 0 while waiting for the
- * EPOLLHUP.
+ *  - perf_evlist__del_thread() first: it stops the fds (DISABLE) and reaps,
+ *    a complete reap; perf_evlist__reap_done() closes the fds. The EPOLLHUP
+ *    that follows reaps nothing. The thread need not exit at all.
+ *  - EPOLLHUP first: the reap is not complete, perf_evlist__reap_done() keeps
+ *    the fds open; perf_evlist__del_thread() closes them at once, a complete
+ *    reap without ring buffer. So does a thread with no ring buffer to reap.
+ *
+ * A second perf_evlist__del_thread() while its reap is under way reaps
+ * nothing: PERF_EVLIST_REAP__NONE.
  */
 LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
-LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid);
+LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
+					struct perf_evlist_reap *reap);
 
 /*
  * Add/remove a cpu on every evsel that follows the evlist cpu map. Evsels
@@ -157,7 +163,8 @@ LIBPERF_API int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_e
 
 enum perf_evlist_reap_type {
 	PERF_EVLIST_REAP__NONE,		/* nothing reaped */
-	PERF_EVLIST_REAP__THREAD,	/* @tid exited, perf_evlist__hup() */
+	PERF_EVLIST_REAP__THREAD,	/* @tid removed, perf_evlist__del_thread(),
+					 * or exited, perf_evlist__hup() */
 	PERF_EVLIST_REAP__CPU,		/* @cpu removed, perf_evlist__del_cpu() */
 	PERF_EVLIST_REAP__EVSEL,	/* @evsel removed, perf_evlist__del_evsel() */
 };
@@ -171,9 +178,9 @@ enum perf_evlist_reap_type {
  * read every reap before the first perf_evlist__reap_done().
  *
  * @complete: the removal is complete once perf_evlist__reap_done() returns -
- * always for a cpu and an evsel, for a thread when perf_evlist__del_thread()
- * came before the EPOLLHUP; the caller may drop its own state of @tid, @cpu or
- * @evsel.
+ * always for a cpu and an evsel, for a thread when the reap comes from
+ * perf_evlist__del_thread(), not from EPOLLHUP; the caller may drop its own
+ * state of @tid, @cpu or @evsel.
  *
  * Always pass the result to perf_evlist__reap_done(), even a
  * PERF_EVLIST_REAP__NONE one.

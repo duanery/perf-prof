@@ -446,14 +446,14 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  *   domains               - the references the writers hold on a ring buffer
  *   writer fds            - attach/detach one fd of an evsel
  *   reap                  - hand the ring buffers of removed writers over
- *   thread exit           - perf_evlist__hup() / perf_evlist__del_thread()
+ *   thread add / remove   - perf_evlist__add_thread() / del_thread() / hup()
  *   cpu add / remove      - perf_evlist__add_cpu() / perf_evlist__del_cpu()
  *   evsel add / remove    - perf_evlist__add_evsel() / perf_evlist__del_evsel()
  *   mmap / munmap / poll  - the public entry points
  *
  * A ring buffer loses its last writer when its last domain is put: in
  * perf_evlist__reap_done() after a reap - EPOLLHUP of a task domain,
- * perf_evlist__del_cpu(), perf_evlist__del_evsel() - or when its fds are
+ * perf_evlist__del_thread(), del_cpu(), del_evsel() - or when its fds are
  * closed outright (perf_evsel__del_thread()/del_cpu(), munmap, close). It
  * retires then: it is gone from the evlist, and reported to the external poll
  * loop, except in munmap.
@@ -470,8 +470,8 @@ static int perf_evlist__mmap_hash(int cpu, pid_t tid, bool overwrite)
 }
 
 /*
- * Only ring buffers new writers may still join are found: a thread ring buffer
- * leaves the hash once its thread is deleted, the tid may be reused.
+ * Only ring buffers new writers may still join are found: a ring buffer leaves
+ * the hash once it retires, the tid may be reused then.
  */
 struct perf_mmap *perf_evlist__find_mmap(struct perf_evlist *evlist,
 					 int cpu, pid_t tid, bool overwrite)
@@ -1205,9 +1205,10 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
  * perf_evlist__reap_done() takes them off - a ring buffer left without writer
  * retires then, see perf_evlist__mmap_unregister() - and finishes the removal.
  *
- * The fds stopped by perf_evlist__del_cpu()/del_evsel() are marked
- * (perf_evsel_fd::stopped) and keep their poll roles until they are closed:
- * nothing is counted, the domains order them, see perf_mmap_domain__order().
+ * The fds stopped by perf_evlist__del_thread()/del_cpu()/del_evsel() are
+ * marked (perf_evsel_fd::stopped) and keep their poll roles until they are
+ * closed: nothing is counted, the domains order them, see
+ * perf_mmap_domain__order().
  */
 
 static void perf_evlist__reap_init(struct perf_evlist_reap *reap)
@@ -1250,10 +1251,19 @@ static bool perf_evlist__cpu_stop(struct perf_evsel_cpu *c)
 }
 
 /*
- * Thread exit.
+ * Thread add / remove.
  *
- * Only evsels following the evlist thread map are driven from here, as in
- * perf_evlist__add_thread().
+ * Only evsels following the evlist thread map are driven from here.
+ *
+ * A thread leaves on two signals, in either order: perf_evlist__del_thread()
+ * and the EPOLLHUP of its exit, perf_evlist__hup(). The first one reaps its
+ * ring buffers, perf_evlist_thread tells which:
+ *
+ *  @del - perf_evlist__del_thread() stopped its fds and reaped; done closes
+ *         them, which puts the domains. The EPOLLHUP finds nothing to reap.
+ *  @hup - the exit stopped its fds and EPOLLHUP reaped; done puts its live
+ *         task domains, the fds stay open until perf_evlist__del_thread()
+ *         closes them.
  */
 
 static bool perf_evlist__thread_evsel(struct perf_evsel *evsel)
@@ -1365,41 +1375,71 @@ out_del:
 }
 
 /*
- * Kernel constraints:
- *  - the events of a task are all written by the time ptrace reports its
- *    exit: do_exit() runs perf_event_exit_task() before exit_notify();
- *  - the EPOLLHUP comes on every fd of the task once it exits, not before.
- *    Until then a running thread keeps writing: disable its fds.
+ * Disable the fds of @pid and mark them stopped, see perf_evlist__cpu_stop().
+ *
+ * Kernel constraint: a running thread keeps writing until its fds are
+ * disabled; an exiting one has written everything by the time ptrace reports
+ * its exit, do_exit() runs perf_event_exit_task() before exit_notify().
  */
-int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
+static void perf_evlist__thread_stop(struct perf_evlist *evlist, pid_t pid)
+{
+	struct perf_evsel_thread *th_fds;
+	struct perf_evsel_fd *entry;
+	struct perf_evsel *evsel;
+
+	perf_evlist__for_each_entry(evlist, evsel) {
+		if (!perf_evlist__thread_evsel(evsel))
+			continue;
+		th_fds = perf_evsel__thread_find(evsel, pid, false);
+		if (!th_fds)
+			continue;
+		list_for_each_entry(entry, &th_fds->fd_list, thread_node) {
+			ioctl(entry->fd, PERF_EVENT_IOC_DISABLE, 0);
+			perf_mmap_domain__stop_fd(entry);
+		}
+	}
+}
+
+/*
+ * Before the EPOLLHUP: stop the fds of @pid and reap the ring buffers of its
+ * live domains, done closes the fds. After it, or with nothing to reap: close
+ * the fds at once, a complete reap without ring buffer.
+ */
+int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
+			    struct perf_evlist_reap *reap)
 {
 	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, pid);
 	struct perf_mmap_domain *dom;
-	struct perf_evsel *evsel;
-	bool live = false;
+	int nr = 0;
+
+	perf_evlist__reap_init(reap);
 
 	if (th && th->del)
 		return 0;
 	if (th && !th->hup)
 		list_for_each_entry(dom, &th->domain_list, thread_node)
-			live |= !dom->dead;
+			if (!dom->dead)
+				nr++;
 
-	/* Stop the fds and wait for the EPOLLHUP to give up the ring buffers. */
-	if (live) {
-		th->del = true;
-		perf_evlist__for_each_entry(evlist, evsel) {
-			if (perf_evlist__thread_evsel(evsel))
-				perf_evsel__disable_thread(evsel, pid);
-		}
-		list_for_each_entry(dom, &th->domain_list, thread_node) {
-			if (dom->map && dom->map->tid == pid)
-				perf_evlist__mmap_unhash(dom->map);
-		}
+	reap->type = PERF_EVLIST_REAP__THREAD;
+	reap->tid = pid;
+	reap->complete = true;
+	if (!nr) {
+		perf_evlist__thread_close(evlist, pid);
 		return 0;
 	}
+	if (perf_evlist__reap_alloc(reap, nr)) {
+		perf_evlist__reap_init(reap);
+		return -ENOMEM;
+	}
 
-	perf_evlist__thread_close(evlist, pid);
-	return 1;
+	th->del = true;
+	perf_evlist__thread_stop(evlist, pid);
+	list_for_each_entry(dom, &th->domain_list, thread_node) {
+		if (!dom->dead)
+			perf_evlist__reap_add(reap, dom->map);
+	}
+	return 0;
 }
 
 /*
@@ -1409,7 +1449,8 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
  * task context: the cpu domain never sees EPOLLHUP.
  *
  * The task domains stay on their ring buffers until perf_evlist__reap_done(),
- * see perf_evlist__thread_reap_done().
+ * see perf_evlist__thread_reap_done(). Nothing to reap once
+ * perf_evlist__del_thread() reaped the thread.
  */
 int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap *reap)
 {
@@ -1419,7 +1460,7 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap
 
 	perf_evlist__reap_init(reap);
 
-	if (!dom || !dom->thread || dom->thread->hup)
+	if (!dom || !dom->thread || dom->thread->hup || dom->thread->del)
 		return 0;
 	th = dom->thread;
 
@@ -1437,8 +1478,34 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap
 	}
 	reap->type = PERF_EVLIST_REAP__THREAD;
 	reap->tid = th->tid;
-	reap->complete = th->del;
 	return 0;
+}
+
+/*
+ * The reap of perf_evlist__del_thread() is complete, the one of EPOLLHUP is
+ * not: done closes the fds of the first, puts the live task domains of the
+ * second - a ring buffer the thread alone wrote into retires either way.
+ */
+static void perf_evlist__thread_reap_done(struct perf_evlist *evlist,
+					  struct perf_evlist_reap *reap)
+{
+	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, reap->tid);
+	struct perf_mmap_domain *dom;
+
+	/* Gone already: closed at once, or a reused tid closed it. */
+	if (!th)
+		return;
+	if (reap->complete) {
+		if (th->del)
+			perf_evlist__thread_close(evlist, reap->tid);
+		return;
+	}
+	if (!th->hup)
+		return;
+	list_for_each_entry(dom, &th->domain_list, thread_node) {
+		if (!dom->dead)
+			perf_evlist__mmap_domain_put(evlist, dom);
+	}
 }
 
 /*
@@ -1772,34 +1839,13 @@ static void perf_evlist__evsel_leave(struct perf_evlist *evlist, struct perf_evs
 	evsel->del = false;
 }
 
-/*
- * The exited thread @tid leaves its ring buffers: its live task domains are
- * put, a ring buffer it alone wrote into retires. Its fds are closed once
- * perf_evlist__del_thread() came too.
- */
-static void perf_evlist__thread_reap_done(struct perf_evlist *evlist, pid_t tid)
-{
-	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, tid);
-	struct perf_mmap_domain *dom;
-
-	/* Gone already: perf_evlist__del_thread() or a reused tid closed it. */
-	if (!th || !th->hup)
-		return;
-	list_for_each_entry(dom, &th->domain_list, thread_node) {
-		if (!dom->dead)
-			perf_evlist__mmap_domain_put(evlist, dom);
-	}
-	if (th->del)
-		perf_evlist__thread_close(evlist, tid);
-}
-
 void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
 {
 	int i;
 
 	switch (reap->type) {
 	case PERF_EVLIST_REAP__THREAD:
-		perf_evlist__thread_reap_done(evlist, reap->tid);
+		perf_evlist__thread_reap_done(evlist, reap);
 		break;
 	case PERF_EVLIST_REAP__CPU:
 		perf_evlist__cpu_close(evlist, reap->cpu);
