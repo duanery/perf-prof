@@ -270,8 +270,10 @@ ring 的共享与生命周期。
 | del 先到（7.2） | `perf_evlist__del_thread()`：`perf_evsel__disable_thread()`、`perf_evlist__mmap_unhash()`、`th->del = true` |
 | 关闭 fd（7.4） | `perf_evlist__thread_close()` → `perf_evsel__del_thread()` → `perf_evsel__close_one()` → `perf_evlist__mmap_detach_fd()`：`perf_evlist__id_del()`、`perf_mmap_domain__del_fd()`，死域空了 `perf_evlist__mmap_domain_free()`；线程记录 `perf_evlist__thread_free()` |
 | 无 HUP 时最后一个 fd 离开存活域 | `perf_evlist__mmap_detach_fd()` 中 `!dom->dead && dom->nr_fds == 1` → `perf_evlist__mmap_domain_put(evlist, dom, NULL)` |
-| cpu 删除：停止 + 收割（7.6） | `perf_evlist__del_cpu()`：`c->del = true`、`perf_evsel__disable_cpu()`；`perf_evlist__cpu_reap_mmap()` 对 (c,-1) ring 计数，停止的 fd 是全部 writer 时 `perf_evlist__mmap_retire()` |
+| cpu 删除：停止 + 收割（7.6） | `perf_evlist__del_cpu()`：`c->del = true`、`perf_evsel__disable_cpu()`；`perf_evlist__reap_mmap()` 对 (c,-1) ring 用 `perf_evlist__mmap_stopped()` 计数，停止的 fd 是全部 writer 时 `perf_evlist__mmap_retire()` |
 | cpu 删除：完成（7.6） | `perf_evlist__reap_done()` → `perf_evlist__cpu_close()` → `perf_evsel__del_cpu()` → `perf_evsel__close_one()` → `perf_evlist__mmap_detach_fd()` |
+| evsel 增加（7.7） | `perf_evsel__set_leader()` → `perf_evsel__open()`；`perf_evlist__add_evsel()`：`evsel->joined`、`perf_evlist__mmap_attach_fd()`、`perf_evsel__enable()` |
+| evsel 删除（7.8） | `perf_evlist__del_evsel()`：`evsel->del = true`、DISABLE、`perf_evlist__reap_mmap()`；`perf_evlist__reap_done()` → `perf_evlist__evsel_leave()` → `perf_evlist__mmap_detach_fd()`、`perf_evlist__remove()` |
 | munmap | `perf_evlist__munmap()`：`evlist->munmapping = true`，先 `perf_evlist_poll__del()` 全部域，再逐个 `perf_evlist__mmap_detach_fd()` |
 | ring 释放 | `perf_mmap__put()` 归 0 → munmap + free（`lib/perf/mmap.c`） |
 
@@ -299,8 +301,8 @@ ring 的共享与生命周期。
 
 | 持有者 | 获取 | 释放 |
 |---|---|---|
-| 每个存活的域 | 域创建 | 域死亡：线程 HUP、cpu 删除使 ring retired，或域内最后一个 fd detach |
-| `struct perf_evlist_reap` 的 `maps[]` | 收割：`perf_evlist__hup()`（由死亡的域转交）、`perf_evlist__del_cpu()`（另取一个引用） | `perf_evlist__reap_done()` |
+| 每个存活的域 | 域创建 | 域死亡：线程 HUP、cpu 或 evsel 删除使 ring retired，或域内最后一个 fd detach |
+| `struct perf_evlist_reap` 的 `maps[]` | 收割：`perf_evlist__hup()`（由死亡的域转交）、`perf_evlist__del_cpu()` / `del_evsel()`（另取一个引用） | `perf_evlist__reap_done()` |
 | perf-prof order 堆 | `order_mmap_add()` | `order_mmap_del()` / `order_deinit()` |
 
 `perf_mmap__put()` 归 0 时 munmap 并 free，**不访问 evlist**：ring 失去 writer 时已经从 evlist
@@ -314,9 +316,9 @@ ring 的共享与生命周期。
   不会再有新事件，也不会被新 writer 找到，但只要还有引用就仍可读。
 - **释放**：最后一个引用放下 → munmap。
 
-ring 的域有三种死法：线程 HUP；cpu 删除时 ring 的 writer 全部被停止，整个 ring retired（7.6）；
-或域内最后一个 fd 被 detach（`perf_evsel__del_thread()` / `del_cpu()`、`perf_evsel__close()`、
-`perf_evlist__munmap()`）。
+ring 的域有三种死法：线程 HUP；cpu 或 evsel 删除时 ring 的 writer 全部被停止，整个 ring retired
+（7.6、7.8）；或域内最后一个 fd 被 detach（`perf_evsel__del_thread()` / `del_cpu()`、
+`perf_evsel__close()`、`perf_evlist__del_evsel()` 的完成、`perf_evlist__munmap()`）。
 
 ### 5.3 owner 与 fd 的关系
 
@@ -413,10 +415,10 @@ void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 
 ---
 
-## 7 线程与 cpu 增删
+## 7 线程、cpu 与 evsel 增删
 
 `perf_evlist__open()` 之后 evlist 与 evsel 的输入 cpu map / thread map 都不再变化，之后只能逐个
-增删线程或 cpu。删除 writer——线程、cpu，后续还有 evsel——统一按 **停止 → 收割 → 完成** 三步：
+增删线程、cpu 或 evsel。删除 writer——线程、cpu、evsel——统一按 **停止 → 收割 → 完成** 三步：
 
 1. **停止**：被删除的 writer 不再产生事件：`DISABLE`，或内核已停止它们（task 退出）；
 2. **收割**：libperf 把它们写过的每个 ring 连同一个引用交给调用方（`struct perf_evlist_reap`），
@@ -426,7 +428,7 @@ void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 
 线程的停止是 `perf_evlist__del_thread()`（或线程退出本身），收割是 EPOLLHUP 触发的
 `perf_evlist__hup()`，二者顺序不定（7.2）；cpu 的停止与收割都在 `perf_evlist__del_cpu()` 里一次完成
-（7.6）。
+（7.6），evsel 的在 `perf_evlist__del_evsel()` 里（7.8）。
 
 ### 7.1 增加
 
@@ -570,6 +572,65 @@ evsel 有 c 时返回 `-ENOENT`，`reap->type` 为 `PERF_EVLIST_REAP__NONE`。
 `perf_evsel__del_cpu()` 直接关闭 fd，不经过收割，与 `perf_evsel__del_thread()` 相同：失去 writer 的
 ring 立即释放，调用方须先读完。
 
+### 7.7 增加 evsel
+
+evsel 整体加入已打开的 evlist，配置都用它自己的 `perf_evsel__` 函数在加入前完成：
+
+1. `perf_evsel__new()`；作为组成员时 `perf_evsel__set_leader(evsel, leader)`；
+   `perf_evsel__open(evsel, cpus, threads)`，用 evsel 自己的 cpu map 与 thread map（跟随 evlist 的
+   线程或 cpu 时传当前的集合）。`attr.disabled = 1` 打开，加入时再 enable；
+2. 可选 `perf_evsel__apply_filter()`、`perf_evsel__set_bpf()`；
+3. `perf_evlist__add_evsel(evlist, evsel)`：`perf_evlist__add()` 加入链表，置 `evsel->joined`；
+   evlist 已 mmap 时每个 fd 经 `perf_evlist__mmap_attach_fd()` 落入 (c,t) 的 ring——已有就
+   `SET_OUTPUT` 接入，没有就创建，经 poll add 回调以 `new_map` 报告给 order；注册监听 fd，登记 sample
+   id；最后 `perf_evsel__enable()`（`keep_disable` 时不 enable）。失败时摘掉已 attach 的 fd 并移出
+   evlist，evsel 仍由调用方关闭。evlist 未 mmap 时只登记 sample id，之后的 `perf_evlist__mmap()` 一并映射。
+
+`perf_evsel__set_leader(evsel, leader)` 的合法性检查，不合法返回 `-EINVAL`：
+
+| 条件 | 原因 |
+|---|---|
+| `evsel` 尚未打开，否则 `-EBUSY` | 内核在 `perf_event_open()` 时取 group_fd，之后不能改 |
+| `leader` 已打开 | 成员的 fd 以 leader 同 (c,t) 的 fd 为 group_fd |
+| `leader` 自己是 leader（`leader->leader == leader`），且没有任何 fd 是别人的组成员 | group_fd 必须是组 leader（`perf_evsel__group_leader()`） |
+| `leader` 不在移出 evlist 的过程中（`!leader->del`） | 它的 fd 将被关闭，组成员会被拆散 |
+| `evsel` 自己没有成员（`nr_members == 1`） | 不支持嵌套组 |
+| `perf_evsel__can_group(leader, evsel)` | 同一 clock；成员不能 pinned / exclusive；`keep_disable` 不入组 |
+
+`leader` 为 NULL 或 evsel 自身时解除组关系。leader 在某个 (c,t) 没有 fd 时，成员在那里单独打开。
+
+不在 evlist 里时成员 fd 按 evsel 自己的 `attr.disabled` 打开，不像 `perf_evlist__open()` 那样以
+enabled 打开、跟随 leader：leader 已在运行，enabled 打开就会在加入 evlist 之前开始写入。
+`perf_evlist__add_evsel()` 要求 leader 已在同一个 evlist 中，否则 `-EINVAL`。
+
+grouped evlist（`perf_evlist__set_leader()`）里，open 之后加入的 evsel 只按显式 leader 分组：它不按
+rank 参与组的选择，也不成为已有 fd 的 leader。`perf_evlist__open_order()` 里 joined evsel 不按 rank
+排序，按加入顺序排在后面，显式 leader 总是先加入。之后的 `perf_evlist__add_thread()` /
+`add_cpu()` 照常驱动它（跟随 evlist 的线程 / cpu 时）。
+
+### 7.8 删除 evsel：停止 → 收割 → 完成
+
+```c
+int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
+                           struct perf_evlist_reap *reap);
+```
+
+evlist 里任一 evsel 都可以删除，包括 open 时就在的。
+
+1. **停止**：置 `evsel->del`，对 evsel 的全部 fd `DISABLE`。evsel 的 fd 还是别的 evsel 的组 leader 时返回
+   `-EBUSY`：DISABLE leader 会把成员一起停掉，须先删除成员。
+2. **收割**：对 evsel 的 fd 所在的每个 ring（去重），与 7.6 相同地数被停止的 fd 与全部 writer，
+   被停止的 fd 包括 `c->del` 的 cpu 与 `evsel->del` 的 evsel 上的：全部停止则 retired，否则只交给
+   调用方读。`reap->type = PERF_EVLIST_REAP__EVSEL`、`reap->evsel`，`complete` 恒为 true。
+3. **完成**：`perf_evlist__reap_done()` 放下引用，`perf_evlist__evsel_leave()` 把 evsel 的 fd 逐个
+   detach（死域随最后一个 fd 释放；未 retired 的 ring 上它的域离开），移出 evlist，清 `joined` /
+   `del`，并退出显式组（清 `entry->leader`，`evsel->leader` 指回自身）：它的 leader 可能先于它被删除、
+   关闭，evlist 之外没有人再清这些指针；内核里 fd 仍在组内，disabled，直到关闭。fd 保持打开。调用方
+   随后 `perf_evsel__close()`、`perf_evsel__delete()`。
+
+停止与完成之间：再次删除返回 `-EBUSY`；`perf_evlist__add_thread()` / `add_cpu()` 跳过该 evsel；它不
+被选为新 fd 的组 leader。
+
 ---
 
 ## 8 与 perf-prof 的接口
@@ -647,8 +708,12 @@ cpu ring 在此读到 head，保证 `prof->del_thread()` 之后不再出现该�
 11. **del 已到、HUP 未到的线程遇上 add_cpu**：新 cpu 上为它打开的 fd 会被 enable。当前 ptrace 未开
     `PTRACE_O_TRACEEXIT`，del 到来时 task 已退出，`perf_event_open()` 返回 `-ESRCH`，不会发生；开启
     TRACEEXIT 后需要处理。
-12. **perf-prof 尚未使用 cpu 增删**：`perf_evlist__add_cpu()` / `del_cpu()` 目前只有 libperf 实现与
-    测试。
+12. **perf-prof 尚未使用 cpu 与 evsel 增删**：`perf_evlist__add_cpu()` / `del_cpu()`、
+    `perf_evlist__add_evsel()` / `del_evsel()` 目前只有 libperf 实现与测试。
+13. **加入运行中的组**：成员从下一次调度起随 leader 运行；PMU 放不下整个组时整个组都不运行，leader
+    也受影响。tracepoint / 软件事件不受限。
+14. **evsel 的 leader 先删**：返回 `-EBUSY`，须先删成员。不在 evlist 里、用 `perf_evsel__set_leader()`
+    组成的组，`perf_evsel__close()` 不检查成员，由调用方先关成员。
 
 ---
 
@@ -671,8 +736,8 @@ perf 的 trace event 过滤器只能设置一次（K12）。若以后要为绑 c
 |---|---|
 | ring 基础操作 | `lib/perf/mmap.c`：`perf_mmap__new/mmap/get/put` |
 | 数据结构 | `lib/perf/include/internal/evlist.h`：`perf_mmap_domain`、`perf_evlist_thread`；`internal/mmap.h`：`perf_mmap` |
-| 登记、线程记录、epoll、HUP 域、writer fd、收割、线程退出、cpu 增删、mmap/munmap/poll | `lib/perf/evlist.c` 中 "Ring buffer management" 一节，按此顺序分组 |
-| evsel 的 cpu / 线程记录与单个 fd 的增删 | `lib/perf/evsel.c`：`perf_evsel__add/del_thread()`、`perf_evsel__add/del_cpu()`、`perf_evsel__open_new()` |
+| 登记、线程记录、epoll、HUP 域、writer fd、收割、线程退出、cpu 增删、evsel 增删、mmap/munmap/poll | `lib/perf/evlist.c` 中 "Ring buffer management" 一节，按此顺序分组 |
+| evsel 的 cpu / 线程记录与单个 fd 的增删，显式 leader | `lib/perf/evsel.c`：`perf_evsel__add/del_thread()`、`perf_evsel__add/del_cpu()`、`perf_evsel__open_new()`、`perf_evsel__set_leader()` |
 | 对外接口 | `lib/perf/include/perf/evlist.h` |
 | perf-prof 侧 | `src/monitor.c`：`prof_dev_hup()`、`prof_dev_thread_done()`、`prof_dev_add/del_thread()`、`__poll_add/del()` |
 | 测试 | `lib/perf/tests/test-bind.c`；`tests/test_dynamic_bindings.py` |
