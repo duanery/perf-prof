@@ -49,6 +49,22 @@ LIBPERF_API int perf_evsel__set_bpf(struct perf_evsel *evsel, unsigned int prog_
 LIBPERF_API void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_cpu_map *own_cpus);
 LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads);
 /*
+ * Make @leader the group leader of @evsel; @evsel itself or NULL ends the
+ * membership. Before perf_evsel__open(): the kernel takes the group leader at
+ * perf_event_open() time, -EBUSY once @evsel is open.
+ *
+ * @leader must be open already and lead a group of its own: it is no member
+ * on any fd, nor on its way out of its evlist; and the two must be able to
+ * share a group (clock, pinned or exclusive member). @evsel must lead no
+ * members itself. -EINVAL otherwise.
+ *
+ * On each (cpu, tid) @evsel joins the fd of @leader there, and opens alone
+ * where @leader has none. Outside an evlist the member fds open with the
+ * attr.disabled of @evsel, not enabled to follow @leader: a leader in an open
+ * evlist runs already. Open disabled, perf_evlist__add_evsel() enables.
+ */
+LIBPERF_API int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader);
+/*
  * Add/remove a thread or a cpu on an already open evsel. The fds are
  * opened/closed and join/leave the ring buffers of their bindings accordingly.
  * The maps the evsel was opened with do not change: perf_evsel__cpus() and

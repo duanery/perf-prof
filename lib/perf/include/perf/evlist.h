@@ -64,8 +64,8 @@ LIBPERF_API int perf_evlist__mmap(struct perf_evlist *evlist, int pages);
 LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
 
 /*
- * Removing writers from the evlist - a thread, a cpu, and later an evsel -
- * goes through three steps:
+ * Removing writers from the evlist - a thread, a cpu or an evsel - goes
+ * through three steps:
  *
  *  stop - the writers produce no more events: DISABLE, or the kernel stopped
  *         them (an exited task);
@@ -77,7 +77,7 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *
  * A thread is stopped by perf_evlist__del_thread() and reaped on EPOLLHUP by
  * perf_evlist__hup(), in either order; a cpu is stopped and reaped in one go
- * by perf_evlist__del_cpu().
+ * by perf_evlist__del_cpu(), an evsel by perf_evlist__del_evsel().
  */
 
 /*
@@ -113,10 +113,40 @@ LIBPERF_API int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu);
 LIBPERF_API int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,
 				     struct perf_evlist_reap *reap);
 
+/*
+ * Add/remove an evsel on an open evlist, as a whole. Adding goes:
+ *
+ *  1. perf_evsel__new(), perf_evsel__set_leader() for a group member, and
+ *     perf_evsel__open() on the cpu and thread maps of the evsel - with
+ *     attr.disabled = 1, it is enabled when it joins;
+ *  2. optionally perf_evsel__apply_filter(), perf_evsel__set_bpf();
+ *  3. perf_evlist__add_evsel(): the evsel joins the evlist, its fds join the
+ *     ring buffers of their bindings - creating the missing ones - and the
+ *     poll fds are registered; then it is enabled, unless kept disabled.
+ *
+ * A group leader joins before its members are opened. The evsel follows the
+ * evlist threads and cpus unless it has its own maps, see
+ * perf_evsel__set_own_cpus()/set_own_threads(): open it on the current ones
+ * then. In a grouped evlist (perf_evlist__set_leader()) it is grouped by its
+ * explicit leader only. The evlist owns it from here on, as with
+ * perf_evlist__add(): perf_evlist__delete() deletes it.
+ *
+ * Removing goes stop - reap - done: perf_evlist__del_evsel() disables its fds
+ * and reaps the ring buffers they wrote into; perf_evlist__reap_done() takes
+ * it out of the evlist with its fds still open; the caller then closes it
+ * with perf_evsel__close() and deletes it. -EBUSY: it leads fds of another
+ * evsel in the evlist, remove those first; or its removal is in progress.
+ * Any evsel of the evlist can be removed, also one there since the open.
+ */
+LIBPERF_API int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel);
+LIBPERF_API int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
+				       struct perf_evlist_reap *reap);
+
 enum perf_evlist_reap_type {
 	PERF_EVLIST_REAP__NONE,		/* nothing reaped */
 	PERF_EVLIST_REAP__THREAD,	/* @tid exited, perf_evlist__hup() */
 	PERF_EVLIST_REAP__CPU,		/* @cpu removed, perf_evlist__del_cpu() */
+	PERF_EVLIST_REAP__EVSEL,	/* @evsel removed, perf_evlist__del_evsel() */
 };
 
 /*
@@ -125,9 +155,9 @@ enum perf_evlist_reap_type {
  * end, so that no event is left behind. @retired marks the ones left without
  * any writer: they are already gone from the evlist and the caller drops its
  * own references, e.g. the order heap. @complete: the removal is complete
- * once perf_evlist__reap_done() returns - always for a cpu, for a thread when
- * perf_evlist__del_thread() came before the EPOLLHUP; the caller may drop its
- * own state of @tid or @cpu.
+ * once perf_evlist__reap_done() returns - always for a cpu and an evsel, for
+ * a thread when perf_evlist__del_thread() came before the EPOLLHUP; the
+ * caller may drop its own state of @tid, @cpu or @evsel.
  *
  * Always pass the result to perf_evlist__reap_done(), even a
  * PERF_EVLIST_REAP__NONE one.
@@ -136,6 +166,7 @@ struct perf_evlist_reap {
 	enum perf_evlist_reap_type type;
 	pid_t tid;		/* PERF_EVLIST_REAP__THREAD, -1 otherwise */
 	int cpu;		/* PERF_EVLIST_REAP__CPU, -1 otherwise */
+	struct perf_evsel *evsel;	/* PERF_EVLIST_REAP__EVSEL, NULL otherwise */
 	bool complete;
 	int nr_maps;
 	struct perf_evlist_reap_map {

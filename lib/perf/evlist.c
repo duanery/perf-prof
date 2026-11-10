@@ -208,7 +208,8 @@ int perf_evlist__set_maps(struct perf_evlist *evlist,
  * Kernel constraint: a group leader is open before its members, perf_event_open()
  * takes its fd as group_fd. In a grouped evlist that is the rank order, highest
  * first, see perf_evsel__rank_cmp(); otherwise the evlist order, explicit
- * leaders come first.
+ * leaders come first. The evsels joined later, see perf_evlist__add_evsel(),
+ * follow in the order they joined, after their leaders.
  */
 static struct perf_evsel **perf_evlist__open_order(struct perf_evlist *evlist)
 {
@@ -219,7 +220,7 @@ static struct perf_evsel **perf_evlist__open_order(struct perf_evlist *evlist)
 	if (!order)
 		return NULL;
 	perf_evlist__for_each_entry(evlist, evsel) {
-		for (i = nr; i > 0 && evlist->grouped &&
+		for (i = nr; i > 0 && evlist->grouped && !evsel->joined &&
 			     perf_evsel__rank_cmp(evsel, order[i - 1]) > 0; i--)
 			order[i] = order[i - 1];
 		order[i] = evsel;
@@ -447,11 +448,12 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  *   reap                  - hand the ring buffers of removed writers over
  *   thread exit           - perf_evlist__hup() / perf_evlist__del_thread()
  *   cpu add / remove      - perf_evlist__add_cpu() / perf_evlist__del_cpu()
+ *   evsel add / remove    - perf_evlist__add_evsel() / perf_evlist__del_evsel()
  *   mmap / munmap / poll  - the public entry points
  *
  * A ring buffer loses its last writer only through a reap - EPOLLHUP of a task
- * domain, perf_evlist__del_cpu() - or when its fds are closed outright
- * (perf_evsel__del_thread()/del_cpu(), munmap, close).
+ * domain, perf_evlist__del_cpu(), perf_evlist__del_evsel() - or when its fds
+ * are closed outright (perf_evsel__del_thread()/del_cpu(), munmap, close).
  */
 
 /* Ring buffer registry. */
@@ -1118,6 +1120,7 @@ static void perf_evlist__reap_init(struct perf_evlist_reap *reap)
 	reap->type = PERF_EVLIST_REAP__NONE;
 	reap->tid = -1;
 	reap->cpu = -1;
+	reap->evsel = NULL;
 }
 
 static int perf_evlist__reap_alloc(struct perf_evlist_reap *reap, int nr)
@@ -1151,6 +1154,60 @@ static void perf_evlist__mmap_retire(struct perf_evlist *evlist, struct perf_mma
 	}
 	list_for_each_entry_safe(dom, tmp, &map->domain_list, map_node)
 		perf_evlist__mmap_domain_put(evlist, dom, NULL);
+}
+
+/*
+ * The writers of @map stopped by a removal in progress: the fds of a cpu
+ * (perf_evlist__del_cpu()) or of an evsel (perf_evlist__del_evsel()) being
+ * removed. A cpu-bound ring buffer has its writers on its cpu, a thread-bound
+ * one on cpu -1. Writers of dead domains (exited threads) no longer count.
+ */
+static int perf_evlist__mmap_stopped(struct perf_evlist *evlist, struct perf_mmap *map)
+{
+	struct perf_evsel_fd *entry;
+	struct perf_evsel *evsel;
+	struct perf_evsel_cpu *c;
+	int stopped = 0;
+
+	perf_evlist__for_each_entry(evlist, evsel) {
+		c = perf_evsel__cpu_find(evsel, map->cpu);
+		if (!c || !(c->del || evsel->del))
+			continue;
+		list_for_each_entry(entry, &c->fd_list, cpu_node)
+			if (entry->domain && entry->domain->map == map)
+				stopped++;
+	}
+	return stopped;
+}
+
+/*
+ * Reap the ring buffer @map of removed writers, if stopped ones write into
+ * it. When they are its only writers it is retired: gone from the evlist at
+ * once, as on EPOLLHUP. Otherwise other writers keep writing into it, it is
+ * only handed over to be read; the stopped fds leave it in
+ * perf_evlist__reap_done().
+ *
+ * Every stopped writer counts, also those of another removal not done yet:
+ * the ring buffer is retired by the reap that stops its last writer.
+ */
+static void perf_evlist__reap_mmap(struct perf_evlist *evlist, struct perf_mmap *map,
+				   struct perf_evlist_reap *reap)
+{
+	struct perf_evlist_reap_map *m;
+	struct perf_mmap_domain *dom;
+	int writers = 0, stopped = perf_evlist__mmap_stopped(evlist, map);
+
+	if (!stopped)
+		return;
+	list_for_each_entry(dom, &map->domain_list, map_node)
+		writers += dom->nr_fds;
+
+	perf_mmap__get(map);
+	m = &reap->maps[reap->nr_maps++];
+	m->map = map;
+	m->retired = stopped == writers;
+	if (m->retired)
+		perf_evlist__mmap_retire(evlist, map);
 }
 
 /*
@@ -1220,7 +1277,7 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 		evsel = added[i];
 		if (!perf_evlist__thread_evsel(evsel))
 			continue;
-		if (!evsel->opened || evsel->any_thread)
+		if (!evsel->opened || evsel->any_thread || evsel->del)
 			continue;
 		if (perf_evsel__has_thread(evsel, pid))
 			continue;
@@ -1391,7 +1448,8 @@ int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu)
 
 	for (i = 0; i < evlist->nr_entries; i++) {
 		evsel = added[i];
-		if (!perf_evlist__cpu_evsel(evsel) || perf_evsel__has_cpu(evsel, cpu))
+		if (!perf_evlist__cpu_evsel(evsel) || evsel->del ||
+		    perf_evsel__has_cpu(evsel, cpu))
 			continue;
 
 		err = perf_evsel__add_cpu(evsel, cpu);
@@ -1430,46 +1488,6 @@ out_del:
 		perf_evsel__del_cpu(added[--nr], cpu);
 	free(added);
 	return err;
-}
-
-/*
- * Reap the ring buffer @map of a cpu being removed, if the stopped fds write
- * into it. When they are its only writers it is retired: gone from the evlist
- * at once, as on EPOLLHUP. Otherwise other evsels keep writing into it (own
- * cpus, system wide), it is only handed over to be read; the stopped fds
- * leave it when perf_evlist__reap_done() closes them.
- *
- * Writers of dead domains (exited threads) no longer count, either way.
- */
-static void perf_evlist__cpu_reap_mmap(struct perf_evlist *evlist, struct perf_mmap *map,
-				       struct perf_evlist_reap *reap)
-{
-	struct perf_evlist_reap_map *m;
-	struct perf_mmap_domain *dom;
-	struct perf_evsel_fd *entry;
-	struct perf_evsel *evsel;
-	struct perf_evsel_cpu *c;
-	int writers = 0, stopped = 0;
-
-	list_for_each_entry(dom, &map->domain_list, map_node)
-		writers += dom->nr_fds;
-	perf_evlist__for_each_entry(evlist, evsel) {
-		c = perf_evlist__cpu_rec(evsel, map->cpu);
-		if (!c || !c->del)
-			continue;
-		list_for_each_entry(entry, &c->fd_list, cpu_node)
-			if (entry->domain && entry->domain->map == map)
-				stopped++;
-	}
-	if (!stopped)
-		return;
-
-	perf_mmap__get(map);
-	m = &reap->maps[reap->nr_maps++];
-	m->map = map;
-	m->retired = stopped == writers;
-	if (m->retired)
-		perf_evlist__mmap_retire(evlist, map);
 }
 
 /*
@@ -1517,10 +1535,10 @@ int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu, struct perf_evlist
 	/* Reap. */
 	map = perf_evlist__find_mmap(evlist, cpu, -1, false);
 	if (map)
-		perf_evlist__cpu_reap_mmap(evlist, map, reap);
+		perf_evlist__reap_mmap(evlist, map, reap);
 	map = perf_evlist__find_mmap(evlist, cpu, -1, true);
 	if (map)
-		perf_evlist__cpu_reap_mmap(evlist, map, reap);
+		perf_evlist__reap_mmap(evlist, map, reap);
 
 	reap->type = PERF_EVLIST_REAP__CPU;
 	reap->cpu = cpu;
@@ -1552,6 +1570,160 @@ static void perf_evlist__cpu_close(struct perf_evlist *evlist, int cpu)
 	}
 }
 
+/*
+ * Evsel add / remove.
+ *
+ * An evsel joins an open evlist as a whole: opened on its own beforehand, see
+ * perf_evsel__open() and perf_evsel__set_leader(), and closed by the caller
+ * after it left, see perf_evsel__close().
+ */
+
+static bool perf_evsel__leads_members(struct perf_evlist *evlist, struct perf_evsel *evsel);
+
+/* Detach the fds of @evsel from the ring buffers, also drops the sample ids. */
+static void perf_evlist__evsel_detach(struct perf_evlist *evlist, struct perf_evsel *evsel)
+{
+	struct perf_evsel_fd *entry;
+
+	perf_evsel__for_each_fd(evsel, entry)
+		perf_evlist__mmap_detach_fd(evlist, entry);
+	evsel->mmaped = false;
+}
+
+/*
+ * Attach every fd of @evsel to the ring buffer of its binding - the first
+ * writer of a binding creates it, see perf_evlist__mmap_attach_fd() - and
+ * register the poll fds; then enable it. An evsel that is not mapped yet only
+ * gets its sample ids, perf_evlist__mmap() maps it along with the others.
+ *
+ * Kernel constraint: a member joining a running group starts with its next
+ * schedule. A group the PMU can no longer fit runs not at all, the leader
+ * included.
+ */
+int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel)
+{
+	struct perf_evsel_fd *entry;
+	int err;
+
+	if (!evlist->opened || !evsel->opened)
+		return -EINVAL;
+	if (evsel->evlist)
+		return -EBUSY;
+	/* Opened before the leader joined: not grouped, see perf_evsel__set_leader(). */
+	if (evsel->leader != evsel && evsel->leader->evlist != evlist)
+		return -EINVAL;
+
+	perf_evlist__add(evlist, evsel);
+	evsel->joined = true;
+	evsel->mmaped = evlist->mmaped;
+	perf_evsel__for_each_fd(evsel, entry) {
+		err = perf_evlist__mmap_attach_fd(evlist, entry);
+		if (err)
+			goto out_remove;
+	}
+	if (perf_evsel__enable(evsel)) {
+		err = -errno;
+		perf_evsel__disable(evsel);
+		goto out_remove;
+	}
+	return 0;
+
+out_remove:
+	perf_evlist__evsel_detach(evlist, evsel);
+	perf_evlist__remove(evlist, evsel);
+	evsel->joined = false;
+	return err;
+}
+
+/*
+ * Kernel constraints:
+ *  - PERF_EVENT_IOC_DISABLE returns once the event is scheduled out, on its
+ *    cpu or in its task: it writes nothing afterwards;
+ *  - a disabled group leader takes its members off with it: an evsel leading
+ *    another one's fds cannot go, -EBUSY. Remove the members first.
+ *
+ * The fds of the evsel write into two kinds of ring buffers only, of its
+ * overwrite mode, see perf_evlist__mmap_attach_fd(): (c,-1) for each of its
+ * cpus, (-1,t) for each of its threads when opened on any cpu. Reap them cpu
+ * by cpu, thread by thread. A (-1,t) ring buffer is found through the fd: it
+ * leaves the lookup hash once its thread is deleted, and is reaped already
+ * when its domain is dead.
+ */
+int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
+			   struct perf_evlist_reap *reap)
+{
+	bool overwrite = evsel->attr.write_backward;
+	struct perf_evsel_thread *t;
+	struct perf_evsel_fd *entry;
+	struct perf_evsel_cpu *c;
+	struct perf_mmap *map;
+	int nr = 0, err;
+
+	perf_evlist__reap_init(reap);
+	if (evsel->evlist != evlist)
+		return -EINVAL;
+	if (evsel->del || perf_evsel__leads_members(evlist, evsel))
+		return -EBUSY;
+	list_for_each_entry(c, &evsel->cpu_list, node)
+		nr++;
+	list_for_each_entry(t, &evsel->thread_list, node)
+		nr++;
+	err = perf_evlist__reap_alloc(reap, nr);
+	if (err)
+		return err;
+
+	/* Stop. */
+	evsel->del = true;
+	perf_evsel__for_each_fd(evsel, entry)
+		ioctl(entry->fd, PERF_EVENT_IOC_DISABLE, 0);
+	/* Reap. */
+	list_for_each_entry(c, &evsel->cpu_list, node) {
+		if (c->cpu < 0)
+			continue;
+		map = perf_evlist__find_mmap(evlist, c->cpu, -1, overwrite);
+		if (map)
+			perf_evlist__reap_mmap(evlist, map, reap);
+	}
+	if (perf_evsel__has_cpu(evsel, -1)) {
+		list_for_each_entry(t, &evsel->thread_list, node) {
+			entry = perf_evsel__fd_find(evsel, -1, t->tid);
+			if (entry && entry->domain && !entry->domain->dead)
+				perf_evlist__reap_mmap(evlist, entry->domain->map, reap);
+		}
+	}
+
+	reap->type = PERF_EVLIST_REAP__EVSEL;
+	reap->evsel = evsel;
+	reap->complete = true;
+	return 0;
+}
+
+/*
+ * Take the stopped @evsel out of the evlist. Its fds stay open, disabled, for
+ * perf_evsel__close().
+ *
+ * It also leaves its group: its leader may be removed and closed before it,
+ * nothing outside the evlist would clear the fds pointing at the leader's.
+ * The kernel keeps the fds in the group until they are closed, disabled.
+ */
+static void perf_evlist__evsel_leave(struct perf_evlist *evlist, struct perf_evsel *evsel)
+{
+	struct perf_evsel_fd *entry;
+
+	if (evsel->evlist != evlist || !evsel->del)
+		return;
+	perf_evlist__evsel_detach(evlist, evsel);
+	perf_evsel__for_each_fd(evsel, entry)
+		entry->leader = NULL;
+	if (evsel->leader != evsel) {
+		evsel->leader->nr_members--;
+		evsel->leader = evsel;
+	}
+	perf_evlist__remove(evlist, evsel);
+	evsel->joined = false;
+	evsel->del = false;
+}
+
 void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
 {
 	struct perf_evlist_thread *th;
@@ -1572,6 +1744,9 @@ void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap 
 		break;
 	case PERF_EVLIST_REAP__CPU:
 		perf_evlist__cpu_close(evlist, reap->cpu);
+		break;
+	case PERF_EVLIST_REAP__EVSEL:
+		perf_evlist__evsel_leave(evlist, reap->evsel);
 		break;
 	case PERF_EVLIST_REAP__NONE:
 	default:

@@ -146,6 +146,16 @@ struct perf_evsel {
 	bool			 mmaped;
 	bool			 enabled;
 	/*
+	 * Joined the evlist after perf_evlist__open(), see
+	 * perf_evlist__add_evsel(): grouped by its explicit leader only.
+	 */
+	bool			 joined;
+	/*
+	 * perf_evlist__del_evsel() stopped its fds, perf_evlist__reap_done()
+	 * takes it out of the evlist.
+	 */
+	bool			 del;
+	/*
 	 * Remembered so that threads added after perf_evlist__open() get the
 	 * same filter and bpf program as the fds opened up front.
 	 */

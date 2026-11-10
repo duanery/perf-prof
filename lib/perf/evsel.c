@@ -424,7 +424,9 @@ int perf_evsel__rank_cmp(struct perf_evsel *a, struct perf_evsel *b)
  * In a grouped evlist the group is decided per fd: the leader is the fd of the
  * highest ranked evsel that has one at the same (cpu, tid), see
  * perf_evlist__set_leader(). Otherwise evsel->leader leads; where it has no
- * fd, the member opens alone.
+ * fd, the member opens alone. An evsel joined to the open evlist, see
+ * perf_evlist__add_evsel(), is grouped by its explicit leader only and leads
+ * no fd of the others. Nothing joins an evsel on its way out.
  *
  * Kernel constraints on the group_fd of perf_event_open() (-EINVAL):
  *  - it is a group leader itself, not a member of another group: only fds
@@ -444,9 +446,10 @@ static int perf_evsel__group_leader(struct perf_evsel *evsel, int cpu, pid_t tid
 	struct perf_evsel *pos;
 
 	*leader = NULL;
-	if (evlist && evlist->grouped) {
+	if (evlist && evlist->grouped && !evsel->joined) {
 		perf_evlist__for_each_entry(evlist, pos) {
-			if (pos == evsel || !perf_evsel__can_group(pos, evsel))
+			if (pos == evsel || pos->joined || pos->del ||
+			    !perf_evsel__can_group(pos, evsel))
 				continue;
 			entry = __perf_evsel__fd_find(pos, cpu, tid, cgroup);
 			if (!entry || entry->leader)
@@ -457,7 +460,7 @@ static int perf_evsel__group_leader(struct perf_evsel *evsel, int cpu, pid_t tid
 		return 0;
 	}
 
-	if (evsel->leader == evsel)
+	if (evsel->leader == evsel || evsel->leader->del)
 		return 0;
 	/* Leader must be already processed/open, if not it's a bug. */
 	if (!evsel->leader->opened)
@@ -471,10 +474,11 @@ static int perf_evsel__group_leader(struct perf_evsel *evsel, int cpu, pid_t tid
  * takes a reference on @c and @t; perf_evsel__close_one() drops them.
  *
  * Kernel constraints:
- *  - a group member is scheduled along its leader: it opens enabled
- *    (attr.disabled = 0) and is switched by the leader. Fds added to an open
- *    evsel open disabled and are enabled afterwards, see
- *    perf_evsel__enable_thread();
+ *  - a group member is scheduled along its leader: in an evlist it opens
+ *    enabled (attr.disabled = 0) and is switched by the leader. Outside an
+ *    evlist the leader may run already, see perf_evsel__set_leader(): it
+ *    opens as the evsel says. Fds added to an open evsel open disabled and
+ *    are enabled afterwards, see perf_evsel__enable_thread();
  *  - PERF_FLAG_FD_CLOEXEC exists since v3.14; older kernels fail it with
  *    -EINVAL, retry without.
  */
@@ -502,7 +506,7 @@ static int perf_evsel__open_one(struct perf_evsel *evsel, struct perf_evsel_cpu 
 		flags |= PERF_FLAG_PID_CGROUP;
 	if (evsel->opened)
 		attr.disabled = 1;
-	else if (leader)
+	else if (leader && evsel->evlist)
 		attr.disabled = 0;
 
 	fd = sys_perf_event_open(&attr, tid, cpu, group_fd, flags);
@@ -588,7 +592,7 @@ int perf_evsel__open(struct perf_evsel *evsel, struct perf_cpu_map *cpus,
 		evsel->threads = perf_thread_map__get(threads);
 	}
 
-	if (evsel->leader != evsel && !(evsel->evlist && evsel->evlist->grouped)) {
+	if (evsel->leader != evsel && evsel->evlist && !evsel->evlist->grouped) {
 		evsel->attr.disabled = evsel->leader->attr.disabled;
 		evsel->init_enabled = 0;
 	}
@@ -1012,6 +1016,37 @@ void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_ma
 	evsel->own_threads = own_threads;
 	perf_thread_map__put(evsel->threads);
 	evsel->threads = perf_thread_map__get(own_threads ?: (evsel->evlist ? evsel->evlist->user_requested_threads : NULL));
+}
+
+int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader)
+{
+	struct perf_evsel_fd *entry;
+
+	if (!leader)
+		leader = evsel;
+	if (evsel->opened)
+		return -EBUSY;
+	if (leader == evsel->leader)
+		return 0;
+
+	if (leader != evsel) {
+		if (!leader->opened || leader->del || leader->leader != leader)
+			return -EINVAL;
+		/* Kernel constraint: the group_fd leads its group, see perf_evsel__group_leader(). */
+		perf_evsel__for_each_fd(leader, entry) {
+			if (entry->leader)
+				return -EINVAL;
+		}
+		if (evsel->nr_members > 1 || !perf_evsel__can_group(leader, evsel))
+			return -EINVAL;
+	}
+
+	if (evsel->leader != evsel)
+		evsel->leader->nr_members--;
+	if (leader != evsel)
+		leader->nr_members++;
+	evsel->leader = leader;
+	return 0;
 }
 
 /* Last opened first, then drop the evsel's reference on the record. */
