@@ -451,9 +451,12 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
  *   evsel add / remove    - perf_evlist__add_evsel() / perf_evlist__del_evsel()
  *   mmap / munmap / poll  - the public entry points
  *
- * A ring buffer loses its last writer only through a reap - EPOLLHUP of a task
- * domain, perf_evlist__del_cpu(), perf_evlist__del_evsel() - or when its fds
- * are closed outright (perf_evsel__del_thread()/del_cpu(), munmap, close).
+ * A ring buffer loses its last writer when its last domain is put: in
+ * perf_evlist__reap_done() after a reap - EPOLLHUP of a task domain,
+ * perf_evlist__del_cpu(), perf_evlist__del_evsel() - or when its fds are
+ * closed outright (perf_evsel__del_thread()/del_cpu(), munmap, close). It
+ * retires then: it is gone from the evlist, and reported to the external poll
+ * loop, except in munmap.
  */
 
 /* Ring buffer registry. */
@@ -502,13 +505,23 @@ static void perf_evlist__mmap_unhash(struct perf_mmap *map)
 		hlist_del_init(&map->hnode);
 }
 
+/*
+ * The ring buffer retires: no writer left. The external poll loop drops the
+ * references it took on new_map; munmap tears them down along with the evlist.
+ */
 static void perf_evlist__mmap_unregister(struct perf_evlist *evlist,
 					 struct perf_mmap *map)
 {
+	struct perf_evlist_poll *epoll = &evlist->epoll;
+
 	perf_evlist__mmap_unhash(map);
 	list_del_init(&map->node);
 	map->registered = false;
 	evlist->nr_mmaps--;
+
+	if (map->announced && !evlist->munmapping && epoll->external && epoll->del)
+		epoll->del(epoll->external, -1, 0, map, true);
+	map->announced = false;
 }
 
 /*
@@ -723,7 +736,7 @@ static void perf_evlist_poll__del(struct perf_evlist *evlist,
 
 	if (epoll->external) {
 		if (epoll->del)
-			epoll->del(epoll->external, fd, dom->poll_events, dom->map);
+			epoll->del(epoll->external, fd, dom->poll_events, dom->map, false);
 	} else
 		epoll_ctl(epoll->epfd, EPOLL_CTL_DEL, fd, NULL);
 
@@ -943,15 +956,13 @@ perf_evlist__mmap_domain_get(struct perf_evlist *evlist, struct perf_mmap *map, 
 
 /*
  * Mark @dom dead: unregister it, take it off its ring buffer and drop its
- * reference - into *@keep when given, the caller then owns it. Returns true
- * when the ring buffer has no writer left; it is then gone from the evlist.
+ * reference. With the last domain the ring buffer retires, see
+ * perf_evlist__mmap_unregister().
  */
-static bool perf_evlist__mmap_domain_put(struct perf_evlist *evlist,
-					 struct perf_mmap_domain *dom,
-					 struct perf_mmap **keep)
+static void perf_evlist__mmap_domain_put(struct perf_evlist *evlist,
+					 struct perf_mmap_domain *dom)
 {
 	struct perf_mmap *map = dom->map;
-	bool lost;
 
 	perf_evlist_poll__del(evlist, dom);
 	dom->dead = true;
@@ -961,8 +972,7 @@ static bool perf_evlist__mmap_domain_put(struct perf_evlist *evlist,
 	if (map->poll_domain == dom)
 		map->poll_domain = NULL;
 
-	lost = list_empty(&map->domain_list);
-	if (lost)
+	if (list_empty(&map->domain_list))
 		perf_evlist__mmap_unregister(evlist, map);
 	else
 		perf_evlist_poll__update(evlist, map, NULL, NULL);
@@ -971,12 +981,7 @@ static bool perf_evlist__mmap_domain_put(struct perf_evlist *evlist,
 		perf_evlist_poll__update(evlist, NULL, dom->thread, NULL);
 	}
 	dom->map = NULL;
-
-	if (keep)
-		*keep = map;
-	else
-		perf_mmap__put(map);
-	return lost;
+	perf_mmap__put(map);
 }
 
 /* A dead domain goes with its last fd. */
@@ -1057,7 +1062,7 @@ int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
 	dom = perf_evlist__mmap_domain_get(evlist, map, tid);
 	if (!dom || perf_mmap_domain__add_fd(dom, entry->fd)) {
 		if (dom && !dom->nr_fds) {
-			perf_evlist__mmap_domain_put(evlist, dom, NULL);
+			perf_evlist__mmap_domain_put(evlist, dom);
 			perf_evlist__mmap_domain_free(dom);
 		} else if (list_empty(&map->domain_list))
 			perf_evlist__mmap_unregister(evlist, map);
@@ -1095,7 +1100,7 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
 	if (dom->poll_fd == entry->fd)
 		perf_evlist_poll__del(evlist, dom);
 	if (!dom->dead && dom->nr_fds == 1)
-		perf_evlist__mmap_domain_put(evlist, dom, NULL);
+		perf_evlist__mmap_domain_put(evlist, dom);
 	if (dom->dead) {
 		perf_mmap_domain__del_fd(dom, entry->fd);
 		if (!dom->nr_fds)
@@ -1111,10 +1116,11 @@ void perf_evlist__mmap_detach_fd(struct perf_evlist *evlist,
 /*
  * Reap.
  *
- * Removed writers are stopped first; the reap then takes their live domains
- * off the ring buffers and passes on the references the domains held, so the
- * caller can read the ring buffers to the end before perf_evlist__reap_done()
- * drops them and finishes the removal.
+ * Removed writers are stopped first; the reap then hands over the ring
+ * buffers they wrote into, each with a reference, so the caller can read them
+ * to the end. The writers stay on the ring buffers, registered, until
+ * perf_evlist__reap_done() takes them off - a ring buffer left without writer
+ * retires then, see perf_evlist__mmap_unregister() - and finishes the removal.
  */
 
 static void perf_evlist__reap_init(struct perf_evlist_reap *reap)
@@ -1132,20 +1138,16 @@ static int perf_evlist__reap_alloc(struct perf_evlist_reap *reap, int nr)
 	return reap->maps ? 0 : -ENOMEM;
 }
 
-/* @reap has room for @dom, see perf_evlist__reap_alloc(). */
-static void perf_evlist__reap_domain(struct perf_evlist *evlist,
-				     struct perf_mmap_domain *dom,
-				     struct perf_evlist_reap *reap)
+/* @reap has room for @map, see perf_evlist__reap_alloc(). */
+static void perf_evlist__reap_add(struct perf_evlist_reap *reap, struct perf_mmap *map)
 {
-	struct perf_evlist_reap_map *m = &reap->maps[reap->nr_maps++];
-
-	m->retired = perf_evlist__mmap_domain_put(evlist, dom, &m->map);
+	perf_mmap__get(map);
+	reap->maps[reap->nr_maps++] = map;
 }
 
 /*
  * Take every domain of @map down at once: none of them is picked for a poll
- * role on the way. The last one unregisters @map; the caller holds a
- * reference.
+ * role on the way. The last one retires @map; the caller holds a reference.
  */
 static void perf_evlist__mmap_retire(struct perf_evlist *evlist, struct perf_mmap *map)
 {
@@ -1156,7 +1158,17 @@ static void perf_evlist__mmap_retire(struct perf_evlist *evlist, struct perf_mma
 		dom->dead = true;
 	}
 	list_for_each_entry_safe(dom, tmp, &map->domain_list, map_node)
-		perf_evlist__mmap_domain_put(evlist, dom, NULL);
+		perf_evlist__mmap_domain_put(evlist, dom);
+}
+
+static int perf_evlist__mmap_writers(struct perf_mmap *map)
+{
+	struct perf_mmap_domain *dom;
+	int writers = 0;
+
+	list_for_each_entry(dom, &map->domain_list, map_node)
+		writers += dom->nr_fds;
+	return writers;
 }
 
 /*
@@ -1185,32 +1197,38 @@ static int perf_evlist__mmap_stopped(struct perf_evlist *evlist, struct perf_mma
 
 /*
  * Reap the ring buffer @map of removed writers, if stopped ones write into
- * it. When they are its only writers it is retired: gone from the evlist at
- * once, as on EPOLLHUP. Otherwise other writers keep writing into it, it is
- * only handed over to be read; the stopped fds leave it in
- * perf_evlist__reap_done().
- *
- * Every stopped writer counts, also those of another removal not done yet:
- * the ring buffer is retired by the reap that stops its last writer.
+ * it. When they are its only writers it leaves the lookup: no new writer
+ * joins a ring buffer about to retire.
  */
 static void perf_evlist__reap_mmap(struct perf_evlist *evlist, struct perf_mmap *map,
 				   struct perf_evlist_reap *reap)
 {
-	struct perf_evlist_reap_map *m;
-	struct perf_mmap_domain *dom;
-	int writers = 0, stopped = perf_evlist__mmap_stopped(evlist, map);
+	int stopped = perf_evlist__mmap_stopped(evlist, map);
 
 	if (!stopped)
 		return;
-	list_for_each_entry(dom, &map->domain_list, map_node)
-		writers += dom->nr_fds;
+	perf_evlist__reap_add(reap, map);
+	if (stopped == perf_evlist__mmap_writers(map))
+		perf_evlist__mmap_unhash(map);
+}
 
-	perf_mmap__get(map);
-	m = &reap->maps[reap->nr_maps++];
-	m->map = map;
-	m->retired = stopped == writers;
-	if (m->retired)
-		perf_evlist__mmap_retire(evlist, map);
+/*
+ * Retire the reaped ring buffers whose writers are all stopped, before the
+ * stopped fds are closed one by one. Every stopped writer counts, also those
+ * of another removal not done yet: the first perf_evlist__reap_done() that
+ * finds no live writer retires the ring buffer, read every reap before.
+ */
+static void perf_evlist__reap_retire(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
+{
+	struct perf_mmap *map;
+	int i;
+
+	for (i = 0; i < reap->nr_maps; i++) {
+		map = reap->maps[i];
+		if (!list_empty(&map->domain_list) &&
+		    perf_evlist__mmap_stopped(evlist, map) == perf_evlist__mmap_writers(map))
+			perf_evlist__mmap_retire(evlist, map);
+	}
 }
 
 /*
@@ -1371,10 +1389,13 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid)
  * PERF_EVENT_STATE_EXIT, not only the one of @fd, so the EPOLLHUP of one fd
  * ends every task domain of the thread. pid=-1 and cgroup events are not in a
  * task context: the cpu domain never sees EPOLLHUP.
+ *
+ * The task domains stay on their ring buffers until perf_evlist__reap_done(),
+ * see perf_evlist__thread_reap_done().
  */
 int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap *reap)
 {
-	struct perf_mmap_domain *dom = perf_evlist_poll__find(evlist, fd), *tmp;
+	struct perf_mmap_domain *dom = perf_evlist_poll__find(evlist, fd);
 	struct perf_evlist_thread *th;
 	int nr = 0;
 
@@ -1390,11 +1411,11 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap
 	if (perf_evlist__reap_alloc(reap, nr))
 		return -ENOMEM;
 
-	/* Set first: a dying thread needs no replacement hup fd. */
+	/* A dying thread needs no replacement hup fd. */
 	th->hup = true;
-	list_for_each_entry_safe(dom, tmp, &th->domain_list, thread_node) {
+	list_for_each_entry(dom, &th->domain_list, thread_node) {
 		if (!dom->dead)
-			perf_evlist__reap_domain(evlist, dom, reap);
+			perf_evlist__reap_add(reap, dom->map);
 	}
 	reap->type = PERF_EVLIST_REAP__THREAD;
 	reap->tid = th->tid;
@@ -1727,34 +1748,52 @@ static void perf_evlist__evsel_leave(struct perf_evlist *evlist, struct perf_evs
 	evsel->del = false;
 }
 
+/*
+ * The exited thread @tid leaves its ring buffers: its live task domains are
+ * put, a ring buffer it alone wrote into retires. Its fds are closed once
+ * perf_evlist__del_thread() came too.
+ */
+static void perf_evlist__thread_reap_done(struct perf_evlist *evlist, pid_t tid)
+{
+	struct perf_evlist_thread *th = perf_evlist__thread_find(evlist, tid);
+	struct perf_mmap_domain *dom;
+
+	/* Gone already: perf_evlist__del_thread() or a reused tid closed it. */
+	if (!th || !th->hup)
+		return;
+	list_for_each_entry(dom, &th->domain_list, thread_node) {
+		if (!dom->dead)
+			perf_evlist__mmap_domain_put(evlist, dom);
+	}
+	if (th->del)
+		perf_evlist__thread_close(evlist, tid);
+}
+
 void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap)
 {
-	struct perf_evlist_thread *th;
 	int i;
-
-	for (i = 0; i < reap->nr_maps; i++)
-		perf_mmap__put(reap->maps[i].map);
-	zfree(&reap->maps);
-	reap->nr_maps = 0;
 
 	switch (reap->type) {
 	case PERF_EVLIST_REAP__THREAD:
-		if (!reap->complete)
-			break;
-		th = perf_evlist__thread_find(evlist, reap->tid);
-		if (th && th->hup && th->del)
-			perf_evlist__thread_close(evlist, reap->tid);
+		perf_evlist__thread_reap_done(evlist, reap->tid);
 		break;
 	case PERF_EVLIST_REAP__CPU:
+		perf_evlist__reap_retire(evlist, reap);
 		perf_evlist__cpu_close(evlist, reap->cpu);
 		break;
 	case PERF_EVLIST_REAP__EVSEL:
+		perf_evlist__reap_retire(evlist, reap);
 		perf_evlist__evsel_leave(evlist, reap->evsel);
 		break;
 	case PERF_EVLIST_REAP__NONE:
 	default:
 		break;
 	}
+
+	for (i = 0; i < reap->nr_maps; i++)
+		perf_mmap__put(reap->maps[i]);
+	zfree(&reap->maps);
+	reap->nr_maps = 0;
 	reap->type = PERF_EVLIST_REAP__NONE;
 }
 
@@ -1814,7 +1853,8 @@ int perf_evlist__mmap(struct perf_evlist *evlist, int pages)
  *
  * Unregister all poll fds up front and keep them unregistered: detaching fds
  * one by one would otherwise hand the roles of each detached fd over to the
- * next one, whatever the order of the evsels.
+ * next one, whatever the order of the evsels. No ring buffer is reported
+ * retired here: the external loop tears its references down with the evlist.
  */
 void perf_evlist__munmap(struct perf_evlist *evlist)
 {
@@ -1892,7 +1932,7 @@ int perf_evlist__poll_mmap(struct perf_evlist *evlist, int timeout, handle_mmap 
 		    perf_evlist__hup(evlist, fd, &reap))
 			continue;
 		for (j = 0; handle && j < reap.nr_maps; j++)
-			handle(reap.maps[j].map);
+			handle(reap.maps[j]);
 		perf_evlist__reap_done(evlist, &reap);
 	}
 	return epoll->nr_live ? cnt : -ENOENT;

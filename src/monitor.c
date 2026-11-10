@@ -2191,7 +2191,8 @@ int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 /*
  * EPOLLHUP: the task of @fd exited. Every ring buffer it wrote into is read to
  * the end before libperf closes its fds, so that the sample ids still resolve;
- * the ones left without a writer leave the order heap.
+ * the ones left without a writer retire in perf_evlist__reap_done(), see
+ * __poll_del().
  */
 static void prof_dev_hup(struct prof_dev *dev, int fd)
 {
@@ -2201,13 +2202,9 @@ static void prof_dev_hup(struct prof_dev *dev, int fd)
     if (perf_evlist__hup(dev->evlist, fd, &reap) < 0)
         return;
     for (i = 0; i < reap.nr_maps; i++) {
-        struct perf_mmap *map = reap.maps[i].map;
-
         /* Only an active device processes events; disabled ones are flushed. */
         if (dev->state == PROF_DEV_STATE_ACTIVE)
-            prof_dev_drain_mmap(dev, map);
-        if (reap.maps[i].retired && dev->order.enabled)
-            order_mmap_del(dev, map);
+            prof_dev_drain_mmap(dev, reap.maps[i]);
     }
     if (reap.type == PERF_EVLIST_REAP__THREAD && reap.complete)
         prof_dev_thread_done(dev, reap.tid);
@@ -2286,10 +2283,16 @@ static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap 
     return 0;
 }
 
-static void __poll_del(void *external, int fd, unsigned events, struct perf_mmap *map)
+/* Either @fd leaves the poll, or @map retires: no writer left, it leaves the order heap. */
+static void __poll_del(void *external, int fd, unsigned events, struct perf_mmap *map, bool retired)
 {
     struct prof_dev *dev = external;
 
+    if (retired) {
+        if (dev->order.enabled)
+            order_mmap_del(dev, map);
+        return;
+    }
     if (main_epoll_del(fd) == 0 && prof_dev_pollfd_counts(dev, events) &&
         dev->nr_pollfd > 0)
         dev->nr_pollfd--;

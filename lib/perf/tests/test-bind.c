@@ -523,6 +523,9 @@ struct ext_poll {
 	int nr_new;
 	int nr_del;
 	int nr_hup;	/* fds added with EPOLLHUP, those that see it */
+	int nr_retired;
+	struct perf_mmap *retired;	/* the last one, compared only */
+	int nr_bad;	/* a del neither of an fd nor of a retired ring buffer */
 };
 
 static int ext_add(void *external, int fd, unsigned events, struct perf_mmap *map, bool new_map)
@@ -538,13 +541,20 @@ static int ext_add(void *external, int fd, unsigned events, struct perf_mmap *ma
 	return 0;
 }
 
-static void ext_del(void *external, int fd, unsigned events, struct perf_mmap *map)
+static void ext_del(void *external, int fd, unsigned events, struct perf_mmap *map, bool retired)
 {
 	struct ext_poll *ext = external;
 
+	if (retired) {
+		ext->nr_retired++;
+		ext->retired = map;
+		ext->nr_bad += fd != -1;
+		return;
+	}
 	epoll_ctl(ext->epfd, EPOLL_CTL_DEL, fd, NULL);
 	ext->nr_del++;
 	ext->nr_hup -= !!(events & EPOLLHUP);
+	ext->nr_bad += fd < 0;
 }
 
 /* The fd of the next EPOLLHUP, or -1. */
@@ -613,7 +623,7 @@ static int test_poll_domains(int id)
 	struct perf_evlist_reap reap;
 	struct perf_evsel_fd *entry;
 	struct perf_mmap *map;
-	int ncpus = perf_cpu_map__nr(all), i, retired;
+	int ncpus = perf_cpu_map__nr(all);
 
 	__T("start first child", !child_start(&a));
 	__T("start second child", !child_start(&b));
@@ -644,9 +654,8 @@ static int test_poll_domains(int id)
 	__T("EPOLLHUP of the first thread", poll_hup(list, &ext, &reap) >= 0);
 	__T("EPOLLHUP names the thread", reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == a.pid && !reap.complete);
 	__T("every cpu ring buffer of the thread is reported", reap.nr_maps == ncpus);
-	for (i = 0; i < reap.nr_maps; i++)
-		__T("ring buffers still have a writer", !reap.maps[i].retired);
 	perf_evlist__reap_done(list, &reap);
+	__T("ring buffers still have a writer", !ext.nr_retired);
 	__T("the other thread's fds take over", list->epoll.nr_live == ncpus);
 	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
 	__T("delete after EPOLLHUP closes the thread", perf_evlist__del_thread(list, a.pid) == 1);
@@ -691,9 +700,8 @@ static int test_poll_domains(int id)
 	__T("EPOLLHUP next to a pid=-1 writer", poll_hup(list, &ext, &reap) >= 0);
 	__T("EPOLLHUP names the last thread", reap.tid == b.pid && !reap.complete);
 	__T("every cpu ring buffer is reported", reap.nr_maps == ncpus);
-	for (i = 0; i < reap.nr_maps; i++)
-		__T("the pid=-1 writers keep the ring buffers", !reap.maps[i].retired);
 	perf_evlist__reap_done(list, &reap);
+	__T("the pid=-1 writers keep the ring buffers", !ext.nr_retired);
 	__T("only the pid=-1 data fds are left", list->epoll.nr_live == ncpus);
 	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, b.pid) == 1);
 	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, b.pid));
@@ -701,8 +709,7 @@ static int test_poll_domains(int id)
 	/* The last writer takes the ring buffers along. */
 	perf_evsel__for_each_fd(cpuwide, entry)
 		perf_evlist__mmap_detach_fd(list, entry);
-	retired = nr_mmaps(list);
-	__T("ring buffers without writers are gone", retired == 0);
+	__T("ring buffers without writers retire", ext.nr_retired == ncpus && nr_mmaps(list) == 0);
 	__T("nothing left to poll", list->epoll.nr_live == 0 && ext.nr_add == ext.nr_del);
 	perf_evsel__close(cpuwide);
 
@@ -881,13 +888,14 @@ static int test_thread_exit(int id)
 	fd = poll_hup(list, &ext, &reap);
 	__T("EPOLLHUP after delete", fd >= 0);
 	__T("EPOLLHUP completes the delete", reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == b.pid && reap.complete);
-	__T("the thread ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map && reap.maps[0].retired);
-	__T("the retired ring buffer is gone from the evlist", nr_mmaps(list) == 2);
+	__T("the thread ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map);
+	__T("it stays until done", nr_mmaps(list) == 3 && !ext.nr_retired);
 	__T("events before the exit are still readable", perf_mmap__read_init(map) == 0 &&
 	    perf_mmap__read_event(map, &(bool){false}) != NULL);
 	perf_mmap__read_done(map);
 	__T("fds stay open until the EPOLLHUP is done", perf_evsel__has_thread(evsel, b.pid));
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires it", ext.nr_retired == 1 && ext.retired == map && nr_mmaps(list) == 2);
 	__T("done closes the thread", !perf_evsel__has_thread(evsel, b.pid));
 	__T("a second EPOLLHUP is ignored", !perf_evlist__hup(list, fd, &reap) && reap.type == PERF_EVLIST_REAP__NONE);
 	perf_evlist__reap_done(list, &reap);
@@ -1288,8 +1296,7 @@ static int test_dynamic_cpus(int id)
 	/* Shared with e2: handed over, not retired. */
 	__T("delete the cpu", !perf_evlist__del_cpu(list, 1, &reap));
 	__T("the reap names the cpu", reap.type == PERF_EVLIST_REAP__CPU && reap.cpu == 1 && reap.complete);
-	__T("the shared ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0].map == map1 &&
-	    !reap.maps[0].retired);
+	__T("the shared ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map1);
 	__T("it stays in the evlist", perf_evlist__find_mmap(list, 1, -1, false) == map1);
 	child_poke(&a);
 	__T("the stopped evsel writes no more", drain_map(map1, a.pid) == 1);
@@ -1300,19 +1307,19 @@ static int test_dynamic_cpus(int id)
 	__T("done closes the fds", perf_evsel__fd(e1, 1, -1) < 0 &&
 	    perf_cpu_map__nr(perf_evsel__cpus(e1)) == 1);
 	__T("e2 keeps the ring buffer", perf_evlist__find_mmap(list, 1, -1, false) == map1 &&
-	    perf_evsel__fd(e2, 1, -1) >= 0);
+	    perf_evsel__fd(e2, 1, -1) >= 0 && !ext.nr_retired);
 
-	/* e1 alone: retired at once. */
+	/* e1 alone: retired when done. */
 	__T("pin the child to cpu 0", !child_pin(&a, 0));
 	child_poke(&a);
 	nr_new = ext.nr_new;
 	__T("delete the last cpu", !perf_evlist__del_cpu(list, 0, &reap));
-	__T("the ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map0 &&
-	    reap.maps[0].retired);
-	__T("it is gone from the evlist", !perf_evlist__find_mmap(list, 0, -1, false) && nr_mmaps(list) == 2);
-	__T("its poll fd is gone", list->epoll.nr_live == 2);
+	__T("the ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map0);
+	__T("no new writer finds it", !perf_evlist__find_mmap(list, 0, -1, false));
 	__T("the events before are still readable", drain_map(map0, a.pid) == 1);
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires it", ext.nr_retired == 1 && ext.retired == map0 && nr_mmaps(list) == 2);
+	__T("its poll fd is gone", list->epoll.nr_live == 2);
 	__T("no cpu left on the evsel", !e1->nr_fds && perf_cpu_map__nr(perf_evsel__cpus(e1)) == 0);
 
 	__T("add the cpu back", !perf_evlist__add_cpu(list, 0));
@@ -1376,11 +1383,11 @@ static int test_cpus_and_thread_exit(int id)
 	child_poke(&a);
 
 	__T("delete the cpu", !perf_evlist__del_cpu(list, 1, &reap));
-	__T("its ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map1 &&
-	    reap.maps[0].retired);
-	__T("the thread keeps a hup fd on cpu 0", th->hup_domain && th->hup_domain->map->cpu == 0);
+	__T("its ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map1);
 	__T("the event on cpu 1 is readable", drain_map(map1, a.pid) == 1);
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires it", ext.nr_retired == 1 && ext.retired == map1);
+	__T("the thread keeps a hup fd on cpu 0", th->hup_domain && th->hup_domain->map->cpu == 0);
 	__T("the dead domain goes with its fd", nr_list(&th->domain_list) == 1);
 
 	child_stop(&a);
@@ -1426,7 +1433,7 @@ static int test_dynamic_evsels(int id)
 	struct perf_evlist_reap reap;
 	struct perf_mmap *map0, *map1, *map;
 	u64 counts[5], member_id;
-	int i, nr_new;
+	int nr_new, nr_retired;
 
 	__T("start child", !child_start(&a));
 	__T("pin the child to cpu 0", !child_pin(&a, 0));
@@ -1476,21 +1483,19 @@ static int test_dynamic_evsels(int id)
 	__T("delete the member", !perf_evlist__del_evsel(list, member, &reap));
 	__T("the reap names it", reap.type == PERF_EVLIST_REAP__EVSEL && reap.evsel == member &&
 	    reap.complete && reap.nr_maps == 2);
-	for (i = 0; i < reap.nr_maps; i++) {
-		if (reap.maps[i].map == map0)
-			__T("the shared ring buffer is handed over", !reap.maps[i].retired);
-		else
-			__T("its own ring buffer is retired", reap.maps[i].map == map1 &&
-			    reap.maps[i].retired);
-	}
-	__T("cpu 1 is gone from the evlist", !perf_evlist__find_mmap(list, 1, -1, false) &&
-	    nr_mmaps(list) == 1);
+	__T("both ring buffers are handed over", (reap.maps[0] == map0 && reap.maps[1] == map1) ||
+	    (reap.maps[0] == map1 && reap.maps[1] == map0));
+	__T("no new writer finds cpu 1", !perf_evlist__find_mmap(list, 1, -1, false) &&
+	    perf_evlist__find_mmap(list, 0, -1, false) == map0);
 	__T("the event before is still readable", drain_map(map1, a.pid) == 1);
 	__T("not twice", perf_evlist__del_evsel(list, member, &(struct perf_evlist_reap){}) == -EBUSY);
 	__T("pin the child to cpu 0", !child_pin(&a, 0));
 	child_poke(&a);
 	__T("the stopped member writes no more", drain_map(map0, a.pid) == 1);
+	nr_retired = ext.nr_retired;
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires its own ring buffer only", ext.nr_retired == nr_retired + 1 &&
+	    ext.retired == map1 && nr_mmaps(list) == 1);
 	__T("done takes it out", !member->evlist && list->nr_entries == 1 &&
 	    !perf_evlist__id_to_evsel(list, member_id, NULL));
 	__T("its fds stay open", perf_evsel__fd(member, 0, -1) >= 0 && member->opened);
@@ -1510,10 +1515,12 @@ static int test_dynamic_evsels(int id)
 	__T("a thread ring buffer", map && nr_mmaps(list) == 2);
 	child_poke(&a);
 	__T("delete it", !perf_evlist__del_evsel(list, tev, &reap));
-	__T("the thread ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map &&
-	    reap.maps[0].retired && nr_mmaps(list) == 1);
+	__T("the thread ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map);
 	__T("drain the thread ring buffer", drain_map(map, a.pid) == 1);
+	nr_retired = ext.nr_retired;
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires it", ext.nr_retired == nr_retired + 1 && ext.retired == map &&
+	    nr_mmaps(list) == 1);
 	perf_evsel__close(tev);
 	perf_evsel__delete(tev);
 	drain_map(map0, a.pid);
@@ -1521,10 +1528,12 @@ static int test_dynamic_evsels(int id)
 	/* An evsel there since the open goes the same way. */
 	child_poke(&a);
 	__T("delete e1", !perf_evlist__del_evsel(list, e1, &reap));
-	__T("its ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map0 &&
-	    reap.maps[0].retired && nr_mmaps(list) == 0 && list->epoll.nr_live == 0);
+	__T("its ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map0);
 	__T("drain it", drain_map(map0, a.pid) == 1);
+	nr_retired = ext.nr_retired;
 	perf_evlist__reap_done(list, &reap);
+	__T("done retires it", ext.nr_retired == nr_retired + 1 && ext.retired == map0 &&
+	    nr_mmaps(list) == 0 && list->epoll.nr_live == 0);
 	__T("the evlist is empty", list->nr_entries == 0);
 	perf_evsel__close(e1);
 	perf_evsel__delete(e1);

@@ -50,11 +50,18 @@ LIBPERF_API int perf_evlist__set_maps(struct perf_evlist *evlist,
  * @events has EPOLLHUP for the fds bound to a task only, which see EPOLLHUP
  * when it exits; pid=-1 and cgroup fds never do. @del gets the @events the fd
  * was added with: e.g. count the EPOLLHUP fds to learn when every task exited.
+ *
+ * @del serves two purposes, called apart: @fd leaves the poll, with @retired
+ * false; or @map retires, with @fd -1 and @retired true: it lost its last
+ * writer, is gone from the evlist and the loop drops the references it took
+ * on @new_map. A ring buffer retires in perf_evlist__reap_done() or when its
+ * last fds are closed; not in perf_evlist__munmap(), the loop tears its
+ * references down along with the evlist.
  */
 typedef int (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
 				      struct perf_mmap *map, bool new_map);
 typedef void (*perf_evlist_poll_del_t)(void *external, int fd, unsigned events,
-				       struct perf_mmap *map);
+				       struct perf_mmap *map, bool retired);
 LIBPERF_API void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 					    perf_evlist_poll_add_t add,
 					    perf_evlist_poll_del_t del);
@@ -76,8 +83,10 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *  reap - libperf hands over every ring buffer they wrote into, see struct
  *         perf_evlist_reap. Their fds are still open, so the caller can read
  *         the ring buffers to the end and the sample ids still resolve;
- *  done - perf_evlist__reap_done(): libperf drops the ring buffer references
- *         of the reap and releases what is left, e.g. closes the fds.
+ *  done - perf_evlist__reap_done(): the writers leave the ring buffers - a
+ *         ring buffer left without writer retires, see
+ *         perf_evlist_poll__external() - libperf drops the references of the
+ *         reap and releases what is left, e.g. closes the fds.
  *
  * A thread is stopped by perf_evlist__del_thread() and reaped on EPOLLHUP by
  * perf_evlist__hup(), in either order; a cpu is stopped and reaped in one go
@@ -156,12 +165,15 @@ enum perf_evlist_reap_type {
 /*
  * The result of the reap step. @maps holds every ring buffer the removed
  * writers wrote into, each with a reference: the caller reads them to the
- * end, so that no event is left behind. @retired marks the ones left without
- * any writer: they are already gone from the evlist and the caller drops its
- * own references, e.g. the order heap. @complete: the removal is complete
- * once perf_evlist__reap_done() returns - always for a cpu and an evsel, for
- * a thread when perf_evlist__del_thread() came before the EPOLLHUP; the
- * caller may drop its own state of @tid, @cpu or @evsel.
+ * end, so that no event is left behind. The writers leave them in
+ * perf_evlist__reap_done(); a ring buffer left without writer retires then,
+ * reported through the poll del callback. With several removals under way,
+ * read every reap before the first perf_evlist__reap_done().
+ *
+ * @complete: the removal is complete once perf_evlist__reap_done() returns -
+ * always for a cpu and an evsel, for a thread when perf_evlist__del_thread()
+ * came before the EPOLLHUP; the caller may drop its own state of @tid, @cpu or
+ * @evsel.
  *
  * Always pass the result to perf_evlist__reap_done(), even a
  * PERF_EVLIST_REAP__NONE one.
@@ -173,10 +185,7 @@ struct perf_evlist_reap {
 	struct perf_evsel *evsel;	/* PERF_EVLIST_REAP__EVSEL, NULL otherwise */
 	bool complete;
 	int nr_maps;
-	struct perf_evlist_reap_map {
-		struct perf_mmap *map;
-		bool retired;
-	} *maps;
+	struct perf_mmap **maps;
 };
 /* EPOLLHUP on @fd: reap its exited thread. PERF_EVLIST_REAP__NONE if @fd
  * belongs to no exiting thread, e.g. a second EPOLLHUP. */
