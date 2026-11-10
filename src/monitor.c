@@ -2214,9 +2214,10 @@ static void prof_dev_hup(struct prof_dev *dev, int fd)
     perf_evlist__reap_done(dev->evlist, &reap);
 
     /*
-     * Nothing left to poll: every task exited. With --ptrace the workload's
-     * first thread can exit while later threads are still attached; those
-     * keep the device via ptrace_list, the last unlink's unuse() closes it.
+     * No fd left that keeps the device alive: every task exited. With
+     * --ptrace the workload's first thread can exit while later threads are
+     * still attached; those keep the device via ptrace_list, the last
+     * unlink's unuse() closes it.
      */
     if (dev->nr_pollfd == 0 && !dev->inclose && dev->state != PROF_DEV_STATE_INACTIVE &&
         list_empty(&dev->ptrace_list)) {
@@ -2253,6 +2254,18 @@ static void perf_event_handle(int fd, unsigned int revents, void *ptr)
 }
 
 /*
+ * Whether @fd keeps the device alive, see prof_dev_hup(). Attached to tasks
+ * (-p, -t, a workload), only the fds that see EPOLLHUP count: libperf marks
+ * them in @events, the pid=-1 ones never exit. Otherwise every fd counts.
+ */
+static bool prof_dev_pollfd_counts(struct prof_dev *dev, unsigned events)
+{
+    bool tasks = perf_thread_map__pid(dev->threads, 0) != -1 && !dev->env->cgroups;
+
+    return !tasks || (events & EPOLLHUP);
+}
+
+/*
  * libperf registers its poll fds from perf_evlist__mmap() on. Events that
  * arrive before the device is active are left in the ring buffers, see
  * perf_event_handle().
@@ -2268,7 +2281,8 @@ static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap 
         main_epoll_del(fd);
         return -ENOMEM;
     }
-    dev->nr_pollfd++;
+    if (prof_dev_pollfd_counts(dev, events))
+        dev->nr_pollfd++;
     return 0;
 }
 
@@ -2276,7 +2290,8 @@ static void __poll_del(void *external, int fd, unsigned events, struct perf_mmap
 {
     struct prof_dev *dev = external;
 
-    if (main_epoll_del(fd) == 0 && dev->nr_pollfd > 0)
+    if (main_epoll_del(fd) == 0 && prof_dev_pollfd_counts(dev, events) &&
+        dev->nr_pollfd > 0)
         dev->nr_pollfd--;
 }
 

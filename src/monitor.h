@@ -402,7 +402,7 @@ struct prof_dev {
     enum prof_dev_state state; // It can be set off and active again by calling prof_dev_enable.
     bool inflush, inclose;
     int pages;
-    int nr_pollfd;
+    int nr_pollfd; // poll fds keeping the device alive, see prof_dev_pollfd_counts()
     bool ftrace_filter;
     bool clone; // prof_dev is cloned
     bool silent; // Silent device, no output.
