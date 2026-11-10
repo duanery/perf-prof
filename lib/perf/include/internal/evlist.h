@@ -41,14 +41,20 @@ struct perf_evlist_thread;
  * domain: marks it dead and hands the reference over to the struct
  * perf_evlist_reap; the fds stay open until perf_evlist__del_thread() or the
  * evsel closes them, and the domain is freed with the last one.
+ *
+ * @fds holds the live fds first, [0, @nr_live), then the ones stopped by a
+ * removal in progress (perf_evsel_fd::stopped), [@nr_live, @nr_fds). A domain
+ * with no live fd goes to the tail of the lists of its ring buffer and of its
+ * thread, see perf_mmap_domain__order().
  */
 struct perf_mmap_domain {
 	struct perf_mmap	*map;          /* NULL once dead */
 	pid_t			 tid;          /* -1: cpu domain */
 	bool			 dead;
 	int			 nr_fds;
+	int			 nr_live;
 	int			 nr_alloc;
-	int			*fds;
+	struct perf_evsel_fd	**fds;
 	int			 poll_fd;      /* registered fd, -1 if none */
 	unsigned		 poll_events;
 	struct perf_evlist_thread *thread;     /* task domain only */
