@@ -2169,7 +2169,7 @@ static void prof_dev_thread_done(struct prof_dev *dev, pid_t tid)
  * libperf closes their fds, so that the sample ids still resolve; the ones
  * left without a writer retire in perf_evlist__reap_done(), see __poll_del().
  */
-static void prof_dev_reap(struct prof_dev *dev, struct perf_evlist_reap *reap)
+static void prof_dev_reap(struct prof_dev *dev, const struct perf_evlist_reap *reap)
 {
     int i;
 
@@ -2197,7 +2197,7 @@ int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
  */
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 {
-    struct perf_evlist_reap reap;
+    const struct perf_evlist_reap *reap;
     int ret;
 
     if (dev->inclose)
@@ -2205,18 +2205,18 @@ int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
     ret = perf_evlist__del_thread(dev->evlist, pid, &reap);
     if (ret < 0)
         return ret;
-    prof_dev_reap(dev, &reap);
+    prof_dev_reap(dev, reap);
     return 0;
 }
 
 /* EPOLLHUP: the task of @fd exited. */
 static void prof_dev_hup(struct prof_dev *dev, int fd)
 {
-    struct perf_evlist_reap reap;
+    const struct perf_evlist_reap *reap;
 
     if (perf_evlist__hup(dev->evlist, fd, &reap) < 0)
         return;
-    prof_dev_reap(dev, &reap);
+    prof_dev_reap(dev, reap);
 
     /*
      * No fd left that keeps the device alive: every task exited. With

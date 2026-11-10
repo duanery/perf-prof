@@ -81,7 +81,7 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *  stop - the writers produce no more events: DISABLE, or the kernel stopped
  *         them (an exited task);
  *  reap - libperf hands over every ring buffer they wrote into, see struct
- *         perf_evlist_reap. Their fds are still open, so the caller can read
+ *         perf_evlist_reap, read only. Their fds are still open, so the caller can read
  *         the ring buffers to the end and the sample ids still resolve;
  *  done - perf_evlist__reap_done(): the writers leave the ring buffers - a
  *         ring buffer left without writer retires, see
@@ -115,7 +115,7 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  */
 LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
 LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
-					struct perf_evlist_reap *reap);
+					const struct perf_evlist_reap **reap);
 
 /*
  * Add/remove a cpu on every evsel that follows the evlist cpu map. Evsels
@@ -130,7 +130,7 @@ LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
  */
 LIBPERF_API int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu);
 LIBPERF_API int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,
-				     struct perf_evlist_reap *reap);
+				     const struct perf_evlist_reap **reap);
 
 /*
  * Add/remove an evsel on an open evlist, as a whole. Adding goes:
@@ -159,7 +159,7 @@ LIBPERF_API int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,
  */
 LIBPERF_API int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel);
 LIBPERF_API int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
-				       struct perf_evlist_reap *reap);
+				       const struct perf_evlist_reap **reap);
 
 enum perf_evlist_reap_type {
 	PERF_EVLIST_REAP__NONE,		/* nothing reaped */
@@ -182,8 +182,11 @@ enum perf_evlist_reap_type {
  * perf_evlist__del_thread(), not from EPOLLHUP; the caller may drop its own
  * state of @tid, @cpu or @evsel.
  *
- * Always pass the result to perf_evlist__reap_done(), even a
- * PERF_EVLIST_REAP__NONE one.
+ * libperf allocates the reap and hands it out through a const pointer, the
+ * caller cannot change it: a write is a compile error. perf_evlist__del_*()
+ * and perf_evlist__hup() always set it, PERF_EVLIST_REAP__NONE on error.
+ * Always pass it to perf_evlist__reap_done(), even a PERF_EVLIST_REAP__NONE
+ * one; it is freed there and must not be used afterwards.
  */
 struct perf_evlist_reap {
 	enum perf_evlist_reap_type type;
@@ -192,14 +195,14 @@ struct perf_evlist_reap {
 	struct perf_evsel *evsel;	/* PERF_EVLIST_REAP__EVSEL, NULL otherwise */
 	bool complete;
 	int nr_maps;
-	struct perf_mmap **maps;
+	struct perf_mmap *const *maps;
 };
 /* EPOLLHUP on @fd: reap its exited thread. PERF_EVLIST_REAP__NONE if @fd
  * belongs to no exiting thread, e.g. a second EPOLLHUP. */
 LIBPERF_API int perf_evlist__hup(struct perf_evlist *evlist, int fd,
-				 struct perf_evlist_reap *reap);
+				 const struct perf_evlist_reap **reap);
 LIBPERF_API void perf_evlist__reap_done(struct perf_evlist *evlist,
-					struct perf_evlist_reap *reap);
+					const struct perf_evlist_reap *reap);
 
 /* Look up the ring buffer of a binding; see perf_mmap__cpu()/perf_mmap__tid(). */
 LIBPERF_API struct perf_mmap *perf_evlist__find_mmap(struct perf_evlist *evlist,
