@@ -350,6 +350,14 @@ EPOLLHUP 会被误当作线程退出。所以注册只发生在 `perf_evlist__mm
   得知线程退出。优先选已承担数据角色的域，使一个 fd 兼任两者。
 
 一个域承担任一角色就注册一个 fd，只有承担数据角色时带 EPOLLIN；overwrite ring 不带 EPOLLIN。
+只有 task 域的注册带 EPOLLHUP。EPOLLHUP 无法屏蔽（K8），写进事件掩码不改变内核行为，它只是标记：
+告诉外部 loop 这个 fd 会在线程退出时 HUP，cpu 域（pid=-1、cgroup）的 fd 永远不会（6.3）。
+
+system wide 的 evsel 也参与角色选择，它的 fd 落在 cpu 域，可以承担数据角色。只有 system wide
+evsel 写入的 ring 因此也会被 poll。上游 perf 最初不 poll system wide 的 fd，原因是它们永不 POLLHUP，
+会妨碍"全部任务退出"的判断：f90d194a867a ("perf evlist: Do not poll events that use the
+system_wide flag"), in v3.19；后来改为 poll，但不计入存活数：6cc447964555 ("libperf evlist: Fix
+polling of system-wide events"), in v6.0。这里由 EPOLLHUP 标记让外部 loop 做同样的区分。
 
 HUP 角色不能省：(event,c,-1) 与 (event,c,t) 共存时数据角色在 cpu 域上，task 域的 fd 若不单独注册，
 线程 t 退出的 EPOLLHUP 永远收不到。
@@ -359,7 +367,7 @@ HUP 角色不能省：(event,c,-1) 与 (event,c,t) 共存时数据角色在 cpu 
 | 只有 (event,-1,t) | 每个线程 1 个，兼任 (-1,t) 的数据角色和 t 的 HUP 角色 |
 | 只有 (event,c,-1) | 每个 cpu ring 1 个 |
 | 只有 (event,c,t)，N 个线程 | 每个 cpu ring 1 个数据 fd + 每个线程 1 个 HUP fd（尽量与数据 fd 重合） |
-| (event,c,-1) 与 (event,c,t) 共存 | 每个 cpu ring 1 个 cpu 域数据 fd + 每个线程 1 个只等 EPOLLHUP 的 fd |
+| (event,c,-1) 或 system wide 与 (event,c,t) 共存 | 每个 cpu ring 1 个 cpu 域数据 fd（不带 EPOLLHUP）+ 每个线程 1 个只等 EPOLLHUP 的 fd |
 | 再加 (event,-1,t) | 线程 t 的 HUP 角色优先落在 (-1,t) 上，与该 thread ring 的数据 fd 共用 |
 
 ### 6.2 角色的维护
@@ -378,16 +386,19 @@ HUP 角色不能省：(event,c,-1) 与 (event,c,t) 共存时数据角色在 cpu 
   不加——否则每 detach 一个 fd 就把角色交给下一个 fd，与 evsel 的添加、拆除顺序无关。
 - 注销必须发生在 fd 关闭之前：VMA 可能撑住 file，fd 关了 epitem 仍在（K9）。
 
-### 6.3 注册数与全部线程退出
+### 6.3 EPOLLHUP 注册数与全部线程退出
 
-每个存活线程至少有一个注册的 fd（HUP 角色），线程 HUP 时它的所有域死亡，HUP 角色的 fd 随之注销，
-所以**每有一个线程退出，注册的 fd 至少少一个**（数据角色可能转移到另一个线程已注册的 fd 上，注册数
-不会因此增加）。
+每个存活线程至少有一个带 EPOLLHUP 的注册（HUP 角色），线程 HUP 时它的所有域死亡，这些注册随之
+注销；数据角色可能转移到另一个线程已注册的 fd 上，也不会多出带 EPOLLHUP 的注册。所以**最后一个
+线程退出后，带 EPOLLHUP 的注册数归 0**，与有没有 cpu 域（(event,c,-1)、system wide）无关：cpu 域的
+注册不带 EPOLLHUP。
 
-- 没有 (event,c,-1) 时，所有域都是 task 域：最后一个线程退出后所有 ring 都失去 writer，注册数归 0。
-  外部只看注册数（perf-prof 的 `dev->nr_pollfd`，由 add/del 回调维护）就能判断被跟踪的线程是否全部
-  退出，**不需要 ptrace**。
-- 有 (event,c,-1) 时，cpu 域永不 HUP，注册数不会归 0，只能由 ptrace 判断。
+外部 loop 从 add 回调的 `events` 得知一个 fd 是否带 EPOLLHUP，del 回调收到同一个 `events`，据此计数
+就能判断被跟踪的线程是否全部退出，**不需要 ptrace**。perf-prof 的 `dev->nr_pollfd` 按跟踪方式计数
+（`prof_dev_pollfd_counts()`）：
+
+- 跟踪任务（`-p`、`-t`、workload）：只计带 EPOLLHUP 的 fd，任务全部退出时归 0；
+- 跟踪 cpu 或 cgroup：所有 fd 都计，没有会退出的任务，注册数不会归 0。
 
 perf-prof 据此主动关闭 prof_dev（8.1）：
 
@@ -401,7 +412,8 @@ perf-prof 据此主动关闭 prof_dev（8.1）：
 ```c
 typedef int  (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
 				       struct perf_mmap *map, bool new_map);
-typedef void (*perf_evlist_poll_del_t)(void *external, int fd, struct perf_mmap *map);
+typedef void (*perf_evlist_poll_del_t)(void *external, int fd, unsigned events,
+				       struct perf_mmap *map);
 
 void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 				perf_evlist_poll_add_t add, perf_evlist_poll_del_t del);
@@ -410,6 +422,8 @@ void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 - 注册哪些 fd 完全由 libperf 决定，从 `perf_evlist__mmap()` 起直接调用 add/del；外部 loop 不需要
   遍历 fd。
 - `new_map` 在某个 ring 第一次被报告时为 true，perf-prof 在此把 ring 加入 order 堆。
+- `events` 只在 task 域的 fd 上带 EPOLLHUP；del 收到该 fd 注册时的 `events`，外部 loop 可以据此
+  维护 EPOLLHUP fd 的计数（6.3）。
 - 外部 loop 收到 EPOLLHUP 时调用 `perf_evlist__hup()`。
 - 没有设置 external 时 evlist 用自己的 epoll，`perf_evlist__poll_mmap()` 内部处理 HUP。
 
@@ -654,8 +668,9 @@ prof_dev_hup(dev, fd):
 
 __poll_add(ext, fd, events, map, new_map):
     main_epoll_add(); new_map 且启用 order: order_mmap_add(map)
-__poll_del(ext, fd, map):
-    main_epoll_del()
+    prof_dev_pollfd_counts(events): nr_pollfd++                     // 6.3
+__poll_del(ext, fd, events, map):
+    main_epoll_del(); prof_dev_pollfd_counts(events): nr_pollfd--
 ```
 
 读 ring 不取引用的前提：ring 只会在 HUP 处理或 `perf_evlist__munmap()` 时释放，二者都不会在读
@@ -739,5 +754,5 @@ perf 的 trace event 过滤器只能设置一次（K12）。若以后要为绑 c
 | 登记、线程记录、epoll、HUP 域、writer fd、收割、线程退出、cpu 增删、evsel 增删、mmap/munmap/poll | `lib/perf/evlist.c` 中 "Ring buffer management" 一节，按此顺序分组 |
 | evsel 的 cpu / 线程记录与单个 fd 的增删，显式 leader | `lib/perf/evsel.c`：`perf_evsel__add/del_thread()`、`perf_evsel__add/del_cpu()`、`perf_evsel__open_new()`、`perf_evsel__set_leader()` |
 | 对外接口 | `lib/perf/include/perf/evlist.h` |
-| perf-prof 侧 | `src/monitor.c`：`prof_dev_hup()`、`prof_dev_thread_done()`、`prof_dev_add/del_thread()`、`__poll_add/del()` |
+| perf-prof 侧 | `src/monitor.c`：`prof_dev_hup()`、`prof_dev_thread_done()`、`prof_dev_add/del_thread()`、`__poll_add/del()`、`prof_dev_pollfd_counts()` |
 | 测试 | `lib/perf/tests/test-bind.c`；`tests/test_dynamic_bindings.py` |
