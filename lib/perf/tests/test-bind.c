@@ -525,6 +525,7 @@ struct ext_poll {
 	int nr_hup;	/* fds added with EPOLLHUP, those that see it */
 	int nr_retired;
 	struct perf_mmap *retired;	/* the last one, compared only */
+	int nr_del_retired;	/* nr_del at the last one */
 	int nr_bad;	/* a del neither of an fd nor of a retired ring buffer */
 };
 
@@ -548,6 +549,7 @@ static void ext_del(void *external, int fd, unsigned events, struct perf_mmap *m
 	if (retired) {
 		ext->nr_retired++;
 		ext->retired = map;
+		ext->nr_del_retired = ext->nr_del;
 		ext->nr_bad += fd != -1;
 		return;
 	}
@@ -786,6 +788,7 @@ static int test_system_wide_poll(int id)
 	perf_evlist__munmap(list);
 	__T("munmap unregisters every fd", ext.nr_add == nr_add && ext.nr_del == ext.nr_add &&
 	    list->epoll.nr_live == 0 && ext.nr_hup == 0);
+	__T("and retires nothing", !ext.nr_retired);
 
 	perf_evlist__delete(list);
 	perf_cpu_map__put(all);
@@ -1345,6 +1348,74 @@ static int test_dynamic_cpus(int id)
 }
 
 /*
+ * A ring buffer retires in perf_evlist__reap_done(), not in the reap: its
+ * writers stay registered until then. Done unregisters their fds, then
+ * reports the retirement apart, with fd -1.
+ */
+static int test_retire_on_done(int id)
+{
+	struct child a = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct ext_poll ext = { .epfd = epoll_create1(EPOLL_CLOEXEC) };
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *tasks = perf_evsel__new(&attr), *cpuwide = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy(), *any = perf_thread_map__new_dummy();
+	struct perf_evlist_reap reap;
+	struct perf_mmap *map;
+	int nr_del;
+
+	__T("start child", !child_start(&a));
+	__T("pin the child to cpu 0", !child_pin(&a, 0));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evsel__set_own_threads(cpuwide, any);
+	perf_evlist__add(list, tasks);
+	perf_evlist__add(list, cpuwide);
+	perf_evlist__set_maps(list, cpus, threads);
+	perf_evlist_poll__external(list, &ext, ext_add, ext_del);
+	__T("open evlist", !perf_evlist__open(list));
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+	map = perf_evlist__find_mmap(list, 0, -1, false);
+	__T("a data fd and a hup fd on the ring buffer", map && list->epoll.nr_live == 2 &&
+	    map->poll_domain == map->cpu_domain);
+
+	child_poke(&a);
+	__T("delete the cpu", !perf_evlist__del_cpu(list, 0, &reap));
+	__T("its ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map);
+	__T("still registered, nothing retired", list->epoll.nr_live == 2 && !ext.nr_retired &&
+	    nr_mmaps(list) == 1);
+	__T("no new writer finds it", !perf_evlist__find_mmap(list, 0, -1, false));
+	__T("read it to the end", drain_map(map, a.pid) == 2);
+	nr_del = ext.nr_del;
+	perf_evlist__reap_done(list, &reap);
+	__T("done unregisters both fds", ext.nr_del == nr_del + 2 && list->epoll.nr_live == 0);
+	__T("then retires the ring buffer", ext.nr_retired == 1 && ext.retired == map &&
+	    ext.nr_del_retired == nr_del + 2);
+	__T("each del does one thing", !ext.nr_bad);
+	__T("it is gone from the evlist", nr_mmaps(list) == 0);
+
+	/* munmap retires nothing. */
+	__T("add the cpu back", !perf_evlist__add_cpu(list, 0));
+	__T("a new ring buffer", nr_mmaps(list) == 1 && list->epoll.nr_live == 2);
+	perf_evlist__munmap(list);
+	__T("munmap unregisters without retiring", list->epoll.nr_live == 0 &&
+	    ext.nr_del == ext.nr_add && ext.nr_retired == 1);
+
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpus);
+	perf_thread_map__put(threads);
+	perf_thread_map__put(any);
+	close(ext.epfd);
+	child_stop(&a);
+	return 0;
+}
+
+/*
  * A cpu removed under a thread: its task domain on the retired ring buffer
  * dies, the thread moves its hup fd to another cpu and still sees its
  * EPOLLHUP. A thread exited but not yet deleted gets no fd on a new cpu.
@@ -1583,6 +1654,7 @@ int test_bind(int argc, char **argv)
 	test_dynamic_group(id);
 	test_dynamic_cpus(id);
 	test_cpus_and_thread_exit(id);
+	test_retire_on_done(id);
 	test_dynamic_evsels(id);
 
 	__T_END;
