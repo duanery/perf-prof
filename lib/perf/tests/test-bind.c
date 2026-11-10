@@ -155,6 +155,22 @@ static int drain(struct perf_evlist *evlist, pid_t tid)
 	return nr_samples;
 }
 
+/*
+ * Delete @pid and finish its reap at once: the number of ring buffers it
+ * reaped, -1 if the removal failed or is not complete.
+ */
+static int del_thread(struct perf_evlist *evlist, pid_t pid)
+{
+	struct perf_evlist_reap reap;
+	int nr;
+
+	if (perf_evlist__del_thread(evlist, pid, &reap) < 0)
+		return -1;
+	nr = reap.type == PERF_EVLIST_REAP__THREAD && reap.complete ? reap.nr_maps : -1;
+	perf_evlist__reap_done(evlist, &reap);
+	return nr;
+}
+
 /* Drain @map, counting the samples of @pid; needs PERF_SAMPLE_TID first. */
 static int drain_map(struct perf_mmap *map, pid_t pid)
 {
@@ -328,11 +344,12 @@ static int test_dynamic_threads(int id)
 		.read_format	= PERF_FORMAT_ID,
 	};
 	struct child a = {}, b = {}, c = {};
+	struct perf_evlist_reap reap, again;
 	struct perf_thread_map *threads;
 	struct perf_cpu_map *cpus;
 	struct perf_evlist *evlist;
 	struct perf_evsel *evsel;
-	struct perf_mmap *map;
+	struct perf_mmap *map, *map_b;
 	int err, i;
 
 	__T("failed to start child a", !child_start(&a));
@@ -383,27 +400,33 @@ static int test_dynamic_threads(int id)
 
 	__T("no sample from thread a", drain(evlist, a.pid) == 1);
 	__T("no sample from thread b", drain(evlist, b.pid) == 1);
+	map_b = perf_evlist__find_mmap(evlist, -1, b.pid, false);
 
-	/* Deleting a thread that still runs only stops it: no EPOLLHUP yet. */
-	err = perf_evlist__del_thread(evlist, b.pid);
-	__T("deleting a running thread should wait for its EPOLLHUP", err == 0);
-	__T("the ring buffer of thread b should not be found any more",
-	    !perf_evlist__find_mmap(evlist, -1, b.pid, false));
-	__T("the ring buffer of thread b should still be readable", nr_mmaps(evlist) == 2);
-	__T("thread b keeps its fds until they are closed",
-	    perf_evsel__has_thread(evsel, b.pid));
+	/* Deleting a thread that still runs stops it and reaps it, no EPOLLHUP. */
 	child_poke(&b);
 	usleep(50000);
-	__T("a deleted thread should not be sampled", drain(evlist, b.pid) == 0);
-
-	/* The exit of thread b completes the delete. */
-	child_stop(&b);
-	for (i = 0; i < 10 && nr_mmaps(evlist) == 2; i++)
-		perf_evlist__poll(evlist, 100);
-	__T("EPOLLHUP should release the ring buffer of thread b", nr_mmaps(evlist) == 1);
+	err = perf_evlist__del_thread(evlist, b.pid, &reap);
+	__T("deleting a running thread reaps its ring buffer", !err &&
+	    reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == b.pid &&
+	    reap.complete && reap.nr_maps == 1 && reap.maps[0] == map_b);
+	__T("thread b keeps its fds until done", perf_evsel__has_thread(evsel, b.pid));
+	child_poke(&b);
+	usleep(50000);
+	__T("the events before the delete are readable, none after",
+	    drain(evlist, b.pid) == 1);
+	__T("a second delete reaps nothing",
+	    !perf_evlist__del_thread(evlist, b.pid, &again) &&
+	    again.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(evlist, &again);
+	perf_evlist__reap_done(evlist, &reap);
+	__T("done releases the ring buffer of thread b", nr_mmaps(evlist) == 1 &&
+	    !perf_evlist__find_mmap(evlist, -1, b.pid, false));
 	__T("thread b should be gone from the evsel",
 	    !perf_evsel__has_thread(evsel, b.pid) &&
 	    perf_thread_map__idx(perf_evsel__threads(evsel), b.pid) < 0);
+	child_stop(&b);
+	perf_evlist__poll(evlist, 100);
+	__T("the exit of a deleted thread is not seen", nr_mmaps(evlist) == 1);
 
 	/* The remaining thread keeps being sampled. */
 	child_poke(&a);
@@ -422,12 +445,11 @@ static int test_dynamic_threads(int id)
 	__T("no sample from the added thread", drain(evlist, c.pid) == 1);
 
 	/*
-	 * Adding a tid whose delete is still pending replaces the old thread
-	 * outright, its sample ids included.
+	 * A deleted tid can be added again once done closed it, its sample ids
+	 * go with it.
 	 */
 	for (i = 0; i < 32; i++) {
-		err = perf_evlist__del_thread(evlist, c.pid);
-		__T("failed to delete thread c in reuse loop", !err);
+		__T("failed to delete thread c in reuse loop", del_thread(evlist, c.pid) == 1);
 		err = perf_evlist__add_thread(evlist, c.pid);
 		__T("failed to re-add thread c in reuse loop", !err);
 		__T("only the ids of a and c remain", nr_ids(evlist) == 2);
@@ -660,7 +682,7 @@ static int test_poll_domains(int id)
 	__T("ring buffers still have a writer", !ext.nr_retired);
 	__T("the other thread's fds take over", list->epoll.nr_live == ncpus);
 	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
-	__T("delete after EPOLLHUP closes the thread", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("delete after EPOLLHUP closes the thread", del_thread(list, a.pid) == 0);
 	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, a.pid));
 
 	/*
@@ -683,7 +705,7 @@ static int test_poll_domains(int id)
 	child_stop(&c);
 	__T("EPOLLHUP of the third thread", poll_hup(list, &ext, &reap) >= 0 && reap.tid == c.pid);
 	perf_evlist__reap_done(list, &reap);
-	__T("the third thread is closed", perf_evlist__del_thread(list, c.pid) == 1);
+	__T("the third thread is closed", del_thread(list, c.pid) == 0);
 
 	/* A pid=-1 writer takes the data role; the thread keeps one hup fd. */
 	cpuwide = perf_evsel__new(&attr);
@@ -705,7 +727,7 @@ static int test_poll_domains(int id)
 	perf_evlist__reap_done(list, &reap);
 	__T("the pid=-1 writers keep the ring buffers", !ext.nr_retired);
 	__T("only the pid=-1 data fds are left", list->epoll.nr_live == ncpus);
-	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, b.pid) == 1);
+	__T("delete after EPOLLHUP completes", del_thread(list, b.pid) == 0);
 	__T("the closed thread is gone", !perf_evsel__has_thread(tasks, b.pid));
 
 	/* The last writer takes the ring buffers along. */
@@ -773,7 +795,7 @@ static int test_system_wide_poll(int id)
 	child_stop(&a);
 	__T("EPOLLHUP of the thread", poll_hup(list, &ext, &reap) >= 0 && reap.tid == a.pid);
 	perf_evlist__reap_done(list, &reap);
-	__T("the thread is closed", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("the thread is closed", del_thread(list, a.pid) == 0);
 	__T("no EPOLLHUP fd left", ext.nr_hup == 0);
 	__T("the system wide data fds are left", list->epoll.nr_live == ncpus);
 	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
@@ -864,7 +886,7 @@ static int test_thread_exit(int id)
 	struct perf_evsel *evsel = perf_evsel__new(&attr);
 	struct perf_cpu_map *cpus = perf_cpu_map__dummy_new();
 	struct perf_thread_map *threads = perf_thread_map__new_dummy();
-	struct perf_evlist_reap reap;
+	struct perf_evlist_reap reap, hup;
 	struct perf_mmap *map;
 	int fd;
 
@@ -882,40 +904,45 @@ static int test_thread_exit(int id)
 	__T("add thread c", !perf_evlist__add_thread(list, c.pid));
 	__T("one ring buffer and poll fd per thread", nr_mmaps(list) == 3 && list->epoll.nr_live == 3);
 
-	/* ptrace first: the delete waits, the EPOLLHUP completes it. */
+	/* ptrace first: the delete reaps, the EPOLLHUP after it reaps nothing. */
 	child_poke(&b);
 	map = perf_evlist__find_mmap(list, -1, b.pid, false);
 	child_stop(&b);
-	__T("delete before EPOLLHUP waits", perf_evlist__del_thread(list, b.pid) == 0);
-	__T("a second delete is a no-op", perf_evlist__del_thread(list, b.pid) == 0);
-	fd = poll_hup(list, &ext, &reap);
-	__T("EPOLLHUP after delete", fd >= 0);
-	__T("EPOLLHUP completes the delete", reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == b.pid && reap.complete);
+	__T("delete before EPOLLHUP reaps", !perf_evlist__del_thread(list, b.pid, &reap) &&
+	    reap.type == PERF_EVLIST_REAP__THREAD && reap.tid == b.pid && reap.complete);
 	__T("the thread ring buffer is handed over", reap.nr_maps == 1 && reap.maps[0] == map);
-	__T("it stays until done", nr_mmaps(list) == 3 && !ext.nr_retired);
+	__T("a second delete reaps nothing", !perf_evlist__del_thread(list, b.pid, &hup) &&
+	    hup.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, &hup);
+	fd = poll_hup(list, &ext, &hup);
+	__T("EPOLLHUP after delete", fd >= 0);
+	__T("it reaps nothing", hup.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, &hup);
+	__T("the ring buffer stays until done", nr_mmaps(list) == 3 && !ext.nr_retired);
 	__T("events before the exit are still readable", perf_mmap__read_init(map) == 0 &&
 	    perf_mmap__read_event(map, &(bool){false}) != NULL);
 	perf_mmap__read_done(map);
-	__T("fds stay open until the EPOLLHUP is done", perf_evsel__has_thread(evsel, b.pid));
+	__T("fds stay open until done", perf_evsel__has_thread(evsel, b.pid));
 	perf_evlist__reap_done(list, &reap);
 	__T("done retires it", ext.nr_retired == 1 && ext.retired == map && nr_mmaps(list) == 2);
 	__T("done closes the thread", !perf_evsel__has_thread(evsel, b.pid));
-	__T("a second EPOLLHUP is ignored", !perf_evlist__hup(list, fd, &reap) && reap.type == PERF_EVLIST_REAP__NONE);
-	perf_evlist__reap_done(list, &reap);
+	__T("an EPOLLHUP after done is ignored", !perf_evlist__hup(list, fd, &hup) &&
+	    hup.type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, &hup);
 
-	/* EPOLLHUP first: the delete completes at once. */
+	/* EPOLLHUP first: it reaps, the delete closes at once. */
 	child_stop(&c);
 	__T("EPOLLHUP before delete", poll_hup(list, &ext, &reap) >= 0);
 	__T("EPOLLHUP alone does not complete", reap.tid == c.pid && !reap.complete);
 	perf_evlist__reap_done(list, &reap);
 	__T("fds stay open until the delete", perf_evsel__has_thread(evsel, c.pid));
-	__T("delete after EPOLLHUP completes", perf_evlist__del_thread(list, c.pid) == 1);
+	__T("delete after EPOLLHUP completes", del_thread(list, c.pid) == 0);
 	__T("delete closes the thread", !perf_evsel__has_thread(evsel, c.pid));
 	__T("only the first thread is left", nr_mmaps(list) == 1 && list->epoll.nr_live == 1);
 	__T("every registered fd was unregistered", ext.nr_add - ext.nr_del == 1);
 
 	/* A thread without a ring buffer has nothing to wait for. */
-	__T("unknown thread is gone at once", perf_evlist__del_thread(list, c.pid) == 1);
+	__T("unknown thread is gone at once", del_thread(list, c.pid) == 0);
 
 	perf_evlist__delete(list);
 	__T("munmap unregisters the rest", ext.nr_add == ext.nr_del);
@@ -1177,7 +1204,7 @@ static int test_cpu_and_thread_mmaps(int id)
 	__T("two distinct binding rings", nr_mmaps(list) == 2);
 	__T("add default thread in mixed list", !perf_evlist__add_thread(list, b.pid));
 	__T("BPF retains any-thread binding", perf_thread_map__pid(bpf_event->threads, 0) == -1);
-	__T("delete default thread", !perf_evlist__del_thread(list, b.pid));
+	__T("delete default thread", del_thread(list, b.pid) >= 1);
 	__T("BPF ring survives deletion", perf_evlist__find_mmap(list, 0, -1, false));
 	perf_evlist__delete(list);
 	perf_cpu_map__put(dummy);
@@ -1218,7 +1245,7 @@ static int test_dynamic_group(int id)
 	perf_evlist__disable(list);
 	child_poke(&b);
 	__T("group disable stops both members", drain(list, b.pid) == 0);
-	__T("delete disabled group thread", !perf_evlist__del_thread(list, b.pid));
+	__T("delete disabled group thread", del_thread(list, b.pid) >= 1);
 	__T("add disabled group thread", !perf_evlist__add_thread(list, b.pid));
 	child_poke(&b);
 	__T("new group stays disabled", drain(list, b.pid) == 0);
@@ -1471,7 +1498,7 @@ static int test_cpus_and_thread_exit(int id)
 	__T("add a cpu after the exit", !perf_evlist__add_cpu(list, 1));
 	__T("the exited thread gets no fd there", perf_evsel__fd(evsel, 1, a.pid) < 0 &&
 	    perf_evsel__has_cpu(evsel, 1));
-	__T("delete the thread", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("delete the thread", del_thread(list, a.pid) == 0);
 	__T("nothing left", !evsel->nr_fds && nr_mmaps(list) == 0);
 
 	perf_evlist__delete(list);
@@ -1641,7 +1668,7 @@ static int test_stopped_hup(int id)
 	perf_evlist__reap_done(list, &reap);
 	__T("done of the cpu closes them", perf_evsel__fd(tasks, 0, a.pid) < 0 &&
 	    perf_evsel__fd(tasks, 1, a.pid) >= 0 && ext.nr_retired == 1);
-	__T("delete the thread", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("delete the thread", del_thread(list, a.pid) == 0);
 	__T("each del does one thing", !ext.nr_bad);
 
 	perf_evlist__delete(list);
@@ -1717,7 +1744,7 @@ static int test_stopped_thread(int id)
 	    hup.nr_maps == 1);
 	__T("the event before is readable", drain_map(hup.maps[0], a.pid) == 1);
 	perf_evlist__reap_done(list, &hup);
-	__T("delete the thread", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("delete the thread", del_thread(list, a.pid) == 0);
 	__T("each del does one thing", !ext.nr_bad);
 
 	perf_evlist__delete(list);
