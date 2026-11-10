@@ -131,7 +131,8 @@ for each evsel in evlist:                  /* 外层：evsel */
 int  perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
 int  perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);
 int  perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
-int  perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid);
+int  perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
+                             struct perf_evlist_reap *reap);
 ```
 
 **写时复制**：如果 `evsel->threads == evlist->threads`（还在共用 evlist 的默认值），
@@ -218,8 +219,9 @@ profiler 的回调统一从 `int instance` 换成 cpu/线程：
 `ptrace.c` 收到 `PTRACE_EVENT_CLONE` / `FORK` / `VFORK` 时，不再 `prof_dev_clone()`，
 而是 `perf_evlist__add_thread(dev->evlist, new_tid)`。
 
-线程退出时：先 `perf_evlist__find_mmap(evlist, -1, tid, overwrite)` 找到 ringbuffer，
-把残留事件处理完，再 `perf_evlist__del_thread()` 让 libperf 销毁它。
+线程退出时：`perf_evlist__del_thread()` 停止线程的 fd 并把它写过的 ringbuffer 交给
+`struct perf_evlist_reap`，把残留事件处理完，再 `perf_evlist__reap_done()` 让 libperf 销毁它
+（EPOLLHUP 先到时由 `perf_evlist__hup()` 收割，见 docs/libperf_ring_lifetime.md 7.2）。
 
 ### 3.3 order 全局排序
 
