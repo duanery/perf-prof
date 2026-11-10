@@ -1328,6 +1328,146 @@ static int test_cpus_and_thread_exit(int id)
 	return 0;
 }
 
+/*
+ * An evsel joins the open evlist as a whole: opened on its own maps as a
+ * member of an evsel already there, filtered, then added. Removing one goes
+ * stop - reap - done, the caller closes it afterwards.
+ */
+static int test_dynamic_evsels(int id)
+{
+	struct child a = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID, .disabled = 1,
+		.wakeup_events = 1,
+	};
+	struct ext_poll ext = { .epfd = epoll_create1(EPOLL_CLOEXEC) };
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *e1 = perf_evsel__new(&attr), *member = perf_evsel__new(&attr);
+	struct perf_evsel *other = perf_evsel__new(&attr), *tev;
+	struct perf_cpu_map *cpu0 = perf_cpu_map__new("0"), *both = perf_cpu_map__new("0-1");
+	struct perf_cpu_map *dummy = perf_cpu_map__dummy_new();
+	struct perf_thread_map *any = perf_thread_map__new_dummy(), *tid = perf_thread_map__new_dummy();
+	struct perf_evlist_reap reap;
+	struct perf_mmap *map0, *map1, *map;
+	u64 counts[5], member_id;
+	int i, nr_new;
+
+	__T("start child", !child_start(&a));
+	__T("pin the child to cpu 0", !child_pin(&a, 0));
+	perf_evlist__add(list, e1);
+	perf_evlist__set_maps(list, cpu0, any);
+	perf_evlist_poll__external(list, &ext, ext_add, ext_del);
+	__T("open evlist", !perf_evlist__open(list));
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+	map0 = perf_evlist__find_mmap(list, 0, -1, false);
+	__T("one ring buffer", map0 && nr_mmaps(list) == 1);
+
+	/* The leader must be open, and lead. */
+	__T("an unopened leader", perf_evsel__set_leader(member, other) == -EINVAL);
+	__T("lead by e1", !perf_evsel__set_leader(member, e1) && e1->nr_members == 2);
+	__T("open the member on its own cpus", !perf_evsel__open(member, both, any));
+	__T("no leader once open", perf_evsel__set_leader(member, NULL) == -EBUSY);
+	__T("a member leads nobody", perf_evsel__set_leader(other, member) == -EINVAL);
+	__T("it joins e1 on cpu 0", perf_evsel__fd_find(member, 0, -1)->leader ==
+	    perf_evsel__fd_find(e1, 0, -1));
+	__T("and is alone on cpu 1", perf_evsel__is_group_leader(member, 1, -1));
+	__T("filter it", !perf_evsel__apply_filter(member, "option == 0"));
+	child_poke(&a);
+	__T("read the group", !perf_evsel__read(e1, 0, -1, (void *)counts));
+	__T("the member opened disabled", counts[0] == 2 && counts[1] >= 1 && counts[3] == 0);
+	__T("only e1 wrote", drain_map(map0, a.pid) == 1);
+
+	__T("an unopened evsel cannot join", perf_evlist__add_evsel(list, other) == -EINVAL);
+	nr_new = ext.nr_new;
+	__T("add the member", !perf_evlist__add_evsel(list, member));
+	__T("not twice", perf_evlist__add_evsel(list, member) == -EBUSY);
+	map1 = perf_evlist__find_mmap(list, 1, -1, false);
+	__T("a new ring buffer for cpu 1", map1 && nr_mmaps(list) == 2 && ext.nr_new == nr_new + 1);
+	__T("it shares the ring buffer of cpu 0",
+	    perf_evsel__fd_find(member, 0, -1)->domain->map == map0);
+	member_id = perf_evsel__get_id(member, 0, -1);
+	__T("its id maps back", perf_evlist__id_to_evsel(list, member_id, NULL) == member);
+	child_poke(&a);
+	__T("both write on cpu 0", drain_map(map0, a.pid) == 2);
+	__T("read the group again", !perf_evsel__read(e1, 0, -1, (void *)counts));
+	__T("the member counts along", counts[1] >= 2 && counts[3] == 1);
+	__T("the leader cannot go first", perf_evlist__del_evsel(list, e1, &reap) == -EBUSY);
+	perf_evlist__reap_done(list, &reap);
+
+	__T("pin the child to cpu 1", !child_pin(&a, 1));
+	child_poke(&a);
+	__T("delete the member", !perf_evlist__del_evsel(list, member, &reap));
+	__T("the reap names it", reap.type == PERF_EVLIST_REAP__EVSEL && reap.evsel == member &&
+	    reap.complete && reap.nr_maps == 2);
+	for (i = 0; i < reap.nr_maps; i++) {
+		if (reap.maps[i].map == map0)
+			__T("the shared ring buffer is handed over", !reap.maps[i].retired);
+		else
+			__T("its own ring buffer is retired", reap.maps[i].map == map1 &&
+			    reap.maps[i].retired);
+	}
+	__T("cpu 1 is gone from the evlist", !perf_evlist__find_mmap(list, 1, -1, false) &&
+	    nr_mmaps(list) == 1);
+	__T("the event before is still readable", drain_map(map1, a.pid) == 1);
+	__T("not twice", perf_evlist__del_evsel(list, member, &(struct perf_evlist_reap){}) == -EBUSY);
+	__T("pin the child to cpu 0", !child_pin(&a, 0));
+	child_poke(&a);
+	__T("the stopped member writes no more", drain_map(map0, a.pid) == 1);
+	perf_evlist__reap_done(list, &reap);
+	__T("done takes it out", !member->evlist && list->nr_entries == 1 &&
+	    !perf_evlist__id_to_evsel(list, member_id, NULL));
+	__T("its fds stay open", perf_evsel__fd(member, 0, -1) >= 0 && member->opened);
+	__T("and it left the group", member->leader == member && e1->nr_members == 1 &&
+	    perf_evsel__is_group_leader(member, 0, -1));
+	perf_evsel__close(member);
+	perf_evsel__delete(member);
+	__T("read e1 alone", !perf_evsel__read(e1, 0, -1, (void *)counts) && counts[0] == 1);
+
+	/* On any cpu: its (-1,t) ring buffers, thread by thread. */
+	attr.read_format = PERF_FORMAT_ID;
+	tev = perf_evsel__new(&attr);
+	perf_thread_map__set_pid(tid, 0, a.pid);
+	__T("open on any cpu", !perf_evsel__open(tev, dummy, tid));
+	__T("add it", !perf_evlist__add_evsel(list, tev));
+	map = perf_evlist__find_mmap(list, -1, a.pid, false);
+	__T("a thread ring buffer", map && nr_mmaps(list) == 2);
+	child_poke(&a);
+	__T("delete it", !perf_evlist__del_evsel(list, tev, &reap));
+	__T("the thread ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map &&
+	    reap.maps[0].retired && nr_mmaps(list) == 1);
+	__T("drain the thread ring buffer", drain_map(map, a.pid) == 1);
+	perf_evlist__reap_done(list, &reap);
+	perf_evsel__close(tev);
+	perf_evsel__delete(tev);
+	drain_map(map0, a.pid);
+
+	/* An evsel there since the open goes the same way. */
+	child_poke(&a);
+	__T("delete e1", !perf_evlist__del_evsel(list, e1, &reap));
+	__T("its ring buffer is retired", reap.nr_maps == 1 && reap.maps[0].map == map0 &&
+	    reap.maps[0].retired && nr_mmaps(list) == 0 && list->epoll.nr_live == 0);
+	__T("drain it", drain_map(map0, a.pid) == 1);
+	perf_evlist__reap_done(list, &reap);
+	__T("the evlist is empty", list->nr_entries == 0);
+	perf_evsel__close(e1);
+	perf_evsel__delete(e1);
+	perf_evsel__delete(other);
+
+	perf_evlist__delete(list);
+	__T("munmap unregisters the rest", ext.nr_add == ext.nr_del);
+	perf_cpu_map__put(cpu0);
+	perf_cpu_map__put(both);
+	perf_cpu_map__put(dummy);
+	perf_thread_map__put(any);
+	perf_thread_map__put(tid);
+	close(ext.epfd);
+	child_stop(&a);
+	return 0;
+}
+
 int test_bind(int argc, char **argv)
 {
 	int id;
@@ -1359,6 +1499,7 @@ int test_bind(int argc, char **argv)
 	test_dynamic_group(id);
 	test_dynamic_cpus(id);
 	test_cpus_and_thread_exit(id);
+	test_dynamic_evsels(id);
 
 	__T_END;
 	return tests_failed == 0 ? 0 : -1;
