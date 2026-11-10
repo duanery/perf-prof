@@ -132,7 +132,7 @@ int  perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid);
 int  perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid);
 int  perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
 int  perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
-                             struct perf_evlist_reap *reap);
+                             const struct perf_evlist_reap **reap);
 ```
 
 **写时复制**：如果 `evsel->threads == evlist->threads`（还在共用 evlist 的默认值），

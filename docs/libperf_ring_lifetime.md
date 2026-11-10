@@ -305,7 +305,7 @@ ring 的共享与生命周期。
 | 持有者 | 获取 | 释放 |
 |---|---|---|
 | 每个存活的域 | 域创建 | 域死亡：`perf_evlist__reap_done()` 摘下被删除 writer 的域，或域内最后一个 fd detach |
-| `struct perf_evlist_reap` 的 `maps[]` | 收割：`perf_evlist__hup()`、`perf_evlist__del_cpu()` / `del_evsel()` 各另取一个引用 | `perf_evlist__reap_done()` |
+| `struct perf_evlist_reap` 的 `maps[]` | 收割：`perf_evlist__hup()`、`perf_evlist__del_thread()` / `del_cpu()` / `del_evsel()` 各另取一个引用 | `perf_evlist__reap_done()` |
 | perf-prof order 堆 | `order_mmap_add()` | `order_mmap_del()` / `order_deinit()` |
 
 `perf_mmap__put()` 归 0 时 munmap 并 free，**不访问 evlist**：ring 失去 writer 时已经从 evlist
@@ -458,7 +458,7 @@ void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 增删线程、cpu 或 evsel。删除 writer——线程、cpu、evsel——统一按 **停止 → 收割 → 完成** 三步：
 
 1. **停止**：被删除的 writer 不再产生事件：`DISABLE`，或内核已停止它们（task 退出）；
-2. **收割**：libperf 把它们写过的每个 ring 连同一个引用交给调用方（`struct perf_evlist_reap`），
+2. **收割**：libperf 把它们写过的每个 ring 连同一个引用交给调用方（`struct perf_evlist_reap`，只读），
    此时 fd 仍未关闭、仍挂在 ring 上并保持注册，调用方把 ring 读到末尾，sample id 仍可解析出 evsel。
    收割只交出 ring 上的事件，不判断 ring 是否退役；
 3. **完成**：`perf_evlist__reap_done()` 把被删除的 writer 从 ring 上摘下——失去最后一个 writer 的
@@ -546,12 +546,18 @@ struct perf_evlist_reap {
 	pid_t tid;          /* PERF_EVLIST_REAP__THREAD 的线程，否则 -1 */
 	bool complete;      /* 删除已完整：perf_evlist__reap_done() 后不复存在（线程：来自 del） */
 	int nr_maps;
-	struct perf_mmap **maps;    /* 被删除的 writer 写过的 ring，各带一个引用 */
+	struct perf_mmap *const *maps;  /* 被删除的 writer 写过的 ring，各带一个引用 */
 };
-int  perf_evlist__hup(struct perf_evlist *evlist, int fd, struct perf_evlist_reap *reap);
-int  perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid, struct perf_evlist_reap *reap);
-void perf_evlist__reap_done(struct perf_evlist *evlist, struct perf_evlist_reap *reap);
+int  perf_evlist__hup(struct perf_evlist *evlist, int fd, const struct perf_evlist_reap **reap);
+int  perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid, const struct perf_evlist_reap **reap);
+void perf_evlist__reap_done(struct perf_evlist *evlist, const struct perf_evlist_reap *reap);
 ```
+
+收割结果由 libperf 分配（`struct perf_evlist_reap_priv`，`maps[]` 放在同一块内存的尾部），经 const
+指针交给调用方：调用方改写任何成员（含 `maps[]` 的元素）都是编译错误，库内部经可写的指针填写。
+`perf_evlist__del_*()` / `perf_evlist__hup()` 总会设置结果：出错或没有可收割的 ring 时是静态的
+`perf_evlist_reap_none`（`PERF_EVLIST_REAP__NONE`，不释放）。`reap_done()` 释放收割结果，之后指针
+失效。
 
 调用方在 `reap_done()` 之前把 `maps[]` 读到末尾：此时 fd 未关闭、sample id 仍可解析出 evsel；
 被删除的 writer 已停止，读完就是它们的全部事件。`reap_done()` 按 `type` 完成删除，退役的 ring 经
@@ -606,7 +612,7 @@ evsel 的输入 cpu map 不变，增删之后 `perf_evsel__cpus()` 返回按升�
 ### 7.6 删除 cpu：停止 → 收割 → 完成
 
 ```c
-int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu, struct perf_evlist_reap *reap);
+int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu, const struct perf_evlist_reap **reap);
 ```
 
 c 的 fd 只写入 c 的 ring，每种 overwrite 至多一个：(c,-1,false) 与 (c,-1,true)。
@@ -673,7 +679,7 @@ rank 参与组的选择，也不成为已有 fd 的 leader。`perf_evlist__open_
 
 ```c
 int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
-                           struct perf_evlist_reap *reap);
+                           const struct perf_evlist_reap **reap);
 ```
 
 evlist 里任一 evsel 都可以删除，包括 open 时就在的。
@@ -707,15 +713,15 @@ perf_event_handle(fd, revents, map):
         prof_dev_hup(dev, fd)
 
 prof_dev_hup(dev, fd):
-    perf_evlist__hup(evlist, fd, &reap)
-    prof_dev_reap(dev, &reap)
+    perf_evlist__hup(evlist, fd, &reap)          // reap: const struct perf_evlist_reap *
+    prof_dev_reap(dev, reap)
     nr_pollfd == 0 且没有 ptrace 链接: hangup + prof_dev_close()   // 6.3
 
 prof_dev_reap(dev, reap):                      // HUP 与 del 共用
-    for map in reap.maps:
+    for map in reap->maps:
         设备 ACTIVE 时把 map 读到当前 head（order_drain 或直接读）
-    reap.type == THREAD 且 reap.complete: prof_dev_thread_done(tid)
-    perf_evlist__reap_done(evlist, &reap)      // 退役的 ring 经 __poll_del() 离开 order 堆
+    reap->type == THREAD 且 reap->complete: prof_dev_thread_done(tid)
+    perf_evlist__reap_done(evlist, reap)       // 退役的 ring 经 __poll_del() 离开 order 堆
 
 __poll_add(ext, fd, events, map, new_map):
     main_epoll_add(); new_map 且启用 order: order_mmap_add(map)
