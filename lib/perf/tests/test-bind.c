@@ -522,6 +522,7 @@ struct ext_poll {
 	int nr_add;
 	int nr_new;
 	int nr_del;
+	int nr_hup;	/* fds added with EPOLLHUP, those that see it */
 };
 
 static int ext_add(void *external, int fd, unsigned events, struct perf_mmap *map, bool new_map)
@@ -533,6 +534,7 @@ static int ext_add(void *external, int fd, unsigned events, struct perf_mmap *ma
 		return -errno;
 	ext->nr_add++;
 	ext->nr_new += new_map;
+	ext->nr_hup += !!(events & EPOLLHUP);
 	return 0;
 }
 
@@ -542,6 +544,7 @@ static void ext_del(void *external, int fd, unsigned events, struct perf_mmap *m
 
 	epoll_ctl(ext->epfd, EPOLL_CTL_DEL, fd, NULL);
 	ext->nr_del++;
+	ext->nr_hup -= !!(events & EPOLLHUP);
 }
 
 /* The fd of the next EPOLLHUP, or -1. */
@@ -709,6 +712,77 @@ static int test_poll_domains(int id)
 	perf_cpu_map__put(all);
 	perf_thread_map__put(threads);
 	perf_thread_map__put(any);
+	close(ext.epfd);
+	return 0;
+}
+
+/*
+ * System wide writers are polled too: their cpu domains take the data role,
+ * without EPOLLHUP in the events, while the thread keeps its hup fd. Once the
+ * thread exited, no EPOLLHUP fd is left and the ring buffers, written by the
+ * system wide evsel alone, are still polled.
+ */
+static int test_system_wide_poll(int id)
+{
+	struct child a = {}, b = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct ext_poll ext = { .epfd = epoll_create1(EPOLL_CLOEXEC) };
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *tasks = perf_evsel__new(&attr), *sw = perf_evsel__new(&attr);
+	struct perf_cpu_map *all = perf_cpu_map__new(NULL);
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_evlist_reap reap;
+	struct perf_mmap *map;
+	int ncpus = perf_cpu_map__nr(all), nr_add;
+
+	__T("start child", !child_start(&a));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__add(list, tasks);
+	perf_evlist__add(list, sw);
+	perf_evlist__set_maps(list, all, threads);
+	perf_evlist__go_system_wide(list, sw);
+	perf_evlist_poll__external(list, &ext, ext_add, ext_del);
+	__T("open a thread and a system wide writer", !perf_evlist__open(list));
+	__T("map them", !perf_evlist__mmap(list, 4));
+	__T("one cpu ring buffer per cpu", nr_mmaps(list) == ncpus && ext.nr_new == ncpus);
+	__T("system wide data fds plus one hup fd", list->epoll.nr_live == ncpus + 1);
+	__T("only the hup fd has EPOLLHUP", ext.nr_hup == 1);
+	perf_evlist__for_each_mmap(list, map, false)
+		__T("the system wide writer polls the data", map->poll_domain == map->cpu_domain &&
+		    map->poll_domain->poll_events == (EPOLLIN | EPOLLERR | EPOLLET));
+	perf_evlist__enable(list);
+
+	child_poke(&a);
+	__T("EPOLLIN arrives through a system wide fd", ext_wait_in(list, &ext) == -1);
+	__T("both writers sample", drain(list, -1) >= 2);
+
+	/* The thread exits: no EPOLLHUP fd left, the system wide fds stay. */
+	child_stop(&a);
+	__T("EPOLLHUP of the thread", poll_hup(list, &ext, &reap) >= 0 && reap.tid == a.pid);
+	perf_evlist__reap_done(list, &reap);
+	__T("the thread is closed", perf_evlist__del_thread(list, a.pid) == 1);
+	__T("no EPOLLHUP fd left", ext.nr_hup == 0);
+	__T("the system wide data fds are left", list->epoll.nr_live == ncpus);
+	__T("the ring buffers stay", nr_mmaps(list) == ncpus);
+
+	__T("start another child", !child_start(&b));
+	child_poke(&b);
+	__T("the system wide writer alone is still polled", ext_wait_in(list, &ext) == -1);
+	__T("and samples", drain(list, -1) >= 1);
+	child_stop(&b);
+
+	nr_add = ext.nr_add;
+	perf_evlist__munmap(list);
+	__T("munmap unregisters every fd", ext.nr_add == nr_add && ext.nr_del == ext.nr_add &&
+	    list->epoll.nr_live == 0 && ext.nr_hup == 0);
+
+	perf_evlist__delete(list);
+	perf_cpu_map__put(all);
+	perf_thread_map__put(threads);
 	close(ext.epfd);
 	return 0;
 }
@@ -1488,6 +1562,7 @@ int test_bind(int argc, char **argv)
 	test_dynamic_threads(id);
 	test_independent_threads(id);
 	test_poll_domains(id);
+	test_system_wide_poll(id);
 	test_munmap_poll(id, false);
 	test_munmap_poll(id, true);
 	test_thread_exit(id);
