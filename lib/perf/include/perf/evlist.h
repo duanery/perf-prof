@@ -46,10 +46,14 @@ LIBPERF_API int perf_evlist__set_maps(struct perf_evlist *evlist,
  * to poll (one per domain of a ring buffer) and calls @add / @del as they
  * appear and go away, from perf_evlist__mmap() on. @new_map is true the first
  * time @map is reported. On EPOLLHUP the loop calls perf_evlist__hup().
+ *
+ * @events has EPOLLHUP for the fds bound to a task only, which see EPOLLHUP
+ * when it exits; pid=-1 and cgroup fds never do. @del gets the @events the fd
+ * was added with: e.g. count the EPOLLHUP fds to learn when every task exited.
  */
 typedef int (*perf_evlist_poll_add_t)(void *external, int fd, unsigned events,
 				      struct perf_mmap *map, bool new_map);
-typedef void (*perf_evlist_poll_del_t)(void *external, int fd,
+typedef void (*perf_evlist_poll_del_t)(void *external, int fd, unsigned events,
 				       struct perf_mmap *map);
 LIBPERF_API void perf_evlist_poll__external(struct perf_evlist *evlist, void *external,
 					    perf_evlist_poll_add_t add,

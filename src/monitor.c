@@ -2272,7 +2272,7 @@ static int __poll_add(void *external, int fd, unsigned events, struct perf_mmap 
     return 0;
 }
 
-static void __poll_del(void *external, int fd, struct perf_mmap *map)
+static void __poll_del(void *external, int fd, unsigned events, struct perf_mmap *map)
 {
     struct prof_dev *dev = external;
 

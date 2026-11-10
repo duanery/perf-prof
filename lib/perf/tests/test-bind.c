@@ -536,7 +536,7 @@ static int ext_add(void *external, int fd, unsigned events, struct perf_mmap *ma
 	return 0;
 }
 
-static void ext_del(void *external, int fd, struct perf_mmap *map)
+static void ext_del(void *external, int fd, unsigned events, struct perf_mmap *map)
 {
 	struct ext_poll *ext = external;
 

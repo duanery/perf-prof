@@ -48,10 +48,7 @@ struct perf_mmap_domain {
 	bool			 dead;
 	int			 nr_fds;
 	int			 nr_alloc;
-	struct perf_mmap_domain_fd {
-		int		 fd;
-		bool		 poll;         /* may be registered with epoll */
-	} *fds;
+	int			*fds;
 	int			 poll_fd;      /* registered fd, -1 if none */
 	unsigned		 poll_events;
 	struct perf_evlist_thread *thread;     /* task domain only */

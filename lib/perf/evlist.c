@@ -684,7 +684,6 @@ static int perf_evlist_poll__add(struct perf_evlist *evlist,
 	struct perf_mmap *map = dom->map;
 	int err = 0;
 
-	events |= EPOLLERR | EPOLLHUP | EPOLLET;
 	if (epoll->external) {
 		if (epoll->add)
 			err = epoll->add(epoll->external, fd, events, map, !map->announced);
@@ -724,7 +723,7 @@ static void perf_evlist_poll__del(struct perf_evlist *evlist,
 
 	if (epoll->external) {
 		if (epoll->del)
-			epoll->del(epoll->external, fd, dom->map);
+			epoll->del(epoll->external, fd, dom->poll_events, dom->map);
 	} else
 		epoll_ctl(epoll->epfd, EPOLL_CTL_DEL, fd, NULL);
 
@@ -735,12 +734,7 @@ static void perf_evlist_poll__del(struct perf_evlist *evlist,
 
 static int perf_mmap_domain__poll_fd(struct perf_mmap_domain *dom)
 {
-	int i;
-
-	for (i = 0; i < dom->nr_fds; i++)
-		if (dom->fds[i].poll)
-			return dom->fds[i].fd;
-	return -1;
+	return dom->nr_fds ? dom->fds[0] : -1;
 }
 
 static bool perf_mmap_domain__pollable(struct perf_mmap_domain *dom)
@@ -759,6 +753,13 @@ static bool perf_mmap_domain__pollable(struct perf_mmap_domain *dom)
  *
  * A domain is registered if it holds either role, with EPOLLIN only for the
  * data role. A thread whose EPOLLHUP is taken (th->hup) needs no hup fd.
+ *
+ * Every writer may serve, system wide ones included: a ring buffer they alone
+ * write into is polled as well, as perf does since 6cc447964555 ("libperf
+ * evlist: Fix polling of system-wide events"), in v6.0. EPOLLHUP is in the
+ * events of task domains only; epoll reports it whatever the mask, so it only
+ * tells the external loop which fds can see it, e.g. to wait for the exit of
+ * every task without counting the cpu domains that never exit.
  *
  * Kernel constraints that make one fd enough:
  *  - a write by any writer wakes up every event attached to the ring buffer
@@ -825,8 +826,12 @@ static int perf_evlist_poll__sync(struct perf_evlist *evlist,
 		return 0;
 	data = !dom->dead && dom->map->poll_domain == dom;
 	hup = !dom->dead && dom->thread && dom->thread->hup_domain == dom;
-	/* An overwrite ring buffer is read on demand, only its EPOLLHUP matters. */
-	events = (data && !dom->map->overwrite ? EPOLLIN : 0) | EPOLLERR | EPOLLHUP | EPOLLET;
+	/*
+	 * An overwrite ring buffer is read on demand, only its EPOLLHUP matters.
+	 * EPOLLHUP marks the fds of a task domain, the only ones to see it.
+	 */
+	events = (data && !dom->map->overwrite ? EPOLLIN : 0) |
+		 (dom->tid >= 0 ? EPOLLHUP : 0) | EPOLLERR | EPOLLET;
 
 	if (dom->poll_fd >= 0 && (!(data || hup) || dom->poll_events != events))
 		perf_evlist_poll__del(evlist, dom);
@@ -872,7 +877,7 @@ static int perf_evlist_poll__update(struct perf_evlist *evlist, struct perf_mmap
 
 /* Domains. */
 
-static int perf_mmap_domain__add_fd(struct perf_mmap_domain *dom, int fd, bool poll)
+static int perf_mmap_domain__add_fd(struct perf_mmap_domain *dom, int fd)
 {
 	if (dom->nr_fds == dom->nr_alloc) {
 		int nr_alloc = dom->nr_alloc ? dom->nr_alloc * 2 : 4;
@@ -883,9 +888,7 @@ static int perf_mmap_domain__add_fd(struct perf_mmap_domain *dom, int fd, bool p
 		dom->fds = fds;
 		dom->nr_alloc = nr_alloc;
 	}
-	dom->fds[dom->nr_fds].fd = fd;
-	dom->fds[dom->nr_fds].poll = poll;
-	dom->nr_fds++;
+	dom->fds[dom->nr_fds++] = fd;
 	return 0;
 }
 
@@ -894,7 +897,7 @@ static void perf_mmap_domain__del_fd(struct perf_mmap_domain *dom, int fd)
 	int i;
 
 	for (i = 0; i < dom->nr_fds; i++) {
-		if (dom->fds[i].fd == fd) {
+		if (dom->fds[i] == fd) {
 			dom->fds[i] = dom->fds[--dom->nr_fds];
 			return;
 		}
@@ -998,7 +1001,7 @@ static int perf_evlist__mmap_output_fd(struct perf_mmap *map)
 
 	list_for_each_entry(dom, &map->domain_list, map_node)
 		if (dom->nr_fds)
-			return dom->fds[0].fd;
+			return dom->fds[0];
 	return -1;
 }
 
@@ -1052,7 +1055,7 @@ int perf_evlist__mmap_attach_fd(struct perf_evlist *evlist,
 	}
 
 	dom = perf_evlist__mmap_domain_get(evlist, map, tid);
-	if (!dom || perf_mmap_domain__add_fd(dom, entry->fd, !evsel->system_wide)) {
+	if (!dom || perf_mmap_domain__add_fd(dom, entry->fd)) {
 		if (dom && !dom->nr_fds) {
 			perf_evlist__mmap_domain_put(evlist, dom, NULL);
 			perf_evlist__mmap_domain_free(dom);
