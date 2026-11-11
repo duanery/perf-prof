@@ -65,6 +65,14 @@ LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct pe
  */
 LIBPERF_API int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader);
 /*
+ * Private data of the caller, for it to find its own state from an evsel.
+ * perf_evsel__delete() releases it with @destructor, unless NULL; so does
+ * setting another one.
+ */
+LIBPERF_API void perf_evsel__set_priv(struct perf_evsel *evsel, void *priv,
+				      void (*destructor)(void *priv));
+LIBPERF_API void *perf_evsel__priv(struct perf_evsel *evsel);
+/*
  * Add/remove a thread or a cpu on an already open evsel. The fds are
  * opened/closed and join/leave the ring buffers of their bindings accordingly.
  * The maps the evsel was opened with do not change: perf_evsel__cpus() and

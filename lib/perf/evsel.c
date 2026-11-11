@@ -70,6 +70,7 @@ void perf_evsel__delete(struct perf_evsel *evsel)
 	free(evsel->filter);
 	if (evsel->bpf_prog_fd >= 0)
 		close(evsel->bpf_prog_fd);
+	perf_evsel__set_priv(evsel, NULL, NULL);
 	free(evsel);
 }
 
@@ -1016,6 +1017,20 @@ void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_ma
 	evsel->own_threads = own_threads;
 	perf_thread_map__put(evsel->threads);
 	evsel->threads = perf_thread_map__get(own_threads ?: (evsel->evlist ? evsel->evlist->user_requested_threads : NULL));
+}
+
+void perf_evsel__set_priv(struct perf_evsel *evsel, void *priv,
+			  void (*destructor)(void *priv))
+{
+	if (evsel->priv_destructor && evsel->priv != priv)
+		evsel->priv_destructor(evsel->priv);
+	evsel->priv = priv;
+	evsel->priv_destructor = destructor;
+}
+
+void *perf_evsel__priv(struct perf_evsel *evsel)
+{
+	return evsel->priv;
 }
 
 int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader)

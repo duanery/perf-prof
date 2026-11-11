@@ -46,6 +46,8 @@ LIBPERF_0.0.1 {
 		perf_evsel__set_bpf;
 		perf_evsel__set_own_cpus;
 		perf_evsel__set_own_threads;
+		perf_evsel__set_priv;
+		perf_evsel__priv;
 		perf_evsel__set_leader;
 		perf_evsel__is_group_leader;
 		perf_mmap__get;
