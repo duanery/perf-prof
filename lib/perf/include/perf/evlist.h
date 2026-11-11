@@ -110,8 +110,11 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *    the fds open; perf_evlist__del_thread() closes them at once, a complete
  *    reap without ring buffer. So does a thread with no ring buffer to reap.
  *
- * A second perf_evlist__del_thread() while its reap is under way reaps
- * nothing: PERF_EVLIST_REAP__NONE.
+ * Until perf_evlist__reap_done() of a complete reap the thread cannot be
+ * added or removed again: -EBUSY. Adding it after its EPOLLHUP closes the fds
+ * of the exited thread first. perf_evlist__del_thread() of a thread no evsel
+ * has: -ENOENT, e.g. all of them are opened on any thread. An error hands out
+ * PERF_EVLIST_REAP__NONE. A negative @pid: -EINVAL.
  */
 LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
 LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,

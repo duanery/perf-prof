@@ -414,8 +414,9 @@ static int test_dynamic_threads(int id)
 	usleep(50000);
 	__T("the events before the delete are readable, none after",
 	    drain(evlist, b.pid) == 1);
-	__T("a second delete reaps nothing",
-	    !perf_evlist__del_thread(evlist, b.pid, &again) &&
+	__T("no add while being removed", perf_evlist__add_thread(evlist, b.pid) == -EBUSY);
+	__T("a second delete is busy",
+	    perf_evlist__del_thread(evlist, b.pid, &again) == -EBUSY &&
 	    again->type == PERF_EVLIST_REAP__NONE);
 	perf_evlist__reap_done(evlist, again);
 	perf_evlist__reap_done(evlist, reap);
@@ -912,7 +913,7 @@ static int test_thread_exit(int id)
 	__T("delete before EPOLLHUP reaps", !perf_evlist__del_thread(list, b.pid, &reap) &&
 	    reap->type == PERF_EVLIST_REAP__THREAD && reap->tid == b.pid && reap->complete);
 	__T("the thread ring buffer is handed over", reap->nr_maps == 1 && reap->maps[0] == map);
-	__T("a second delete reaps nothing", !perf_evlist__del_thread(list, b.pid, &hup) &&
+	__T("a second delete is busy", perf_evlist__del_thread(list, b.pid, &hup) == -EBUSY &&
 	    hup->type == PERF_EVLIST_REAP__NONE);
 	perf_evlist__reap_done(list, hup);
 	fd = poll_hup(list, &ext, &hup);
@@ -942,8 +943,10 @@ static int test_thread_exit(int id)
 	__T("only the first thread is left", nr_mmaps(list) == 1 && list->epoll.nr_live == 1);
 	__T("every registered fd was unregistered", ext.nr_add - ext.nr_del == 1);
 
-	/* A thread without a ring buffer has nothing to wait for. */
-	__T("unknown thread is gone at once", del_thread(list, c.pid) == 0);
+	/* A thread no evsel has: nothing to reap. */
+	__T("unknown thread is not found", perf_evlist__del_thread(list, c.pid, &reap) == -ENOENT &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
 
 	perf_evlist__delete(list);
 	__T("munmap unregisters the rest", ext.nr_add == ext.nr_del);
@@ -1903,6 +1906,88 @@ static int test_dynamic_evsels(int id)
 	return 0;
 }
 
+/*
+ * Without ring buffers a thread has fds but no thread record: deleting it
+ * still closes them. An evsel opened on any thread takes no thread, one on
+ * any cpu no cpu: adding is a no-op, deleting finds nothing.
+ */
+static int test_unmapped_threads(int id)
+{
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.disabled = 1,
+	};
+	const struct perf_evlist_reap *reap;
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0");
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *evsel = perf_evsel__new(&attr);
+	struct child a = {}, b = {};
+
+	__T("start first child", !child_start(&a));
+	__T("start second child", !child_start(&b));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__add(list, evsel);
+	perf_evlist__set_maps(list, cpus, threads);
+	__T("open a counting evlist", !perf_evlist__open(list));
+
+	__T("no negative thread", perf_evlist__add_thread(list, -1) == -EINVAL &&
+	    perf_evlist__del_thread(list, -1, &reap) == -EINVAL &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	__T("add a thread without ring buffer", !perf_evlist__add_thread(list, b.pid) &&
+	    perf_evsel__has_thread(evsel, b.pid));
+	__T("adding it again is a no-op", !perf_evlist__add_thread(list, b.pid));
+	__T("delete it", !perf_evlist__del_thread(list, b.pid, &reap) &&
+	    reap->type == PERF_EVLIST_REAP__THREAD && reap->complete && !reap->nr_maps);
+	perf_evlist__reap_done(list, reap);
+	__T("delete closes its fds", !perf_evsel__has_thread(evsel, b.pid));
+	__T("then it is not found", perf_evlist__del_thread(list, b.pid, &reap) == -ENOENT &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
+	perf_evlist__delete(list);
+	perf_thread_map__put(threads);
+	perf_cpu_map__put(cpus);
+
+	/* Opened on any thread of cpu 0. */
+	threads = perf_thread_map__new_dummy();
+	cpus = perf_cpu_map__new("0");
+	list = perf_evlist__new();
+	evsel = perf_evsel__new(&attr);
+	perf_evlist__add(list, evsel);
+	perf_evlist__set_maps(list, cpus, threads);
+	__T("open an evlist on any thread", !perf_evlist__open(list));
+	__T("an evsel on any thread takes no thread", !perf_evlist__add_thread(list, b.pid) &&
+	    !perf_evsel__has_thread(evsel, b.pid));
+	__T("deleting it finds nothing", perf_evlist__del_thread(list, b.pid, &reap) == -ENOENT &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
+	perf_evlist__delete(list);
+	perf_thread_map__put(threads);
+	perf_cpu_map__put(cpus);
+
+	/* Opened on any cpu of thread a. */
+	threads = perf_thread_map__new_dummy();
+	cpus = perf_cpu_map__dummy_new();
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	list = perf_evlist__new();
+	evsel = perf_evsel__new(&attr);
+	perf_evlist__add(list, evsel);
+	perf_evlist__set_maps(list, cpus, threads);
+	__T("open an evlist on any cpu", !perf_evlist__open(list));
+	__T("an evsel on any cpu takes no cpu", !perf_evlist__add_cpu(list, 0) &&
+	    !perf_evsel__has_cpu(evsel, 0));
+	__T("deleting the cpu finds nothing", perf_evlist__del_cpu(list, 0, &reap) == -ENOENT &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
+	perf_evlist__delete(list);
+	perf_thread_map__put(threads);
+	perf_cpu_map__put(cpus);
+
+	child_stop(&a);
+	child_stop(&b);
+	return 0;
+}
+
 int test_bind(int argc, char **argv)
 {
 	int id;
@@ -1940,6 +2025,7 @@ int test_bind(int argc, char **argv)
 	test_stopped_hup(id);
 	test_stopped_thread(id);
 	test_dynamic_evsels(id);
+	test_unmapped_threads(id);
 
 	__T_END;
 	return tests_failed == 0 ? 0 : -1;

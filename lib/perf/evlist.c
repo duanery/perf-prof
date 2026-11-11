@@ -1289,6 +1289,31 @@ static bool perf_evlist__thread_evsel(struct perf_evsel *evsel)
 	return !evsel->own_threads && !evsel->system_wide;
 }
 
+/*
+ * An evsel driven from here has fds of @pid. The thread record alone does not
+ * tell: it comes with the first ring buffer, see perf_evlist__mmap_domain_get().
+ */
+static bool perf_evlist__has_thread(struct perf_evlist *evlist, pid_t pid)
+{
+	struct perf_evsel *evsel;
+
+	perf_evlist__for_each_entry(evlist, evsel) {
+		if (perf_evlist__thread_evsel(evsel) && perf_evsel__has_thread(evsel, pid))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * @evsel is driven from here and has no fds of @pid yet: perf_evlist__add_thread()
+ * opens them.
+ */
+static bool perf_evlist__needs_thread(struct perf_evsel *evsel, pid_t pid)
+{
+	return perf_evlist__thread_evsel(evsel) && evsel->opened && !evsel->any_thread &&
+	       !evsel->del && !perf_evsel__has_thread(evsel, pid);
+}
+
 /* Close the fds of @tid, which also frees its dead domains, and forget it. */
 static void perf_evlist__thread_close(struct perf_evlist *evlist, pid_t tid)
 {
@@ -1326,13 +1351,27 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	struct perf_evsel **added;
 	int err, nr = 0, pass, i;
 
+	if (pid < 0)
+		return -EINVAL;
+	/* Removed, until perf_evlist__reap_done(). */
+	if (th && th->del)
+		return -EBUSY;
 	/*
-	 * A previous thread with this tid that is still on its way out - tid
-	 * reuse, or a thread attached again. Drop it outright; a ring buffer
-	 * it alone wrote into is released without reporting it.
+	 * A previous thread with this tid exited, EPOLLHUP reaped it, its fds
+	 * wait for perf_evlist__del_thread() - tid reuse, or a thread attached
+	 * again. Close them outright.
 	 */
-	if (th && (th->hup || th->del))
+	if (th && th->hup)
 		perf_evlist__thread_close(evlist, pid);
+
+	/* No evsel takes the thread, e.g. all opened on any thread. */
+	perf_evlist__for_each_entry(evlist, evsel) {
+		if (perf_evlist__needs_thread(evsel, pid))
+			nr++;
+	}
+	if (!nr)
+		return 0;
+	nr = 0;
 
 	/* In open order; the evsels taking the thread are compacted to the front. */
 	added = perf_evlist__open_order(evlist);
@@ -1342,11 +1381,7 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 
 	for (i = 0; i < evlist->nr_entries; i++) {
 		evsel = added[i];
-		if (!perf_evlist__thread_evsel(evsel))
-			continue;
-		if (!evsel->opened || evsel->any_thread || evsel->del)
-			continue;
-		if (perf_evsel__has_thread(evsel, pid))
+		if (!perf_evlist__needs_thread(evsel, pid))
 			continue;
 
 		err = perf_evsel__add_thread(evsel, pid);
@@ -1432,9 +1467,13 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
 	int nr = 0;
 
 	*reapp = &perf_evlist_reap_none;
+	if (pid < 0)
+		return -EINVAL;
 
 	if (th && th->del)
-		return 0;
+		return -EBUSY;
+	if (!th && !perf_evlist__has_thread(evlist, pid))
+		return -ENOENT;
 	if (th && !th->hup)
 		list_for_each_entry(dom, &th->domain_list, thread_node)
 			if (!dom->dead)
@@ -1567,7 +1606,13 @@ int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu)
 		c = perf_evlist__cpu_rec(evsel, cpu);
 		if (c && c->del)
 			return -EBUSY;
+		if (perf_evlist__cpu_evsel(evsel) && !evsel->del && !c)
+			nr++;
 	}
+	/* No evsel takes the cpu, or every one has it already. */
+	if (!nr)
+		return 0;
+	nr = 0;
 
 	/* In open order; the evsels taking the cpu are compacted to the front. */
 	added = perf_evlist__open_order(evlist);

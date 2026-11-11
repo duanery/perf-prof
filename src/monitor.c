@@ -2225,7 +2225,7 @@ int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
  * Unlike prof_dev_add_thread(), the profiler does not replace this: the
  * EPOLLHUP path reaps the same thread, and prof->del_thread() needs the cpu
  * ring buffers drained first, see prof_dev_thread_done(). A thread the
- * profiler never added to the evlist is reaped at once, with nothing to read.
+ * profiler never added to the evlist is done at once, with nothing to reap.
  */
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 {
@@ -2240,6 +2240,14 @@ int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
         return 0;
 
     ret = perf_evlist__del_thread(dev->evlist, pid, &reap);
+    /* Removed already, its reap is under way. */
+    if (ret == -EBUSY)
+        return 0;
+    if (ret == -ENOENT) {
+        /* Not in the evlist: nothing to reap, the thread is done at once. */
+        prof_dev_thread_done(dev, pid);
+        return 0;
+    }
     if (ret < 0)
         return ret;
     prof_dev_reap(dev, reap);
