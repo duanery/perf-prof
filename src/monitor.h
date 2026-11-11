@@ -761,33 +761,32 @@ struct perf_event_member_cache {
     u64 sample_type;
 };
 
-struct perf_evsel_external {
-    struct prof_dev *dev;  // evsel -> dev
-    struct tp *tp;   // evsel -> tp
-    struct perf_event_member_cache *member_cache;  // evsel -> member_cache (for profiler event source)
+/*
+ * perf-prof state of an evsel, its libperf private data: perf_evsel__delete()
+ * frees it, see perf_evsel__set_priv().
+ */
+struct prof_evsel {
+    struct tp *tp;   // evsel -> tp, set by tp_evsel_new()
+    struct perf_event_member_cache *member_cache;  // sample layout, built on first use
 };
 
 int perf_evsel_link_tp(struct perf_evsel *evsel, struct tp *tp);
 static inline struct tp *perf_evsel_tp(struct perf_evsel *evsel)
 {
-    struct perf_evsel_external *ext = evsel->external;
-    return ext ? ext->tp : NULL;
+    struct prof_evsel *pe = perf_evsel__priv(evsel);
+    return pe ? pe->tp : NULL;
 }
-static inline struct prof_dev *perf_evsel_dev(struct perf_evsel *evsel)
-{
-    struct perf_evsel_external *ext = evsel->external;
-    return ext ? ext->dev : NULL;
-}
+struct perf_event_member_cache *__perf_evsel_member_cache(struct perf_evsel *evsel);
 static inline struct perf_event_member_cache *perf_evsel_member_cache(struct perf_evsel *evsel)
 {
-    struct perf_evsel_external *ext = evsel->external;
-    return ext ? ext->member_cache : NULL;
+    struct prof_evsel *pe = perf_evsel__priv(evsel);
+    if (likely(pe && pe->member_cache))
+        return pe->member_cache;
+    return __perf_evsel_member_cache(evsel);
 }
-int prof_dev_evsel_external_init(struct prof_dev *dev);
-void prof_dev_evsel_external_deinit(struct prof_dev *dev);
 struct perf_evsel *perf_event_evsel(struct prof_dev *dev, union perf_event *event);
-    struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel);
-    int perf_event_member_offset(struct perf_event_member_cache *cache,
+struct perf_event_member_cache *perf_event_members(struct perf_evsel *evsel);
+int perf_event_member_offset(struct perf_event_member_cache *cache,
                                  struct perf_event_member *member,
                                  union perf_event *event);
 int perf_sample_read_size(struct perf_evsel *evsel, void *data);

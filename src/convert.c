@@ -976,74 +976,63 @@ NULL_tidmap:
 }
 
 /*
- * evsel->external (struct perf_evsel_external)
+ * evsel private data (struct prof_evsel)
  *
  * Extends perf_evsel with perf-prof specific data, providing fast reverse
  * lookups from evsel to its owning context:
  *
  *   - tp:           The tp (tracepoint descriptor) associated with this evsel.
  *                   Set by perf_evsel_link_tp() during tp_evsel_new().
- *   - dev:          The prof_dev instance that owns this evsel.
- *                   Set by prof_dev_evsel_external_init() after prof->init().
  *   - member_cache: Describes the sample record layout based on sample_type,
  *                   used by profiler event sources (dev_tp) to access fields
- *                   in forwarded events. Built by perf_event_members().
+ *                   in forwarded events. Built by perf_event_members() on the
+ *                   first perf_evsel_member_cache(), when sample_type is final.
  *
- * Access helpers: perf_evsel_tp(), perf_evsel_dev(), perf_evsel_member_cache().
+ * It is set by perf_evsel__set_priv() and freed by perf_evsel__delete(), on
+ * every path that deletes the evsel.
+ *
+ * Access helpers: perf_evsel_tp(), perf_evsel_member_cache().
  */
+
+static void prof_evsel_free(void *priv)
+{
+    struct prof_evsel *pe = priv;
+
+    free(pe->member_cache);
+    free(pe);
+}
+
+static struct prof_evsel *prof_evsel_get(struct perf_evsel *evsel)
+{
+    struct prof_evsel *pe = perf_evsel__priv(evsel);
+
+    if (!pe) {
+        pe = calloc(1, sizeof(*pe));
+        if (pe)
+            perf_evsel__set_priv(evsel, pe, prof_evsel_free);
+    }
+    return pe;
+}
 
 int perf_evsel_link_tp(struct perf_evsel *evsel, struct tp *tp)
 {
-    evsel->external = calloc(1, sizeof(struct perf_evsel_external));
-    if (!evsel->external)
+    struct prof_evsel *pe = prof_evsel_get(evsel);
+
+    if (!pe)
         return -1;
-    ((struct perf_evsel_external *)evsel->external)->tp = tp;
+    pe->tp = tp;
     return 0;
 }
 
-int prof_dev_evsel_external_init(struct prof_dev *dev)
+struct perf_event_member_cache *__perf_evsel_member_cache(struct perf_evsel *evsel)
 {
-    struct perf_evlist *evlist = dev->evlist;
-    struct perf_evsel *evsel;
-    struct perf_evsel_external *ext;
+    struct prof_evsel *pe = prof_evsel_get(evsel);
 
-    if (dev->silent || dev->type == PROF_DEV_TYPE_SERVICE)
-        return 0;
-
-    perf_evlist__for_each_evsel(evlist, evsel) {
-        /* evsel->external may already be allocated by perf_evsel_link_tp() */
-        if (!evsel->external) {
-            evsel->external = calloc(1, sizeof(struct perf_evsel_external));
-            if (!evsel->external) {
-                prof_dev_evsel_external_deinit(dev);
-                return -1;
-            }
-        }
-        ext = evsel->external;
-        ext->dev = dev;
-
-        /* Initialize member_cache for events with sample_type */
-        if (!ext->member_cache) {
-            ext->member_cache = perf_event_members(evsel);
-        }
-    }
-    return 0;
-}
-
-void prof_dev_evsel_external_deinit(struct prof_dev *dev)
-{
-    struct perf_evlist *evlist = dev->evlist;
-    struct perf_evsel *evsel;
-
-    perf_evlist__for_each_evsel(evlist, evsel) {
-        if (evsel->external) {
-            struct perf_evsel_external *ext = evsel->external;
-            if (ext->member_cache)
-                free(ext->member_cache);
-            free(evsel->external);
-            evsel->external = NULL;
-        }
-    }
+    if (!pe)
+        return NULL;
+    if (!pe->member_cache)
+        pe->member_cache = perf_event_members(evsel);
+    return pe->member_cache;
 }
 
 struct perf_evsel *perf_event_evsel(struct prof_dev *dev, union perf_event *event)

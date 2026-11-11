@@ -1867,7 +1867,7 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
 
 struct tp *tp_from_evsel(struct perf_evsel *evsel, struct tp_list *tp_list)
 {
-    /* Fast path: direct access via evsel->external->tp */
+    /* Fast path: direct access via the evsel private data */
     struct tp *tp = evsel ? perf_evsel_tp(evsel) : NULL;
     int i;
 

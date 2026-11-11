@@ -2542,10 +2542,6 @@ reinit:
         fprintf(stderr, "monitor(%s) convert failed\n", prof->name);
         goto out_deinit;
     }
-    if (prof_dev_evsel_external_init(dev) < 0) {
-        fprintf(stderr, "monitor(%s) evsel external init failed\n", prof->name);
-        goto out_deinit;
-    }
     /* prof->init allows reassignment of cpus and threads */
     perf_evlist__set_maps(evlist, dev->cpus, dev->threads);
 
@@ -2655,7 +2651,6 @@ out_deinit:
     if (!reinit)
         ptrace_detach(dev);
 
-    prof_dev_evsel_external_deinit(dev);
     perf_event_convert_deinit(dev);
     prof->deinit(dev);
 out_delete:
@@ -3003,7 +2998,6 @@ static void prof_dev_free(struct prof_dev *dev)
     **/
     prof->deinit(dev);
     dev->private = NULL;
-    prof_dev_evsel_external_deinit(dev);
     perf_event_convert_deinit(dev);
 
     if (dev->pages) {

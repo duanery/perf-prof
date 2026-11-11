@@ -139,7 +139,6 @@ struct perf_evsel {
 	bool			 cpus_changed;
 	struct perf_cpu_map	*cpus_snap;
 	struct perf_evsel	*leader;
-	void			*external;
 	/* perf_evsel__set_priv() */
 	void			*priv;
 	void			(*priv_destructor)(void *priv);
