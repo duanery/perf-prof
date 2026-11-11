@@ -1,8 +1,6 @@
 #ifndef __LINUX_EPOLL__
 #define __LINUX_EPOLL__
 
-#include <linux/list.h>
-#include <linux/rbtree.h>
 #include <sys/epoll.h>
 
 typedef void (*handle_event)(int fd, unsigned int revents, void *ptr);

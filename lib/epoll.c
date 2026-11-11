@@ -117,7 +117,11 @@ int event_poll__del(struct event_poll *ep, int fd)
     if (!data)
         return -ENOENT;
 
-    for (i = 0; i < ep->cnt; i++) {
+    /*
+     * Check if data is being used in ep->events, if so, clear it.
+     * The events up to ep->i are already handled.
+    **/
+    for (i = ep->i + 1; i < ep->cnt; i++) {
         if (ep->events[i].data.ptr == data)
             ep->events[i].data.ptr = NULL;
     }
