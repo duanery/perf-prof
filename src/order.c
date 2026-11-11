@@ -238,6 +238,7 @@ void order_mmap_del(struct prof_dev *dev, struct perf_mmap *map)
         if (heap_event->type == PERF_MMAP_EVENT && mmap_event->map == map) {
             if (order_main_dev(dev)->order.inprocess) {
                 heap_event->removed = true;
+                order_main_dev(dev)->order.nr_removed++;
                 return;
             }
             list_del(&heap_event->link);
@@ -372,6 +373,7 @@ void order_unregister(struct prof_dev *dev, void *stream)
         if (heap_event->type == STREAM_EVENT && stream_event->stream == stream) {
             if (main_dev->order.inprocess) {
                 heap_event->removed = true;
+                main_dev->order.nr_removed++;
                 return;
             }
             list_del(&heap_event->link);
@@ -732,7 +734,7 @@ static int order_heap_init(struct prof_dev *main_dev, struct prof_dev *dev, bool
     return 0;
 }
 
-static void order_reap(struct prof_dev *dev)
+static void __order_reap(struct prof_dev *dev)
 {
     struct heap_event *event, *next;
     struct prof_dev *child, *tmp;
@@ -746,7 +748,19 @@ static void order_reap(struct prof_dev *dev)
             order_unregister(dev, ((struct stream_event *)event)->stream);
     }
     for_each_child_dev_get(child, tmp, dev)
-        order_reap(child);
+        __order_reap(child);
+}
+
+/*
+ * Free the heap events removed during the heap sort. Walk the devices only
+ * when there is one, most heap sorts remove nothing.
+ */
+static void order_reap(struct prof_dev *main_dev)
+{
+    if (likely(!main_dev->order.nr_removed))
+        return;
+    main_dev->order.nr_removed = 0;
+    __order_reap(main_dev);
 }
 
 bool order_drain(struct prof_dev *dev, struct perf_mmap *map, u64 end)

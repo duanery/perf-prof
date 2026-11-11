@@ -444,6 +444,7 @@ struct prof_dev {
         DEFINE_MIN_HEAP(void *, heapsort) heapsort;
         struct list_head heap_event_list; // link all heap_event
         int heap_size, nr_mmaps, nr_streams;
+        int nr_removed; // heap events removed during the heap sort, freed by order_reap()
         void **data; // used in heapsort;
         struct perf_mmap *drain_map;
         u64 drain_end;
