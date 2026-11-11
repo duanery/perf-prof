@@ -1,5 +1,5 @@
 /*
- * Clone the new prof_dev under the control of ptrace.
+ * Track the new threads and child processes under the control of ptrace.
  *
  * For prof_dev, after it is attached to a process (-p <pid>), there is no way to
  * track the newly forked child process. However, we can use ptrace to control the
@@ -7,10 +7,11 @@
  * it to CONTINUE at the appropriate time.
  *
  * The main idea is:
- *    When in the STOP state, clone a new prof_dev for the tracee.
+ *    When in the STOP state, add the tracee to the prof_dev of its parent.
  *    Then, notify it to CONTINUE.
  *
- *    When tracee exits, close its prof_dev.
+ *    When tracee exits, remove it from the prof_dev. The prof_dev is closed
+ *    after its last tracee exits.
  *
  * Initially, ptrace is used to trace the fork, vfork, and clone syscalls.
  * And re-inject all delivered signals.
@@ -48,7 +49,6 @@ struct pid_link_dev {
 };
 
 static void put_pid(struct pid_node *p, int pid);
-static void del_thread_tree(struct prof_dev *dev, pid_t pid);
 
 static int __ptrace_link(struct pid_node *node, struct prof_dev *dev)
 {
@@ -92,7 +92,7 @@ static void __ptrace_unlink_free(struct pid_link_dev *link)
      * this list and must not re-enter del_thread.
      */
     if (dev && dev->evlist && pid >= 0 && !dev->inclose)
-        del_thread_tree(dev, pid);
+        prof_dev_del_thread(dev, pid);
     prof_dev_unuse(dev);
 }
 
@@ -375,37 +375,6 @@ static int __detach(struct pid_node *node)
     return SKIP_CONT;
 }
 
-static int add_thread_tree(struct prof_dev *dev, pid_t pid)
-{
-    struct prof_dev *child, *tmp;
-    int err = 0;
-
-    if (dev->inclose)
-        return 0;
-    err = prof_dev_add_thread(dev, pid);
-    if (err)
-        return err;
-    if (dev->prof->add_thread && (err = dev->prof->add_thread(dev, pid)) < 0)
-        return err;
-    for_each_child_dev_get(child, tmp, dev) {
-        int child_err = add_thread_tree(child, pid);
-        if (child_err)
-            err = child_err;
-    }
-    if (err)
-        del_thread_tree(dev, pid);
-    return err;
-}
-
-static void del_thread_tree(struct prof_dev *dev, pid_t pid)
-{
-    struct prof_dev *child, *tmp;
-
-    for_each_child_dev_get(child, tmp, dev)
-        del_thread_tree(child, pid);
-    prof_dev_del_thread(dev, pid);
-}
-
 static int __fork__new(struct pid_node *child)
 {
     struct pid_node *parent = child->parent;
@@ -419,10 +388,10 @@ static int __fork__new(struct pid_node *child)
         struct pid_link_dev *link;
 
         list_for_each_entry(link, &parent->dev_list, link_to_pid) {
-            if (add_thread_tree(link->dev, child->pid) < 0)
+            if (prof_dev_add_thread(link->dev, child->pid) < 0)
                 continue;
             if (!__ptrace_link(child, link->dev))
-                del_thread_tree(link->dev, child->pid);
+                prof_dev_del_thread(link->dev, child->pid);
         }
         put_pid(parent, 0);
         child->parent = NULL;

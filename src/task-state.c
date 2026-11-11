@@ -569,7 +569,11 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
     struct task_state_ctx *ctx = dev->private;
     int ret;
 
-    if (!ctx->thread_map || pid < 0)
+    /* No tid filter to follow the thread: the default. */
+    if (!ctx->thread_map)
+        return perf_evlist__add_thread(dev->evlist, pid);
+    /* The events stay on all cpus, only the tid filter takes the thread. */
+    if (pid < 0)
         return 0;
     ret = tid_set__add(&ctx->tids, pid);
     if (ret <= 0)

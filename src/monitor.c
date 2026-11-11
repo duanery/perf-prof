@@ -2183,25 +2183,62 @@ static void prof_dev_reap(struct prof_dev *dev, const struct perf_evlist_reap *r
     perf_evlist__reap_done(dev->evlist, reap);
 }
 
+/*
+ * Add a new thread to @dev and every child device, which follow the same
+ * threads. If a child device fails, the thread is removed from all of them
+ * again.
+ */
 int prof_dev_add_thread(struct prof_dev *dev, pid_t pid)
 {
+    struct prof_dev *child, *tmp;
+    int err;
+
     if (dev->inclose)
         return 0;
-    /* New ring buffers join the order heap from __poll_add(). */
-    return perf_evlist__add_thread(dev->evlist, pid);
+    /*
+     * The profiler decides whether the thread gets its own events. New ring
+     * buffers join the order heap from __poll_add().
+     */
+    if (dev->prof->add_thread)
+        err = dev->prof->add_thread(dev, pid);
+    else
+        err = perf_evlist__add_thread(dev->evlist, pid);
+    if (err < 0)
+        return err;
+
+    err = 0;
+    for_each_child_dev_get(child, tmp, dev) {
+        int child_err = prof_dev_add_thread(child, pid);
+        if (child_err)
+            err = child_err;
+    }
+    if (err)
+        prof_dev_del_thread(dev, pid);
+    return err;
 }
 
 /*
- * ptrace saw the thread exit. Its fds see EPOLLHUP as well, in either order;
- * whichever comes first reaps its ring buffers, see perf_evlist__del_thread().
+ * Remove a thread from the child devices first, then from @dev.
+ * Its fds see EPOLLHUP as well, in either order; whichever comes first reaps
+ * its ring buffers, see perf_evlist__del_thread().
+ *
+ * Unlike prof_dev_add_thread(), the profiler does not replace this: the
+ * EPOLLHUP path reaps the same thread, and prof->del_thread() needs the cpu
+ * ring buffers drained first, see prof_dev_thread_done(). A thread the
+ * profiler never added to the evlist is reaped at once, with nothing to read.
  */
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid)
 {
     const struct perf_evlist_reap *reap;
+    struct prof_dev *child, *tmp;
     int ret;
+
+    for_each_child_dev_get(child, tmp, dev)
+        prof_dev_del_thread(child, pid);
 
     if (dev->inclose)
         return 0;
+
     ret = perf_evlist__del_thread(dev->evlist, pid, &reap);
     if (ret < 0)
         return ret;

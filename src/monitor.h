@@ -255,14 +255,6 @@ typedef struct monitor {
     int (*init)(struct prof_dev *dev);
     int (*reinit)(struct prof_dev *dev, int err);
     int (*filter)(struct prof_dev *dev);
-    /*
-     * ptrace added or removed a thread; update profiler-side filters.
-     * del_thread() runs once the thread is gone from the evlist: after its
-     * removal by ptrace, and the EPOLLHUP of its fds if that came first,
-     * with every event of it read.
-     */
-    int (*add_thread)(struct prof_dev *dev, pid_t pid);
-    int (*del_thread)(struct prof_dev *dev, pid_t pid);
     void (*enabled)(struct prof_dev *dev);
     void (*deinit)(struct prof_dev *dev);
     void (*flush)(struct prof_dev *dev, enum profdev_flush how);
@@ -270,6 +262,18 @@ typedef struct monitor {
     void (*sigusr)(struct prof_dev *dev, int signum);
     void (*print_dev)(struct prof_dev *dev, int indent);
     void (*interval)(struct prof_dev *dev);
+
+    /*
+     * A thread was added or removed; update profiler-side filters.
+     * add_thread() replaces perf_evlist__add_thread(); the profiler calls it
+     * when the thread needs events of its own.
+     * del_thread() does not replace perf_evlist__del_thread(), it is only
+     * notified: it runs once the thread is gone from the evlist, after
+     * prof_dev_del_thread() and the EPOLLHUP of its fds, whichever came
+     * first, with every event of it read.
+     */
+    int (*add_thread)(struct prof_dev *dev, pid_t pid);
+    int (*del_thread)(struct prof_dev *dev, pid_t pid);
 
     // fixup `struct perf_sample_pos'.
     // Used by bpf profiler to allow getting pid, time, cpu from PERF_SAMPLE_RAW.
