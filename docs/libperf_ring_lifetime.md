@@ -705,6 +705,136 @@ evlist 里任一 evsel 都可以删除，包括 open 时就在的。
 停止与完成之间：再次删除返回 `-EBUSY`；`perf_evlist__add_thread()` / `add_cpu()` 跳过该 evsel；它不
 被选为新 fd 的组 leader。
 
+### 7.9 完整示例：增删 cpu 与 evsel
+
+下面的示例按调用顺序展示 7.5–7.8 的用法，省略了部分错误处理。前提：evlist 已
+`perf_evlist__open()`、`perf_evlist__mmap()`、`perf_evlist__enable()`，并经
+`perf_evlist_poll__external()` 注册了 poll add/del 回调（6.4）。新 ring 经 add 回调以 `new_map`
+报告，退役的 ring 经 del 回调以 `retired` 报告，示例里不再重复。
+
+收割得到的 ring 用同一个函数读到末尾。perf-prof 里这一步是 `prof_dev_reap()`（8.1），启用 order
+时用 `order_drain()` 按时间序读：
+
+```c
+static void drain(struct perf_mmap *map)
+{
+	union perf_event *event;
+	bool writable;
+
+	if (perf_mmap__read_init(map) < 0)
+		return;
+	while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+		handle_event(event);    /* sample id 仍能解析出被删除的 evsel */
+		perf_mmap__consume(map);
+	}
+	perf_mmap__read_done(map);
+}
+
+/* 读完一次收割交出的全部 ring，再完成删除。 */
+static void reap(struct perf_evlist *evlist, const struct perf_evlist_reap *reap)
+{
+	int i;
+
+	for (i = 0; i < reap->nr_maps; i++)
+		drain(reap->maps[i]);
+	perf_evlist__reap_done(evlist, reap);   /* 出错时的 NONE 也要交回 */
+}
+```
+
+#### 增删 cpu：跟随 cpu 热插拔
+
+cpu 上线时给跟随 evlist cpu map 的 evsel 加上它，下线时删掉它。自带 cpu map 的 evsel 不动（7.5）：
+
+```c
+/* cpu 上线 */
+err = perf_evlist__add_cpu(evlist, cpu);
+if (err < 0)
+	return err;     /* 已回滚：已加上的 evsel 又删掉了；-EBUSY：该 cpu 的删除尚未完成 */
+/*
+ * 新 fd 已 enable。(cpu,-1) ring 是新建的就经 add 回调以 new_map 报告，
+ * 进入 order 堆；已有（自带 cpu map 的 evsel 在写）就接入它。
+ */
+
+/* cpu 下线 */
+const struct perf_evlist_reap *r;
+
+err = perf_evlist__del_cpu(evlist, cpu, &r);
+/*
+ * 停止：cpu 上的 fd 已 DISABLE，不再写入；离线 cpu 的 event 本来就已停止。
+ * 收割：r->type == PERF_EVLIST_REAP__CPU，r->maps[] 是 (cpu,-1) 的两种
+ * overwrite ring 中被写过的那些。-ENOENT（没有 evsel 有该 cpu）、-EBUSY
+ * 时 r 是 PERF_EVLIST_REAP__NONE。
+ */
+reap(evlist, r);
+/*
+ * 完成：fd 已关闭，evsel 放下了对 cpu 记录的引用；(cpu,-1) ring 没有其他
+ * writer 时退役，经 del 回调以 retired 报告，离开 order 堆。
+ * r->complete 恒为 true，调用方可以丢掉自己关于该 cpu 的状态。
+ */
+```
+
+删除之后 `perf_evsel__cpus()` 返回去掉该 cpu 的快照。之后再加线程，新线程不会在该 cpu 上开 fd；
+同一 cpu 可以再次 `perf_evlist__add_cpu()`。
+
+#### 增删 evsel：运行中加入一组事件，用完删除
+
+把一个 leader 与它的组成员加入已打开的 evlist。两者都跟随 evlist 的 cpu 与线程，所以用 evlist 中
+已有 evsel 的当前集合打开（7.7）：
+
+```c
+struct perf_evsel *base = perf_evlist__next(evlist, NULL);   /* 跟随 evlist 的 evsel */
+struct perf_cpu_map *cpus = perf_evsel__cpus(base);          /* 增删 cpu 之后是快照 */
+struct perf_thread_map *threads = perf_evsel__threads(base);
+struct perf_evsel *leader, *member;
+
+/* 1. 打开：disabled 打开，加入时再 enable。成员不在 evlist 里时按自己的 attr.disabled 打开（7.7）。 */
+attr.disabled = 1;
+member_attr.disabled = 1;
+leader = perf_evsel__new(&attr);
+member = perf_evsel__new(&member_attr);
+if (perf_evsel__open(leader, cpus, threads) < 0)
+	goto out_delete;
+/* 2. 可选：过滤器、BPF 程序。之后加入的线程、cpu 的新 fd 也会补上。 */
+perf_evsel__apply_filter(leader, filter);
+/* 3. 加入：leader 先加入，成员才能以它为组 leader。 */
+if (perf_evlist__add_evsel(evlist, leader) < 0)
+	goto out_close;   /* 已移出 evlist，evsel 仍由调用方关闭 */
+if (perf_evsel__set_leader(member, leader) < 0 ||   /* 必须在 open 之前 */
+    perf_evsel__open(member, cpus, threads) < 0 ||
+    perf_evlist__add_evsel(evlist, member) < 0)
+	goto out_del_leader;
+/*
+ * fd 按 (c,t) 落入已有的 ring，sample id 已登记，事件与原有事件在同一个
+ * order 堆里排序。之后的 perf_evlist__add_cpu()/add_thread() 也驱动它们。
+ */
+```
+
+删除时先删组成员：成员在 `perf_evlist__reap_done()` 才退出组（7.8），在此之前它的 fd 仍以 leader
+的 fd 为组 leader，删除 leader 返回 `-EBUSY`。所以成员要完整走完停止 → 收割 → 完成，再删 leader：
+
+```c
+const struct perf_evlist_reap *r;
+
+/* 成员：停止 + 收割，r->type == PERF_EVLIST_REAP__EVSEL，r->evsel == member */
+perf_evlist__del_evsel(evlist, member, &r);
+reap(evlist, r);                /* 完成：移出 evlist、退出组，fd 仍打开 */
+perf_evsel__close(member);
+perf_evsel__delete(member);     /* 私有数据经 destructor 在此释放 */
+
+/* leader：已不再领着任何成员 */
+perf_evlist__del_evsel(evlist, leader, &r);
+reap(evlist, r);                /* 没有其他 writer 的 ring 在此退役，经 del 回调报告 */
+perf_evsel__close(leader);
+perf_evsel__delete(leader);
+```
+
+没有组关系的几个 evsel 可以同时删除：先对每个调用 `perf_evlist__del_evsel()`，读完所有收割的 ring，
+再逐个 `perf_evlist__reap_done()`（7 开头）。
+
+`perf_evlist__reap_done()` 之后 evsel 已不在 evlist 里，sample id 也已注销，不会再有它的事件。
+`perf_evsel__set_priv()` 挂上的私有数据（perf-prof 的 evsel 状态）仍在，`perf_evsel__close()` 也不动它，
+到 `perf_evsel__delete()` 才由 destructor 释放。
+
 ---
 
 ## 8 与 perf-prof 的接口
