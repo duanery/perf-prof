@@ -30,6 +30,7 @@ LIBPERF_API int perf_evsel__open(struct perf_evsel *evsel, struct perf_cpu_map *
 				 struct perf_thread_map *threads);
 LIBPERF_API void perf_evsel__close(struct perf_evsel *evsel);
 LIBPERF_API void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu);
+LIBPERF_API void perf_evsel__close_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__mmap(struct perf_evsel *evsel, int pages);
 LIBPERF_API void perf_evsel__munmap(struct perf_evsel *evsel);
 LIBPERF_API void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, pid_t tid);
@@ -38,13 +39,16 @@ LIBPERF_API int perf_evsel__read(struct perf_evsel *evsel, int cpu, pid_t tid,
 				 struct perf_counts_values *count);
 LIBPERF_API int perf_evsel__enable(struct perf_evsel *evsel);
 LIBPERF_API int perf_evsel__enable_cpu(struct perf_evsel *evsel, int cpu);
+LIBPERF_API int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__enable_group(struct perf_evsel *evsel);
 LIBPERF_API int perf_evsel__disable(struct perf_evsel *evsel);
 LIBPERF_API int perf_evsel__disable_cpu(struct perf_evsel *evsel, int cpu);
+LIBPERF_API int perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid);
 LIBPERF_API int perf_evsel__disable_group(struct perf_evsel *evsel);
 LIBPERF_API void perf_evsel__keep_disable(struct perf_evsel *evsel, bool keep_disable);
 LIBPERF_API int perf_evsel__apply_filter(struct perf_evsel *evsel, const char *filter);
 LIBPERF_API int perf_evsel__apply_filter_cpu(struct perf_evsel *evsel, const char *filter, int cpu);
+LIBPERF_API int perf_evsel__apply_filter_thread(struct perf_evsel *evsel, const char *filter, pid_t pid);
 LIBPERF_API int perf_evsel__set_bpf(struct perf_evsel *evsel, unsigned int prog_fd);
 LIBPERF_API void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_cpu_map *own_cpus);
 LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads);

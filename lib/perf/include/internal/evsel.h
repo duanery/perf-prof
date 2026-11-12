@@ -203,9 +203,8 @@ bool perf_evsel__has_cpu(struct perf_evsel *evsel, int cpu);
 void perf_evsel__set_rank(struct perf_evsel *evsel, struct perf_cpu_map *cpus,
 			  struct perf_thread_map *threads);
 int perf_evsel__rank_cmp(struct perf_evsel *a, struct perf_evsel *b);
-int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group);
-void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid);
 int perf_evsel__enable_new_cpu(struct perf_evsel *evsel, int cpu, bool group);
+int perf_evsel__enable_new_thread(struct perf_evsel *evsel, pid_t pid, bool group);
 struct perf_evsel_cpu *perf_evsel__cpu_find(struct perf_evsel *evsel, int cpu);
 
 #endif /* __LIBPERF_INTERNAL_EVSEL_H */

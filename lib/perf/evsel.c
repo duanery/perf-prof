@@ -479,7 +479,7 @@ static int perf_evsel__group_leader(struct perf_evsel *evsel, int cpu, pid_t tid
  *    enabled (attr.disabled = 0) and is switched by the leader. Outside an
  *    evlist the leader may run already, see perf_evsel__set_leader(): it
  *    opens as the evsel says. Fds added to an open evsel open disabled and
- *    are enabled afterwards, see perf_evsel__enable_thread();
+ *    are enabled afterwards, see perf_evsel__enable_new_thread();
  *  - PERF_FLAG_FD_CLOEXEC exists since v3.14; older kernels fail it with
  *    -EINVAL, retry without.
  */
@@ -695,7 +695,11 @@ void perf_evsel__close(struct perf_evsel *evsel)
 	evsel->cpus_snap = NULL;
 }
 
-/* The evsel keeps its reference on the cpu: threads added later still open on it. */
+/*
+ * Close the fds of @cpu, last opened first. The evsel keeps its reference on
+ * the cpu: threads added later still open on it. perf_evsel__del_cpu() drops
+ * it.
+ */
 void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu)
 {
 	struct perf_evsel_cpu *c = perf_evsel__cpu_find(evsel, cpu);
@@ -704,6 +708,22 @@ void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu)
 	if (!c)
 		return;
 	list_for_each_entry_safe_reverse(entry, tmp, &c->fd_list, cpu_node)
+		perf_evsel__close_one(evsel, entry);
+}
+
+/*
+ * Close the fds of @pid, last opened first. The evsel keeps its reference on
+ * the thread: cpus added later still open for it. perf_evsel__del_thread()
+ * drops it.
+ */
+void perf_evsel__close_thread(struct perf_evsel *evsel, pid_t pid)
+{
+	struct perf_evsel_thread *th = perf_evsel__thread_find(evsel, pid, false);
+	struct perf_evsel_fd *entry, *tmp;
+
+	if (!th)
+		return;
+	list_for_each_entry_safe_reverse(entry, tmp, &th->fd_list, thread_node)
 		perf_evsel__close_one(evsel, entry);
 }
 
@@ -823,56 +843,81 @@ int perf_evsel__read(struct perf_evsel *evsel, int cpu, pid_t tid,
 }
 
 /*
- * Run @ioc on the fds of one cpu.
+ * Run @ioc on one fd.
  *
  * Kernel constraint: with PERF_IOC_FLAG_GROUP, ENABLE/DISABLE apply to the
  * group leader of the fd and all its members, whichever fd of the group gets
  * it. So members are skipped: their leader takes them along.
  */
-static int perf_evsel__run_ioctl_cpu(struct perf_evsel_cpu *c, int ioc, void *arg)
+static int perf_evsel__ioctl_one(struct perf_evsel_fd *entry, int ioc, void *arg)
 {
-	struct perf_evsel_fd *entry;
-	int err;
+	if (arg == (void *)PERF_IOC_FLAG_GROUP &&
+	    (ioc == PERF_EVENT_IOC_ENABLE || ioc == PERF_EVENT_IOC_DISABLE) &&
+	    entry->leader)
+		return 0;
 
-	list_for_each_entry(entry, &c->fd_list, cpu_node) {
-		if (arg == (void *)PERF_IOC_FLAG_GROUP &&
-		    (ioc == PERF_EVENT_IOC_ENABLE || ioc == PERF_EVENT_IOC_DISABLE) &&
-		    entry->leader)
-			continue;
-
-		err = ioctl(entry->fd, ioc, arg);
-		if (err)
-			return err;
-	}
-	return 0;
+	return ioctl(entry->fd, ioc, arg);
 }
 
 /* Run @ioc on every fd of the evsel. */
 static int perf_evsel__run_ioctl(struct perf_evsel *evsel, int ioc, void *arg)
 {
+	struct perf_evsel_fd *entry;
 	struct perf_evsel_cpu *c;
 	int err;
 
 	list_for_each_entry(c, &evsel->cpu_list, node) {
-		err = perf_evsel__run_ioctl_cpu(c, ioc, arg);
-		if (err)
-			return err;
+		list_for_each_entry(entry, &c->fd_list, cpu_node) {
+			err = perf_evsel__ioctl_one(entry, ioc, arg);
+			if (err)
+				return err;
+		}
 	}
-
 	return 0;
 }
 
 /* Run @ioc on the fds of @cpu only; nothing to do if the evsel has none there. */
-static int perf_evsel__run_ioctl_on(struct perf_evsel *evsel, int cpu, int ioc, void *arg)
+static int perf_evsel__run_ioctl_cpu(struct perf_evsel *evsel, int cpu, int ioc, void *arg)
 {
 	struct perf_evsel_cpu *c = perf_evsel__cpu_find(evsel, cpu);
+	struct perf_evsel_fd *entry;
+	int err;
 
-	return c ? perf_evsel__run_ioctl_cpu(c, ioc, arg) : 0;
+	if (!c)
+		return 0;
+	list_for_each_entry(entry, &c->fd_list, cpu_node) {
+		err = perf_evsel__ioctl_one(entry, ioc, arg);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+/* Run @ioc on the fds of @pid only; nothing to do if the evsel has none of it. */
+static int perf_evsel__run_ioctl_thread(struct perf_evsel *evsel, pid_t pid, int ioc, void *arg)
+{
+	struct perf_evsel_thread *th = perf_evsel__thread_find(evsel, pid, false);
+	struct perf_evsel_fd *entry;
+	int err;
+
+	if (!th)
+		return 0;
+	list_for_each_entry(entry, &th->fd_list, thread_node) {
+		err = perf_evsel__ioctl_one(entry, ioc, arg);
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
 int perf_evsel__enable_cpu(struct perf_evsel *evsel, int cpu)
 {
-	return perf_evsel__run_ioctl_on(evsel, cpu, PERF_EVENT_IOC_ENABLE, NULL);
+	return perf_evsel__run_ioctl_cpu(evsel, cpu, PERF_EVENT_IOC_ENABLE, NULL);
+}
+
+int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid)
+{
+	return perf_evsel__run_ioctl_thread(evsel, pid, PERF_EVENT_IOC_ENABLE, NULL);
 }
 
 int perf_evsel__enable(struct perf_evsel *evsel)
@@ -910,7 +955,12 @@ int perf_evsel__enable_group(struct perf_evsel *evsel)
 
 int perf_evsel__disable_cpu(struct perf_evsel *evsel, int cpu)
 {
-	return perf_evsel__run_ioctl_on(evsel, cpu, PERF_EVENT_IOC_DISABLE, NULL);
+	return perf_evsel__run_ioctl_cpu(evsel, cpu, PERF_EVENT_IOC_DISABLE, NULL);
+}
+
+int perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid)
+{
+	return perf_evsel__run_ioctl_thread(evsel, pid, PERF_EVENT_IOC_DISABLE, NULL);
 }
 
 int perf_evsel__disable(struct perf_evsel *evsel)
@@ -946,7 +996,12 @@ void perf_evsel__keep_disable(struct perf_evsel *evsel, bool keep_disable)
  */
 int perf_evsel__apply_filter_cpu(struct perf_evsel *evsel, const char *filter, int cpu)
 {
-	return perf_evsel__run_ioctl_on(evsel, cpu, PERF_EVENT_IOC_SET_FILTER, (void *)filter);
+	return perf_evsel__run_ioctl_cpu(evsel, cpu, PERF_EVENT_IOC_SET_FILTER, (void *)filter);
+}
+
+int perf_evsel__apply_filter_thread(struct perf_evsel *evsel, const char *filter, pid_t pid)
+{
+	return perf_evsel__run_ioctl_thread(evsel, pid, PERF_EVENT_IOC_SET_FILTER, (void *)filter);
 }
 
 /*
@@ -1064,26 +1119,6 @@ int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader)
 	return 0;
 }
 
-/* Last opened first, then drop the evsel's reference on the record. */
-static void perf_evsel__close_thread(struct perf_evsel *evsel, struct perf_evsel_thread *th)
-{
-	perf_evsel__threads_changed(evsel);
-	while (!list_empty(&th->fd_list))
-		perf_evsel__close_one(evsel, list_last_entry(&th->fd_list,
-					struct perf_evsel_fd, thread_node));
-	perf_evsel__thread_put(th);
-}
-
-/* Last opened first, then drop the evsel's reference on the record. */
-static void perf_evsel__close_cpu_rec(struct perf_evsel *evsel, struct perf_evsel_cpu *c)
-{
-	perf_evsel__cpus_changed(evsel);
-	while (!list_empty(&c->fd_list))
-		perf_evsel__close_one(evsel, list_last_entry(&c->fd_list,
-					struct perf_evsel_fd, cpu_node));
-	perf_evsel__cpu_put(c);
-}
-
 bool perf_evsel__is_group_leader(struct perf_evsel *evsel, int cpu, pid_t tid)
 {
 	struct perf_evsel_fd *entry = perf_evsel__fd_find(evsel, cpu, tid);
@@ -1100,23 +1135,6 @@ static int perf_evsel__enable_new(struct perf_evsel_fd *entry, bool group)
 	if (ioctl(entry->fd, PERF_EVENT_IOC_ENABLE,
 		  group && !entry->leader ? PERF_IOC_FLAG_GROUP : 0) < 0)
 		return -errno;
-	return 0;
-}
-
-/* Enable the fds of a thread added later, see perf_evsel__enable_new(). */
-int perf_evsel__enable_thread(struct perf_evsel *evsel, pid_t pid, bool group)
-{
-	struct perf_evsel_thread *th = perf_evsel__thread_find(evsel, pid, false);
-	struct perf_evsel_fd *entry;
-	int err;
-
-	if (!th || !evsel->enabled || evsel->keep_disable)
-		return 0;
-	list_for_each_entry(entry, &th->fd_list, thread_node) {
-		err = perf_evsel__enable_new(entry, group);
-		if (err)
-			return err;
-	}
 	return 0;
 }
 
@@ -1137,15 +1155,21 @@ int perf_evsel__enable_new_cpu(struct perf_evsel *evsel, int cpu, bool group)
 	return 0;
 }
 
-void perf_evsel__disable_thread(struct perf_evsel *evsel, pid_t pid)
+/* Enable the fds of a thread added later, see perf_evsel__enable_new(). */
+int perf_evsel__enable_new_thread(struct perf_evsel *evsel, pid_t pid, bool group)
 {
 	struct perf_evsel_thread *th = perf_evsel__thread_find(evsel, pid, false);
 	struct perf_evsel_fd *entry;
+	int err;
 
-	if (!th)
-		return;
-	list_for_each_entry(entry, &th->fd_list, thread_node)
-		ioctl(entry->fd, PERF_EVENT_IOC_DISABLE, 0);
+	if (!th || !evsel->enabled || evsel->keep_disable)
+		return 0;
+	list_for_each_entry(entry, &th->fd_list, thread_node) {
+		err = perf_evsel__enable_new(entry, group);
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
 /*
@@ -1211,19 +1235,19 @@ int perf_evsel__add_thread(struct perf_evsel *evsel, pid_t pid)
 			continue;
 		err = perf_evsel__open_new(evsel, c, t);
 		if (err < 0)
-			goto out_close;
+			goto out_del;
 	}
 
 	if (!(evlist && evlist->adding)) {
-		err = perf_evsel__enable_thread(evsel, pid, false);
+		err = perf_evsel__enable_new_thread(evsel, pid, false);
 		if (err)
-			goto out_close;
+			goto out_del;
 	}
 
 	return 0;
 
-out_close:
-	perf_evsel__close_thread(evsel, t);
+out_del:
+	perf_evsel__del_thread(evsel, pid);
 	return err;
 }
 
@@ -1238,7 +1262,9 @@ int perf_evsel__del_thread(struct perf_evsel *evsel, pid_t pid)
 	if (!th)
 		return -ENOENT;
 
-	perf_evsel__close_thread(evsel, th);
+	perf_evsel__threads_changed(evsel);
+	perf_evsel__close_thread(evsel, pid);
+	perf_evsel__thread_put(th);
 	return 0;
 }
 
@@ -1276,19 +1302,19 @@ int perf_evsel__add_cpu(struct perf_evsel *evsel, int cpu)
 		    !perf_evsel__fd_find(evsel, cpu, t->tid))
 			continue;
 		if (err < 0)
-			goto out_close;
+			goto out_del;
 	}
 
 	if (!(evlist && evlist->adding)) {
 		err = perf_evsel__enable_new_cpu(evsel, cpu, false);
 		if (err)
-			goto out_close;
+			goto out_del;
 	}
 
 	return 0;
 
-out_close:
-	perf_evsel__close_cpu_rec(evsel, c);
+out_del:
+	perf_evsel__del_cpu(evsel, cpu);
 	return err;
 }
 
@@ -1303,7 +1329,9 @@ int perf_evsel__del_cpu(struct perf_evsel *evsel, int cpu)
 	if (!c)
 		return -ENOENT;
 
-	perf_evsel__close_cpu_rec(evsel, c);
+	perf_evsel__cpus_changed(evsel);
+	perf_evsel__close_cpu(evsel, cpu);
+	perf_evsel__cpu_put(c);
 	return 0;
 }
 

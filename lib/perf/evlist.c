@@ -1407,7 +1407,7 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	}
 	/* Open group members before enabling any of the new leaders. */
 	for (pass = 0; pass < nr; pass++) {
-		err = perf_evsel__enable_thread(added[pass], pid, true);
+		err = perf_evsel__enable_new_thread(added[pass], pid, true);
 		if (err)
 			goto out_del;
 	}
