@@ -171,6 +171,11 @@ struct perf_evlist {
 	struct perf_thread_map	*threads_snap;
 	/* perf_evlist__open() until perf_evlist__close(): the maps are fixed. */
 	bool			 opened;
+	/*
+	 * perf_evlist__enable() until perf_evlist__disable(): an evsel joining
+	 * with perf_evlist__add_evsel() is enabled.
+	 */
+	bool			 enabled;
 	int			 rl_file;
 	int			 nr_mmaps;
 	size_t			 mmap_len;

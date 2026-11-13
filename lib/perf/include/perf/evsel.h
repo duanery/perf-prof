@@ -65,7 +65,8 @@ LIBPERF_API void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct pe
  * On each (cpu, tid) @evsel joins the fd of @leader there, and opens alone
  * where @leader has none. Outside an evlist the member fds open with the
  * attr.disabled of @evsel, not enabled to follow @leader: a leader in an open
- * evlist runs already. Open disabled, perf_evlist__add_evsel() enables.
+ * evlist runs already. Open disabled, it is enabled along with the evlist,
+ * see perf_evlist__add_evsel().
  */
 LIBPERF_API int perf_evsel__set_leader(struct perf_evsel *evsel, struct perf_evsel *leader);
 /*

@@ -569,6 +569,15 @@ int perf_evlist__open(struct perf_evlist *evlist)
 	int err = 0, i;
 	struct rlimit rl;
 
+	/*
+	 * An evsel opened already joins with perf_evlist__add_evsel(); one put
+	 * in with perf_evlist__add() would fail to open again. Refuse before
+	 * opening any.
+	 */
+	perf_evlist__for_each_entry(evlist, evsel) {
+		if (evsel->opened && !evsel->joined)
+			return -EBUSY;
+	}
 	if (!perf_evlist__cpus(evlist) && evlist->cpus_changed)
 		return -ENOMEM;
 	if (!perf_evlist__threads(evlist) && evlist->threads_changed)
@@ -604,6 +613,9 @@ int perf_evlist__open(struct perf_evlist *evlist)
 		goto out_err;
 	}
 	for (i = 0; i < evlist->nr_entries; i++) {
+		/* Joined before the open, see perf_evlist__add_evsel(). */
+		if (order[i]->opened)
+			continue;
 		err = perf_evsel__open(order[i], order[i]->cpus, order[i]->threads);
 		if (err < 0)
 			break;
@@ -637,6 +649,7 @@ void perf_evlist__close(struct perf_evlist *evlist)
 	int i;
 
 	evlist->opened = false;
+	evlist->enabled = false;
 	if (evlist->rl_file > 0 && getrlimit(RLIMIT_NOFILE, &rl) == 0) {
 		rl.rlim_cur -= evlist->rl_file;
 		evlist->rl_file = 0;
@@ -658,6 +671,7 @@ void perf_evlist__enable(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel;
 
+	evlist->enabled = true;
 	perf_evlist__for_each_entry(evlist, evsel)
 		perf_evsel__enable_group(evsel);
 }
@@ -666,6 +680,7 @@ void perf_evlist__disable(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel;
 
+	evlist->enabled = false;
 	perf_evlist__for_each_entry(evlist, evsel)
 		perf_evsel__disable_group(evsel);
 }
@@ -2107,11 +2122,12 @@ static void perf_evlist__cpu_close(struct perf_evlist *evlist, int cpu)
 /*
  * Evsel add / remove.
  *
- * An evsel joins an open evlist as a whole: opened on its own beforehand, see
- * perf_evsel__open() and perf_evsel__set_leader(), and closed by the caller
- * after it left, see perf_evsel__close().
+ * An evsel joins the evlist as a whole, at any stage: opened on its own
+ * beforehand, see perf_evsel__open() and perf_evsel__set_leader(), and closed
+ * by the caller after it left, see perf_evsel__close().
  */
 
+static bool perf_evlist__leads_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel);
 static bool perf_evsel__leads_members(struct perf_evlist *evlist, struct perf_evsel *evsel);
 
 /* Detach the fds of @evsel from the ring buffers, also drops the sample ids. */
@@ -2127,8 +2143,10 @@ static void perf_evlist__evsel_detach(struct perf_evlist *evlist, struct perf_ev
 /*
  * Attach every fd of @evsel to the ring buffer of its binding - the first
  * writer of a binding creates it, see perf_evlist__mmap_attach_fd() - and
- * register the poll fds; then enable it. An evsel that is not mapped yet only
- * gets its sample ids, perf_evlist__mmap() maps it along with the others.
+ * register the poll fds; then enable it if the evlist is enabled, else
+ * perf_evlist__enable() does along with the others. Before perf_evlist__mmap()
+ * it only gets its sample ids, the mmap maps it along with the others; before
+ * perf_evlist__open() not even these, the open skips it and registers them.
  *
  * Kernel constraint: a member joining a running group starts with its next
  * schedule. A group the PMU can no longer fit runs not at all, the leader
@@ -2139,7 +2157,7 @@ int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel)
 	struct perf_evsel_fd *entry;
 	int err;
 
-	if (!evlist->opened || !evsel->opened)
+	if (!evsel->opened)
 		return -EINVAL;
 	if (evsel->evlist)
 		return -EBUSY;
@@ -2149,13 +2167,15 @@ int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel)
 
 	perf_evlist__add(evlist, evsel);
 	evsel->joined = true;
+	if (!evlist->opened)
+		return 0;
 	evsel->mmaped = evlist->mmaped;
 	perf_evsel__for_each_fd(evsel, entry) {
 		err = perf_evlist__mmap_attach_fd(evlist, entry);
 		if (err)
 			goto out_remove;
 	}
-	if (perf_evsel__enable(evsel)) {
+	if (evlist->enabled && perf_evsel__enable(evsel)) {
 		err = -errno;
 		perf_evsel__disable(evsel);
 		goto out_remove;
@@ -2174,7 +2194,9 @@ out_remove:
  *  - PERF_EVENT_IOC_DISABLE returns once the event is scheduled out, on its
  *    cpu or in its task: it writes nothing afterwards;
  *  - a disabled group leader takes its members off with it: an evsel leading
- *    another one's fds cannot go, -EBUSY. Remove the members first.
+ *    another one's fds cannot go, -EBUSY. Remove the members first. So
+ *    neither can the explicit leader of another evsel, also before the open,
+ *    when there is no fd yet.
  *
  * The fds of the evsel write into two kinds of ring buffers only, of its
  * overwrite mode, see perf_evlist__mmap_attach_fd(): (c,-1) for each of its
@@ -2198,7 +2220,8 @@ int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
 	*reapp = &perf_evlist_reap_none;
 	if (evsel->evlist != evlist)
 		return -EINVAL;
-	if (evsel->del || perf_evsel__leads_members(evlist, evsel))
+	if (evsel->del || perf_evlist__leads_evsel(evlist, evsel) ||
+	    perf_evsel__leads_members(evlist, evsel))
 		return -EBUSY;
 	list_for_each_entry(c, &evsel->cpu_list, node)
 		nr++;
@@ -2466,6 +2489,18 @@ void perf_evlist__set_leader(struct perf_evlist *evlist)
 		evsel->leader = evsel;
 		evsel->nr_members = 1;
 	}
+}
+
+/* Whether @evsel is the explicit leader of another evsel of the evlist. */
+static bool perf_evlist__leads_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel)
+{
+	struct perf_evsel *pos;
+
+	perf_evlist__for_each_entry(evlist, pos) {
+		if (pos != evsel && pos->leader == evsel)
+			return true;
+	}
+	return false;
 }
 
 /* Whether some fd of @evsel leads a group with members. */

@@ -163,29 +163,37 @@ LIBPERF_API int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,
 				     const struct perf_evlist_reap **reap);
 
 /*
- * Add/remove an evsel on an open evlist, as a whole. Adding goes:
+ * Add/remove an evsel, as a whole, at any stage: before perf_evlist__open(),
+ * before perf_evlist__mmap() or after. Adding goes:
  *
  *  1. perf_evsel__new(), perf_evsel__set_leader() for a group member, and
  *     perf_evsel__open() on the cpu and thread maps of the evsel - with
- *     attr.disabled = 1, it is enabled when it joins;
+ *     attr.disabled = 1, it is enabled with the evlist;
  *  2. optionally perf_evsel__apply_filter(), perf_evsel__set_bpf();
  *  3. perf_evlist__add_evsel(): the evsel joins the evlist, its fds join the
  *     ring buffers of their bindings - creating the missing ones - and the
- *     poll fds are registered; then it is enabled, unless kept disabled.
+ *     poll fds are registered; then it is enabled if the evlist is, see
+ *     perf_evlist__enable(), unless kept disabled. Before the mmap it only
+ *     joins, the mmap maps it; before the open the open skips it.
+ *
+ * Only perf_evlist__add_evsel() adds an opened evsel: perf_evlist__open() of
+ * an evlist holding one put in with perf_evlist__add() fails with -EBUSY.
  *
  * A group leader joins before its members are opened. The evsel follows the
  * evlist threads and cpus unless it has its own maps, see
- * perf_evsel__set_own_cpus()/set_own_threads(): open it on the current ones
- * then. In a grouped evlist (perf_evlist__set_leader()) it is grouped by its
- * explicit leader only. The evlist owns it from here on, as with
- * perf_evlist__add(): perf_evlist__delete() deletes it.
+ * perf_evsel__set_own_cpus()/set_own_threads(): open it on
+ * perf_evlist__cpus()/threads() then. In a grouped evlist
+ * (perf_evlist__set_leader()) it is grouped by its explicit leader only. The
+ * evlist owns it from here on, as with perf_evlist__add():
+ * perf_evlist__delete() deletes it.
  *
  * Removing goes stop - reap - done: perf_evlist__del_evsel() disables its fds
  * and reaps the ring buffers they wrote into; perf_evlist__reap_done() takes
  * it out of the evlist with its fds still open; the caller then closes it
- * with perf_evsel__close() and deletes it. -EBUSY: it leads fds of another
- * evsel in the evlist, remove those first; or its removal is in progress.
- * Any evsel of the evlist can be removed, also one there since the open.
+ * with perf_evsel__close() and deletes it. -EBUSY: it is the explicit leader
+ * of another evsel in the evlist, or leads fds of one, remove those first;
+ * or its removal is in progress. Any evsel of the evlist can be removed, also
+ * one there since the open, or one not open yet.
  */
 LIBPERF_API int perf_evlist__add_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel);
 LIBPERF_API int perf_evlist__del_evsel(struct perf_evlist *evlist, struct perf_evsel *evsel,
