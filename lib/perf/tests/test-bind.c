@@ -171,6 +171,15 @@ static int del_thread(struct perf_evlist *evlist, pid_t pid)
 	return nr;
 }
 
+/* Finish a reap at once: true if it is complete and hands out no ring buffer. */
+static bool reap_empty(struct perf_evlist *evlist, const struct perf_evlist_reap *reap)
+{
+	bool empty = reap->complete && !reap->nr_maps;
+
+	perf_evlist__reap_done(evlist, reap);
+	return empty;
+}
+
 /* Drain @map, counting the samples of @pid; needs PERF_SAMPLE_TID first. */
 static int drain_map(struct perf_mmap *map, pid_t pid)
 {
@@ -1909,7 +1918,7 @@ static int test_dynamic_evsels(int id)
 /*
  * Without ring buffers a thread has fds but no thread record: deleting it
  * still closes them. An evsel opened on any thread takes no thread, one on
- * any cpu no cpu: adding is a no-op, deleting finds nothing.
+ * any cpu no cpu: only the follow set does, deleting closes nothing.
  */
 static int test_unmapped_threads(int id)
 {
@@ -1958,7 +1967,10 @@ static int test_unmapped_threads(int id)
 	__T("open an evlist on any thread", !perf_evlist__open(list));
 	__T("an evsel on any thread takes no thread", !perf_evlist__add_thread(list, b.pid) &&
 	    !perf_evsel__has_thread(evsel, b.pid));
-	__T("deleting it finds nothing", perf_evlist__del_thread(list, b.pid, &reap) == -ENOENT &&
+	__T("the set has it", perf_thread_map__idx(perf_evlist__threads(list), b.pid) >= 0);
+	__T("deleting it closes nothing", !perf_evlist__del_thread(list, b.pid, &reap) &&
+	    reap_empty(list, reap));
+	__T("then it is not found", perf_evlist__del_thread(list, b.pid, &reap) == -ENOENT &&
 	    reap->type == PERF_EVLIST_REAP__NONE);
 	perf_evlist__reap_done(list, reap);
 	perf_evlist__delete(list);
@@ -1976,7 +1988,10 @@ static int test_unmapped_threads(int id)
 	__T("open an evlist on any cpu", !perf_evlist__open(list));
 	__T("an evsel on any cpu takes no cpu", !perf_evlist__add_cpu(list, 0) &&
 	    !perf_evsel__has_cpu(evsel, 0));
-	__T("deleting the cpu finds nothing", perf_evlist__del_cpu(list, 0, &reap) == -ENOENT &&
+	__T("the set has it", perf_cpu_map__idx(perf_evlist__cpus(list), 0) >= 0);
+	__T("deleting the cpu closes nothing", !perf_evlist__del_cpu(list, 0, &reap) &&
+	    reap_empty(list, reap));
+	__T("then it is not found", perf_evlist__del_cpu(list, 0, &reap) == -ENOENT &&
 	    reap->type == PERF_EVLIST_REAP__NONE);
 	perf_evlist__reap_done(list, reap);
 	perf_evlist__delete(list);
@@ -1985,6 +2000,286 @@ static int test_unmapped_threads(int id)
 
 	child_stop(&a);
 	child_stop(&b);
+	return 0;
+}
+
+/*
+ * The follow set starts as the maps of perf_evlist__set_maps() and changes at
+ * any stage: before the open the open takes it, after it the evsels opened on
+ * perf_evlist__cpus()/threads() follow it. The maps themselves never change.
+ */
+static int test_follow_set(int id)
+{
+	struct child a = {}, b = {}, c = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID,
+		.disabled = 1, .wakeup_events = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *e1 = perf_evsel__new(&attr), *e2 = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0"), *snap;
+	struct perf_thread_map *threads = perf_thread_map__new_dummy(), *tsnap;
+	struct perf_thread_map *cgroup = perf_thread_map__new_dummy();
+	const struct perf_evlist_reap *reap;
+	int nr;
+
+	__T("start first child", !child_start(&a));
+	__T("start second child", !child_start(&b));
+	__T("start third child", !child_start(&c));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__add(list, e1);
+	__T("set maps", !perf_evlist__set_maps(list, cpus, threads));
+	__T("the set is the maps", perf_evlist__cpus(list) == cpus && perf_evlist__threads(list) == threads);
+
+	/* Before the open: only the set changes. */
+	__T("add a cpu before the open", !perf_evlist__add_cpu(list, 1));
+	snap = perf_evlist__cpus(list);
+	__T("a snapshot of the cpus, ascending", snap && snap != cpus && perf_cpu_map__nr(snap) == 2 &&
+	    perf_cpu_map__cpu(snap, 0) == 0 && perf_cpu_map__cpu(snap, 1) == 1);
+	__T("kept until the next change", perf_evlist__cpus(list) == snap);
+	__T("the map is unchanged", perf_cpu_map__nr(cpus) == 1);
+	__T("adding it again is a no-op", !perf_evlist__add_cpu(list, 1) && perf_evlist__cpus(list) == snap);
+	__T("add a thread before the open", !perf_evlist__add_thread(list, b.pid));
+	tsnap = perf_evlist__threads(list);
+	__T("a snapshot of the threads, in order", tsnap && tsnap != threads &&
+	    perf_thread_map__nr(tsnap) == 2 && perf_thread_map__pid(tsnap, 0) == a.pid &&
+	    perf_thread_map__pid(tsnap, 1) == b.pid);
+	__T("the thread map is unchanged", perf_thread_map__nr(threads) == 1);
+	__T("delete a thread before the open", !perf_evlist__del_thread(list, a.pid, &reap) &&
+	    reap->type == PERF_EVLIST_REAP__THREAD && reap->tid == a.pid && reap_empty(list, reap));
+	tsnap = perf_evlist__threads(list);
+	__T("it left the set", perf_thread_map__nr(tsnap) == 1 && perf_thread_map__pid(tsnap, 0) == b.pid);
+	__T("then it is not found", perf_evlist__del_thread(list, a.pid, &reap) == -ENOENT &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
+	__T("delete a cpu before the open", !perf_evlist__del_cpu(list, 0, &reap) &&
+	    reap->type == PERF_EVLIST_REAP__CPU && reap->cpu == 0 && reap_empty(list, reap));
+	__T("a cpu in neither is not found", perf_evlist__del_cpu(list, 0, &reap) == -ENOENT);
+	perf_evlist__reap_done(list, reap);
+	__T("add it back", !perf_evlist__add_cpu(list, 0));
+
+	/* The open takes the set. */
+	__T("open evlist", !perf_evlist__open(list));
+	__T("opened on the set", perf_evsel__has_cpu(e1, 0) && perf_evsel__has_cpu(e1, 1) &&
+	    perf_evsel__has_thread(e1, b.pid) && !perf_evsel__has_thread(e1, a.pid) &&
+	    e1->nr_fds == 2);
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+
+	/* After it: the set and the fds. */
+	__T("delete cpu 1", !perf_evlist__del_cpu(list, 1, &reap));
+	__T("it left the set at once", perf_cpu_map__nr(perf_evlist__cpus(list)) == 1);
+	perf_evlist__reap_done(list, reap);
+	__T("add thread c", !perf_evlist__add_thread(list, c.pid) && perf_evsel__has_thread(e1, c.pid));
+	__T("pin the third child to cpu 0", !child_pin(&c, 0));
+	__T("open a new evsel on the set", !perf_evsel__open(e2, perf_evlist__cpus(list),
+							     perf_evlist__threads(list)));
+	__T("on cpu 0, threads b and c", perf_evsel__has_cpu(e2, 0) && !perf_evsel__has_cpu(e2, 1) &&
+	    perf_evsel__has_thread(e2, b.pid) && perf_evsel__has_thread(e2, c.pid) && e2->nr_fds == 2);
+	__T("it joins", !perf_evlist__add_evsel(list, e2));
+	child_poke(&c);
+	nr = drain(list, -1);
+	__T("both write", nr == 2);
+
+	/* EPOLLHUP takes the exited thread out of the set. */
+	child_stop(&c);
+	for (nr = 0; nr < 100 && perf_thread_map__idx(perf_evlist__threads(list), c.pid) >= 0; nr++)
+		perf_evlist__poll(list, 10);
+	__T("EPOLLHUP takes it out", perf_thread_map__nr(perf_evlist__threads(list)) == 1 &&
+	    perf_thread_map__pid(perf_evlist__threads(list), 0) == b.pid);
+	__T("its fds wait for the delete", perf_evsel__has_thread(e1, c.pid));
+	__T("the delete closes them", del_thread(list, c.pid) == 0 && !perf_evsel__has_thread(e1, c.pid));
+
+	/* A closed evlist starts over from new maps. */
+	perf_evlist__munmap(list);
+	perf_evlist__close(list);
+	__T("set maps again", !perf_evlist__set_maps(list, cpus, threads));
+	__T("the set is the maps again", perf_evlist__cpus(list) == cpus &&
+	    perf_evlist__threads(list) == threads);
+
+	/* Any cpu, any thread: an empty set, a dummy map once changed. */
+	__T("set any", !perf_evlist__set_maps(list, NULL, NULL));
+	__T("a cpu goes in before the open", !perf_evlist__add_cpu(list, 0) &&
+	    perf_cpu_map__nr(perf_evlist__cpus(list)) == 1 &&
+	    perf_cpu_map__cpu(perf_evlist__cpus(list), 0) == 0);
+	__T("and comes out", !perf_evlist__del_cpu(list, 0, &reap) && reap_empty(list, reap));
+	snap = perf_evlist__cpus(list);
+	__T("an empty set is any cpu", snap && perf_cpu_map__nr(snap) == 1 &&
+	    perf_cpu_map__cpu(snap, 0) == -1);
+	__T("NULL is any thread", list->nr_members == 1 && list->nr_tids == 0);
+	__T("the first thread replaces it", !perf_evlist__add_thread(list, b.pid) &&
+	    perf_thread_map__nr(perf_evlist__threads(list)) == 1 &&
+	    perf_thread_map__pid(perf_evlist__threads(list), 0) == b.pid);
+	__T("a second one joins", !perf_evlist__add_thread(list, c.pid) && list->nr_tids == 2);
+	__T("one goes", !perf_evlist__del_thread(list, b.pid, &reap) && reap_empty(list, reap) &&
+	    perf_thread_map__nr(perf_evlist__threads(list)) == 1);
+	__T("the last one goes", !perf_evlist__del_thread(list, c.pid, &reap) && reap_empty(list, reap));
+	tsnap = perf_evlist__threads(list);
+	__T("any thread is back", tsnap && perf_thread_map__nr(tsnap) == 1 &&
+	    perf_thread_map__pid(tsnap, 0) == -1 && !list->nr_tids);
+	tsnap = perf_thread_map__new_dummy();
+	__T("a dummy map is any thread", !perf_evlist__set_maps(list, NULL, tsnap) &&
+	    list->nr_members == 1 && perf_evlist__threads(list) == tsnap);
+	perf_thread_map__put(tsnap);
+	tsnap = perf_thread_map__realloc(NULL, 2);
+	refcount_set(&tsnap->refcnt, 1);
+	tsnap->nr = 2;
+	perf_thread_map__set_pid(tsnap, 0, -1);
+	perf_thread_map__set_pid(tsnap, 1, a.pid);
+	__T("any thread goes with threads in the map", !perf_evlist__set_maps(list, NULL, tsnap) &&
+	    list->nr_members == 1 && list->nr_tids == 1);
+	perf_thread_map__put(tsnap);
+
+	/* Threads, cgroups and any thread mix; only threads come and go one by one. */
+	tsnap = perf_thread_map__realloc(NULL, 2);
+	refcount_set(&tsnap->refcnt, 1);
+	tsnap->nr = 2;
+	perf_thread_map__set_pid(tsnap, 0, -1);
+	perf_thread_map__set_pid(tsnap, 1, 100);
+	perf_thread_map__pid_cgroup(tsnap, 1);
+	__T("set any thread and a cgroup", !perf_evlist__set_maps(list, cpus, tsnap) &&
+	    list->nr_members == 2 && !list->nr_tids);
+	perf_thread_map__put(tsnap);
+	__T("a thread replaces any thread", !perf_evlist__add_thread(list, b.pid));
+	tsnap = perf_evlist__threads(list);
+	__T("the cgroup and the thread are handed out, in order", perf_thread_map__nr(tsnap) == 2 &&
+	    perf_thread_map__pid(tsnap, 0) == 100 && tsnap->map[0].cgroup &&
+	    perf_thread_map__pid(tsnap, 1) == b.pid && !tsnap->map[1].cgroup);
+	__T("the cgroup is no thread", perf_evlist__del_thread(list, 100, &reap) == -ENOENT);
+	perf_evlist__reap_done(list, reap);
+	__T("the thread goes", !perf_evlist__del_thread(list, b.pid, &reap) && reap_empty(list, reap));
+	tsnap = perf_evlist__threads(list);
+	__T("the cgroup stays, any thread is back", perf_thread_map__nr(tsnap) == 2 &&
+	    tsnap->map[0].cgroup && perf_thread_map__pid(tsnap, 1) == -1 && !tsnap->map[1].cgroup);
+	perf_thread_map__set_pid(cgroup, 0, -1);
+	perf_thread_map__pid_cgroup(cgroup, 0);
+	__T("a cgroup needs its fd", perf_evlist__set_maps(list, cpus, cgroup) == -EINVAL &&
+	    list->nr_members == 2);
+	perf_thread_map__set_pid(cgroup, 0, 100);
+	__T("set the cgroup alone", !perf_evlist__set_maps(list, cpus, cgroup) && list->nr_members == 1);
+	__T("a thread joins it", !perf_evlist__add_thread(list, b.pid) && list->nr_members == 2);
+	__T("without any thread in the map it goes for good",
+	    !perf_evlist__del_thread(list, b.pid, &reap) && reap_empty(list, reap));
+	tsnap = perf_evlist__threads(list);
+	__T("the cgroup alone again", perf_thread_map__nr(tsnap) == 1 && tsnap->map[0].cgroup &&
+	    perf_thread_map__pid(tsnap, 0) == 100);
+	__T("threads only", !perf_evlist__set_maps(list, cpus, threads) && !list->map_any_thread);
+	__T("the last member leaves any thread", !perf_evlist__del_thread(list, a.pid, &reap) &&
+	    reap_empty(list, reap) && list->nr_members == 1 &&
+	    perf_thread_map__pid(perf_evlist__threads(list), 0) == -1);
+
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpus);
+	perf_thread_map__put(threads);
+	perf_thread_map__put(cgroup);
+	child_stop(&a);
+	child_stop(&b);
+	return 0;
+}
+
+/*
+ * Evsels join and leave before the open and before the mmap too: an opened
+ * evsel joins with perf_evlist__add_evsel() only, the open skips it, and it
+ * is enabled along with the evlist.
+ */
+static int test_evsels_before_open(int id)
+{
+	struct child a = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ID,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *leader = perf_evsel__new(&attr), *member = perf_evsel__new(&attr);
+	struct perf_evsel *plain = perf_evsel__new(&attr), *gone = perf_evsel__new(&attr);
+	struct perf_evsel *late = perf_evsel__new(&attr), *stray = perf_evsel__new(&attr);
+	struct perf_cpu_map *cpus = perf_cpu_map__new("0");
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	const struct perf_evlist_reap *reap;
+
+	__T("start child", !child_start(&a));
+	__T("pin the child to cpu 0", !child_pin(&a, 0));
+	perf_thread_map__set_pid(threads, 0, a.pid);
+
+	/* An empty evlist opens, evsels join later. */
+	__T("set maps", !perf_evlist__set_maps(list, cpus, threads));
+	__T("open an empty evlist", !perf_evlist__open(list));
+	perf_evlist__close(list);
+
+	/* Before the open. */
+	__T("open the leader", !perf_evsel__open(leader, perf_evlist__cpus(list),
+						 perf_evlist__threads(list)));
+	__T("it joins before the open", !perf_evlist__add_evsel(list, leader) && leader->joined);
+	__T("no sample id yet", nr_ids(list) == 0);
+	__T("lead the member", !perf_evsel__set_leader(member, leader));
+	__T("open the member", !perf_evsel__open(member, perf_evlist__cpus(list),
+						 perf_evlist__threads(list)));
+	__T("it joins", !perf_evlist__add_evsel(list, member));
+	perf_evlist__add(list, plain);
+	perf_evlist__add(list, gone);
+	__T("the leader cannot go before its member", perf_evlist__del_evsel(list, leader, &reap) == -EBUSY &&
+	    reap->type == PERF_EVLIST_REAP__NONE);
+	perf_evlist__reap_done(list, reap);
+	__T("an unopened evsel goes", !perf_evlist__del_evsel(list, gone, &reap) &&
+	    reap->type == PERF_EVLIST_REAP__EVSEL && reap->evsel == gone);
+	__T("with nothing to reap", reap_empty(list, reap));
+	__T("done takes it out", !gone->evlist && list->nr_entries == 3);
+	perf_evsel__delete(gone);
+
+	/* An opened evsel put in with perf_evlist__add() fails the open up front. */
+	__T("open a stray evsel", !perf_evsel__open(stray, cpus, threads));
+	perf_evlist__add(list, stray);
+	__T("the open refuses it", perf_evlist__open(list) == -EBUSY);
+	__T("before opening any", !plain->opened && !list->opened);
+	perf_evlist__remove(list, stray);
+	perf_evsel__close(stray);
+	perf_evsel__delete(stray);
+
+	__T("open evlist", !perf_evlist__open(list));
+	__T("the joined ones are skipped", leader->nr_fds == 1 && member->nr_fds == 1 &&
+	    perf_evsel__fd_find(member, 0, a.pid)->leader == perf_evsel__fd_find(leader, 0, a.pid));
+	__T("the rest is opened", plain->opened && plain->nr_fds == 1);
+	__T("every sample id is registered", nr_ids(list) == 3);
+
+	/* Before the mmap, and not enabled yet. */
+	__T("open a late evsel", !perf_evsel__open(late, cpus, threads));
+	__T("it joins before the mmap", !perf_evlist__add_evsel(list, late) && nr_ids(list) == 4);
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	child_poke(&a);
+	__T("nothing writes before the enable", drain(list, -1) == 0);
+	perf_evlist__enable(list);
+	child_poke(&a);
+	__T("all write after it", drain(list, -1) == 4);
+
+	/* Removed one by one, the member first. */
+	__T("delete the member", !perf_evlist__del_evsel(list, member, &reap));
+	perf_evlist__reap_done(list, reap);
+	perf_evsel__close(member);
+	perf_evsel__delete(member);
+	__T("then the leader", !perf_evlist__del_evsel(list, leader, &reap));
+	perf_evlist__reap_done(list, reap);
+	perf_evsel__close(leader);
+	perf_evsel__delete(leader);
+	child_poke(&a);
+	__T("the rest still writes", drain(list, -1) == 2);
+
+	/* A disabled evlist keeps a joining evsel disabled. */
+	perf_evlist__disable(list);
+	late = perf_evsel__new(&attr);
+	__T("open another late evsel", !perf_evsel__open(late, cpus, threads));
+	__T("it joins", !perf_evlist__add_evsel(list, late));
+	child_poke(&a);
+	__T("nothing writes while disabled", drain(list, -1) == 0);
+	perf_evlist__enable(list);
+	child_poke(&a);
+	__T("all write again", drain(list, -1) == 3);
+
+	perf_evlist__delete(list);
+	perf_cpu_map__put(cpus);
+	perf_thread_map__put(threads);
+	child_stop(&a);
 	return 0;
 }
 
@@ -2026,6 +2321,8 @@ int test_bind(int argc, char **argv)
 	test_stopped_thread(id);
 	test_dynamic_evsels(id);
 	test_unmapped_threads(id);
+	test_follow_set(id);
+	test_evsels_before_open(id);
 
 	__T_END;
 	return tests_failed == 0 ? 0 : -1;
