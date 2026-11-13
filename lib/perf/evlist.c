@@ -233,7 +233,7 @@ int perf_evlist__open(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel, **order;
 	struct perf_evsel_fd *entry;
-	int err, i;
+	int err = 0, i;
 	struct rlimit rl;
 
 	perf_evlist__propagate_maps(evlist);
