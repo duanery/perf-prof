@@ -1060,7 +1060,7 @@ void perf_evsel__set_own_cpus(struct perf_evsel *evsel, struct perf_cpu_map *own
 	perf_cpu_map__put(evsel->own_cpus);
 	evsel->own_cpus = own_cpus;
 	perf_cpu_map__put(evsel->cpus);
-	evsel->cpus = perf_cpu_map__get(own_cpus ?: (evsel->evlist ? evsel->evlist->user_requested_cpus : NULL));
+	evsel->cpus = perf_cpu_map__get(own_cpus ?: (evsel->evlist ? perf_evlist__cpus(evsel->evlist) : NULL));
 }
 
 void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_map *own_threads)
@@ -1071,7 +1071,7 @@ void perf_evsel__set_own_threads(struct perf_evsel *evsel, struct perf_thread_ma
 	perf_thread_map__put(evsel->own_threads);
 	evsel->own_threads = own_threads;
 	perf_thread_map__put(evsel->threads);
-	evsel->threads = perf_thread_map__get(own_threads ?: (evsel->evlist ? evsel->evlist->user_requested_threads : NULL));
+	evsel->threads = perf_thread_map__get(own_threads ?: (evsel->evlist ? perf_evlist__threads(evsel->evlist) : NULL));
 }
 
 void perf_evsel__set_priv(struct perf_evsel *evsel, void *priv,

@@ -33,14 +33,32 @@ LIBPERF_API void perf_evlist__disable(struct perf_evlist *evlist);
 	     (pos) = perf_evlist__next((evlist), (pos)))
 
 /*
- * The maps every evsel without its own maps opens on. They are fixed from
- * perf_evlist__open() to perf_evlist__close(): -EBUSY in between. Threads
- * come and go one by one with perf_evlist__add_thread()/del_thread(), cpus
- * with perf_evlist__add_cpu()/del_cpu().
+ * The maps every evsel without its own maps opens on; NULL is any cpu, any
+ * thread. They can be set before perf_evlist__open() only, and again after
+ * perf_evlist__close(): -EBUSY in between.
+ *
+ * They start the follow set of the evlist: threads come and go one by one
+ * with perf_evlist__add_thread()/del_thread(), cpus with
+ * perf_evlist__add_cpu()/del_cpu(), at any stage, also before the open; an
+ * exited thread leaves it with its EPOLLHUP, see perf_evlist__hup().
+ * perf_evlist__set_maps() starts it over.
+ *
+ * perf_evlist__cpus()/threads() hand the set out: the maps above while it
+ * did not change, else a snapshot, valid until the next change - take a
+ * reference to keep it; an empty cpu set is a dummy map, any cpu. The thread
+ * map may mix threads, cgroups and any thread (-1), but not any thread and
+ * threads: the first thread added replaces any thread; the last one removed
+ * leaves it back if the map of perf_evlist__set_maps() had it. The thread
+ * set never empties: any thread takes the place of its last member. A cgroup
+ * without its fd (pid < 0): -EINVAL. Open a new evsel on them to follow
+ * the evlist. The set is what is asked for; what an evsel has open is
+ * perf_evsel__cpus()/threads(). NULL on error, or for a NULL map.
  */
 LIBPERF_API int perf_evlist__set_maps(struct perf_evlist *evlist,
 				      struct perf_cpu_map *cpus,
 				      struct perf_thread_map *threads);
+LIBPERF_API struct perf_cpu_map *perf_evlist__cpus(struct perf_evlist *evlist);
+LIBPERF_API struct perf_thread_map *perf_evlist__threads(struct perf_evlist *evlist);
 /*
  * Hand the poll fds over to an external poll loop. libperf decides which fds
  * to poll (one per domain of a ring buffer) and calls @add / @del as they
@@ -94,9 +112,11 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  */
 
 /*
- * Add/remove a thread on every evsel that follows the evlist thread map.
- * Evsels bound to their own thread map (perf_evsel__set_own_threads()) are
- * left alone; drive those with perf_evsel__add_thread() directly.
+ * Add/remove a thread to/from the follow set and on every evsel that follows
+ * it, see perf_evlist__set_maps(). Evsels bound to their own thread map
+ * (perf_evsel__set_own_threads()) are left alone; drive those with
+ * perf_evsel__add_thread() directly. Before perf_evlist__open() only the set
+ * changes, the open takes it from there.
  *
  * A thread goes away on two signals that may come in either order: the caller
  * (ptrace) removes it with perf_evlist__del_thread(), and the kernel reports
@@ -112,24 +132,31 @@ LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
  *
  * Until perf_evlist__reap_done() of a complete reap the thread cannot be
  * added or removed again: -EBUSY. Adding it after its EPOLLHUP closes the fds
- * of the exited thread first. perf_evlist__del_thread() of a thread no evsel
- * has: -ENOENT, e.g. all of them are opened on any thread. An error hands out
- * PERF_EVLIST_REAP__NONE. A negative @pid: -EINVAL.
+ * of the exited thread first.
+ *
+ * A thread no evsel takes - not open yet, all opened on any thread - is still
+ * added to the set, 0. perf_evlist__del_thread() of a thread in the set but
+ * without fds: a complete reap without ring buffer. Neither in the set nor in
+ * an evsel: -ENOENT. A negative @pid: -EINVAL. Only threads come and go here,
+ * the cgroups of the set stay. An error hands out PERF_EVLIST_REAP__NONE.
  */
 LIBPERF_API int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid);
 LIBPERF_API int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
 					const struct perf_evlist_reap **reap);
 
 /*
- * Add/remove a cpu on every evsel that follows the evlist cpu map. Evsels
- * bound to their own cpu map (perf_evsel__set_own_cpus()) and system wide
- * evsels are left alone; drive those with perf_evsel__add_cpu() directly.
- * Evsels opened on any cpu (cpu == -1) take no cpu.
+ * Add/remove a cpu to/from the follow set and on every evsel that follows it,
+ * see perf_evlist__set_maps(). Evsels bound to their own cpu map
+ * (perf_evsel__set_own_cpus()) and system wide evsels are left alone; drive
+ * those with perf_evsel__add_cpu() directly. Evsels opened on any cpu
+ * (cpu == -1) take no cpu, the set still does. Before
+ * perf_evlist__open() only the set changes.
  *
  * perf_evlist__del_cpu() stops the fds of @cpu (DISABLE) and reaps the ring
  * buffers they wrote into, the caller reads them to the end; then
  * perf_evlist__reap_done() closes the fds. Until then the cpu cannot be added
- * or removed again: -EBUSY. -ENOENT: no evsel has @cpu.
+ * or removed again: -EBUSY. A cpu in the set without fds: a complete reap
+ * without ring buffer. -ENOENT: neither in the set nor in an evsel.
  */
 LIBPERF_API int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu);
 LIBPERF_API int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,

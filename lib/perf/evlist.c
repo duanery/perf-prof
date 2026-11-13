@@ -36,14 +36,341 @@ void perf_evlist__init(struct perf_evlist *evlist)
 		INIT_HLIST_HEAD(&evlist->mmap_heads[i]);
 	for (i = 0; i < PERF_EVLIST__THREAD_HLIST_SIZE; i++)
 		INIT_HLIST_HEAD(&evlist->thread_heads[i]);
+	INIT_LIST_HEAD(&evlist->member_list);
+	for (i = 0; i < PERF_EVLIST__THREAD_HLIST_SIZE; i++)
+		INIT_HLIST_HEAD(&evlist->member_heads[i]);
 	perf_evlist_poll__init(evlist);
 	perf_evlist__reset_id_hash(evlist);
 }
 
 /*
- * The evlist maps are the default. An evsel that asked for its own cpu or
- * thread map keeps it; the two are independent, an evsel can bind its own cpus
- * and still follow the evlist threads.
+ * The follow set, see perf_evlist::cpu_bits and perf_evlist::member_list.
+ *
+ * The maps of perf_evlist__set_maps() are never changed in place: the evsels
+ * following the evlist opened on them, and the caller may hold them too. A
+ * changed set hands out a snapshot instead.
+ */
+
+static bool perf_evlist__cpu_set_has(struct perf_evlist *evlist, int cpu)
+{
+	return cpu < evlist->nr_cpu_bits && test_bit(cpu, evlist->cpu_bits);
+}
+
+static void perf_evlist__cpus_changed(struct perf_evlist *evlist)
+{
+	evlist->cpus_changed = true;
+	perf_cpu_map__put(evlist->cpus_snap);
+	evlist->cpus_snap = NULL;
+}
+
+/* Make room for @cpu in @bits of @nr bits; the new bits are clear. */
+static int perf_evlist__cpu_bits_grow(unsigned long **bits, int *nr, int cpu)
+{
+	int nr_bits = max(cpu + 1, *nr * 2);
+	size_t old = BITS_TO_LONGS(*nr) * sizeof(long);
+	size_t size = BITS_TO_LONGS(nr_bits) * sizeof(long);
+	unsigned long *new;
+
+	if (cpu < *nr)
+		return 0;
+	new = realloc(*bits, size);
+	if (!new)
+		return -ENOMEM;
+	memset((char *)new + old, 0, size - old);
+	*bits = new;
+	*nr = BITS_TO_LONGS(nr_bits) * BITS_PER_LONG;
+	return 0;
+}
+
+static int perf_evlist__cpu_set_add(struct perf_evlist *evlist, int cpu)
+{
+	int err;
+
+	if (perf_evlist__cpu_set_has(evlist, cpu))
+		return 0;
+	err = perf_evlist__cpu_bits_grow(&evlist->cpu_bits, &evlist->nr_cpu_bits, cpu);
+	if (err)
+		return err;
+	__set_bit(cpu, evlist->cpu_bits);
+	perf_evlist__cpus_changed(evlist);
+	return 0;
+}
+
+static void perf_evlist__cpu_set_del(struct perf_evlist *evlist, int cpu)
+{
+	if (!perf_evlist__cpu_set_has(evlist, cpu))
+		return;
+	__clear_bit(cpu, evlist->cpu_bits);
+	perf_evlist__cpus_changed(evlist);
+}
+
+static int perf_evlist__member_hash(int value)
+{
+	return hash_32((u32)value, PERF_EVLIST__THREAD_HLIST_BITS);
+}
+
+static struct perf_evlist_member *
+perf_evlist__member_find(struct perf_evlist *evlist, int value, bool cgroup)
+{
+	struct perf_evlist_member *m;
+
+	hlist_for_each_entry(m, &evlist->member_heads[perf_evlist__member_hash(value)], hnode) {
+		if (m->cgroup == cgroup && (cgroup ? m->cgroup_fd : m->tid) == value)
+			return m;
+	}
+	return NULL;
+}
+
+static bool perf_evlist_member__tid(struct perf_evlist_member *m)
+{
+	return !m->cgroup && m->tid >= 0;
+}
+
+static void perf_evlist__member_hash_add(struct perf_evlist *evlist, struct perf_evlist_member *m)
+{
+	hlist_add_head(&m->hnode,
+		&evlist->member_heads[perf_evlist__member_hash(m->cgroup ? m->cgroup_fd : m->tid)]);
+}
+
+static void perf_evlist__member_insert(struct perf_evlist *evlist, struct perf_evlist_member *m)
+{
+	list_add_tail(&m->node, &evlist->member_list);
+	perf_evlist__member_hash_add(evlist, m);
+	evlist->nr_members++;
+	evlist->nr_tids += perf_evlist_member__tid(m);
+}
+
+static void perf_evlist__member_free(struct perf_evlist *evlist, struct perf_evlist_member *m)
+{
+	list_del(&m->node);
+	hlist_del(&m->hnode);
+	evlist->nr_members--;
+	evlist->nr_tids -= perf_evlist_member__tid(m);
+	free(m);
+}
+
+static void perf_evlist__threads_changed(struct perf_evlist *evlist)
+{
+	evlist->threads_changed = true;
+	perf_thread_map__put(evlist->threads_snap);
+	evlist->threads_snap = NULL;
+}
+
+/*
+ * A thread, never a cgroup: those come from perf_evlist__set_maps() only.
+ *
+ * Any thread (-1, pid=-1 fds bound to a cpu) stands in for the threads while
+ * there are none: the first thread takes it out, new evsels open on the
+ * threads from then on; the last one leaving may put it back, see
+ * perf_evlist__member_del().
+ */
+static int perf_evlist__thread_set_add(struct perf_evlist *evlist, pid_t pid)
+{
+	struct perf_evlist_member *m;
+
+	if (perf_evlist__member_find(evlist, pid, false))
+		return 0;
+	m = zalloc(sizeof(*m));
+	if (!m)
+		return -ENOMEM;
+	m->tid = pid;
+	perf_evlist__member_insert(evlist, m);
+	m = perf_evlist__member_find(evlist, -1, false);
+	if (m)
+		perf_evlist__member_free(evlist, m);
+	perf_evlist__threads_changed(evlist);
+	return 0;
+}
+
+/*
+ * Take @m, a thread or a cgroup, out of the set. Any thread (-1) takes its
+ * place, in place - nothing to allocate - when it is
+ *  - the last member: the set never empties, no member is any thread;
+ *  - the last thread of a set that started with any thread, see
+ *    perf_evlist::map_any_thread: e.g. (-1),(cg) is back to (cg),(-1).
+ * Otherwise it goes: e.g. (cg) with a thread added is back to (cg).
+ */
+static void perf_evlist__member_del(struct perf_evlist *evlist, struct perf_evlist_member *m)
+{
+	bool last_tid = perf_evlist_member__tid(m) && evlist->nr_tids == 1;
+
+	if (evlist->nr_members > 1 && !(last_tid && evlist->map_any_thread)) {
+		perf_evlist__member_free(evlist, m);
+		return;
+	}
+	hlist_del(&m->hnode);
+	evlist->nr_tids -= perf_evlist_member__tid(m);
+	m->cgroup = false;
+	m->tid = -1;
+	perf_evlist__member_hash_add(evlist, m);
+}
+
+static void perf_evlist__thread_set_del(struct perf_evlist *evlist, pid_t pid)
+{
+	struct perf_evlist_member *m = perf_evlist__member_find(evlist, pid, false);
+
+	if (!m)
+		return;
+	perf_evlist__member_del(evlist, m);
+	perf_evlist__threads_changed(evlist);
+}
+
+static void perf_evlist__set_clear(struct perf_evlist *evlist)
+{
+	struct perf_evlist_member *m, *tmp;
+
+	zfree(&evlist->cpu_bits);
+	evlist->nr_cpu_bits = 0;
+	evlist->cpus_changed = false;
+	perf_cpu_map__put(evlist->cpus_snap);
+	evlist->cpus_snap = NULL;
+	list_for_each_entry_safe(m, tmp, &evlist->member_list, node)
+		perf_evlist__member_free(evlist, m);
+	evlist->threads_changed = false;
+	perf_thread_map__put(evlist->threads_snap);
+	evlist->threads_snap = NULL;
+}
+
+/*
+ * Start the sets over from @cpus and @threads. Any cpu (-1) is no member:
+ * NULL, a dummy map, start an empty cpu set. The thread set takes the thread
+ * map as it is - threads, cgroups and any thread (-1) may mix, e.g. any thread
+ * next to a cgroup - but any thread goes when there are threads, see
+ * perf_evlist__thread_set_add(); NULL and an empty map are any thread.
+ * Whether the map had any thread is kept, see perf_evlist__member_del(). A
+ * cgroup without its fd: -EINVAL. Built aside first: on error the sets stay as they are.
+ */
+static int perf_evlist__set_reset(struct perf_evlist *evlist,
+				  struct perf_cpu_map *cpus,
+				  struct perf_thread_map *threads)
+{
+	struct perf_evlist_member *m, *tmp;
+	unsigned long *bits = NULL;
+	bool has_tid = false, any_thread = false;
+	LIST_HEAD(members);
+	int nr_bits = 0, i, err = -ENOMEM;
+
+	for (i = 0; cpus && i < cpus->nr; i++) {
+		if (cpus->map[i] < 0)
+			continue;
+		if (perf_evlist__cpu_bits_grow(&bits, &nr_bits, cpus->map[i]))
+			goto out_err;
+		__set_bit(cpus->map[i], bits);
+	}
+	for (i = 0; threads && i < threads->nr; i++) {
+		if (threads->map[i].cgroup && threads->map[i].pid < 0) {
+			err = -EINVAL;
+			goto out_err;
+		}
+		m = zalloc(sizeof(*m));
+		if (!m)
+			goto out_err;
+		m->cgroup = threads->map[i].cgroup;
+		if (m->cgroup)
+			m->cgroup_fd = threads->map[i].pid;
+		else
+			m->tid = threads->map[i].pid;
+		has_tid |= perf_evlist_member__tid(m);
+		any_thread |= !m->cgroup && m->tid < 0;
+		list_add_tail(&m->node, &members);
+	}
+	if (list_empty(&members)) {
+		any_thread = true;
+		m = zalloc(sizeof(*m));
+		if (!m)
+			goto out_err;
+		m->tid = -1;
+		list_add_tail(&m->node, &members);
+	}
+
+	perf_evlist__set_clear(evlist);
+	evlist->cpu_bits = bits;
+	evlist->nr_cpu_bits = nr_bits;
+	evlist->map_any_thread = any_thread;
+	list_for_each_entry_safe(m, tmp, &members, node) {
+		list_del(&m->node);
+		/* Also a second any thread. */
+		if (!m->cgroup && m->tid < 0 &&
+		    (has_tid || perf_evlist__member_find(evlist, -1, false)))
+			free(m);
+		else
+			perf_evlist__member_insert(evlist, m);
+	}
+	return 0;
+
+out_err:
+	free(bits);
+	list_for_each_entry_safe(m, tmp, &members, node)
+		free(m);
+	return err;
+}
+
+struct perf_cpu_map *perf_evlist__cpus(struct perf_evlist *evlist)
+{
+	struct perf_cpu_map *map;
+	int cpu, nr = 0;
+
+	if (!evlist->cpus_changed)
+		return evlist->user_requested_cpus;
+	if (evlist->cpus_snap)
+		return evlist->cpus_snap;
+
+	for (cpu = 0; cpu < evlist->nr_cpu_bits; cpu++)
+		nr += test_bit(cpu, evlist->cpu_bits);
+	/* An empty set is any cpu, as a dummy map. */
+	if (!nr) {
+		map = perf_cpu_map__dummy_new();
+		if (!map)
+			return NULL;
+		evlist->cpus_snap = map;
+		return map;
+	}
+	map = malloc(sizeof(*map) + sizeof(int) * nr);
+	if (!map)
+		return NULL;
+	refcount_set(&map->refcnt, 1);
+
+	nr = 0;
+	for (cpu = 0; cpu < evlist->nr_cpu_bits; cpu++) {
+		if (test_bit(cpu, evlist->cpu_bits))
+			map->map[nr++] = cpu;
+	}
+	map->nr = nr;
+	evlist->cpus_snap = map;
+	return map;
+}
+
+struct perf_thread_map *perf_evlist__threads(struct perf_evlist *evlist)
+{
+	struct perf_evlist_member *m;
+	struct perf_thread_map *map;
+	int nr = 0;
+
+	if (!evlist->threads_changed)
+		return evlist->user_requested_threads;
+	if (evlist->threads_snap)
+		return evlist->threads_snap;
+
+	map = perf_thread_map__realloc(NULL, evlist->nr_members ?: 1);
+	if (!map)
+		return NULL;
+	refcount_set(&map->refcnt, 1);
+
+	list_for_each_entry(m, &evlist->member_list, node) {
+		map->map[nr].pid = m->cgroup ? m->cgroup_fd : m->tid;
+		map->map[nr].cgroup = m->cgroup;
+		nr++;
+	}
+	map->nr = nr;
+	evlist->threads_snap = map;
+	return map;
+}
+
+/*
+ * The follow set of the evlist is the default, see perf_evlist__cpus()/
+ * threads(). An evsel that asked for its own cpu or thread map keeps it; the
+ * two are independent, an evsel can bind its own cpus and still follow the
+ * evlist threads.
  *
  * Once the evsel is open both are frozen: they are the input its fds were
  * opened from.
@@ -59,7 +386,7 @@ static void __perf_evlist__propagate_maps(struct perf_evlist *evlist,
 		else if (evsel->own_cpus)
 			cpus = perf_cpu_map__get(evsel->own_cpus);
 		else
-			cpus = perf_cpu_map__get(evlist->user_requested_cpus);
+			cpus = perf_cpu_map__get(perf_evlist__cpus(evlist));
 
 		perf_cpu_map__put(evsel->cpus);
 		evsel->cpus = cpus;
@@ -73,7 +400,7 @@ static void __perf_evlist__propagate_maps(struct perf_evlist *evlist,
 		else if (evsel->own_threads)
 			threads = perf_thread_map__get(evsel->own_threads);
 		else
-			threads = perf_thread_map__get(evlist->user_requested_threads);
+			threads = perf_thread_map__get(perf_evlist__threads(evlist));
 
 		perf_thread_map__put(evsel->threads);
 		evsel->threads = threads;
@@ -154,6 +481,7 @@ static void perf_evlist__purge(struct perf_evlist *evlist)
 
 void perf_evlist__exit(struct perf_evlist *evlist)
 {
+	perf_evlist__set_clear(evlist);
 	perf_cpu_map__put(evlist->user_requested_cpus);
 	perf_thread_map__put(evlist->user_requested_threads);
 	evlist->user_requested_cpus = NULL;
@@ -176,9 +504,14 @@ int perf_evlist__set_maps(struct perf_evlist *evlist,
 			  struct perf_cpu_map *cpus,
 			  struct perf_thread_map *threads)
 {
+	int err;
+
 	/* The fds are laid out along them, see perf_evlist__open(). */
 	if (evlist->opened)
 		return -EBUSY;
+	err = perf_evlist__set_reset(evlist, cpus, threads);
+	if (err)
+		return err;
 
 	/*
 	 * Allow for the possibility that one or another of the maps isn't being
@@ -235,6 +568,11 @@ int perf_evlist__open(struct perf_evlist *evlist)
 	struct perf_evsel_fd *entry;
 	int err = 0, i;
 	struct rlimit rl;
+
+	if (!perf_evlist__cpus(evlist) && evlist->cpus_changed)
+		return -ENOMEM;
+	if (!perf_evlist__threads(evlist) && evlist->threads_changed)
+		return -ENOMEM;
 
 	perf_evlist__propagate_maps(evlist);
 	evlist->opened = true;
@@ -1364,13 +1702,16 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 	if (th && th->hup)
 		perf_evlist__thread_close(evlist, pid);
 
-	/* No evsel takes the thread, e.g. all opened on any thread. */
+	/*
+	 * No evsel takes the thread: not open yet, or all opened on any
+	 * thread. It goes into the set only, the open takes it from there.
+	 */
 	perf_evlist__for_each_entry(evlist, evsel) {
 		if (perf_evlist__needs_thread(evsel, pid))
 			nr++;
 	}
 	if (!nr)
-		return 0;
+		return perf_evlist__thread_set_add(evlist, pid);
 	nr = 0;
 
 	/* In open order; the evsels taking the thread are compacted to the front. */
@@ -1411,6 +1752,9 @@ int perf_evlist__add_thread(struct perf_evlist *evlist, pid_t pid)
 		if (err)
 			goto out_del;
 	}
+	err = perf_evlist__thread_set_add(evlist, pid);
+	if (err)
+		goto out_del;
 	evlist->adding = false;
 	free(added);
 
@@ -1472,7 +1816,8 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
 
 	if (th && th->del)
 		return -EBUSY;
-	if (!th && !perf_evlist__has_thread(evlist, pid))
+	if (!th && !perf_evlist__member_find(evlist, pid, false) &&
+	    !perf_evlist__has_thread(evlist, pid))
 		return -ENOENT;
 	if (th && !th->hup)
 		list_for_each_entry(dom, &th->domain_list, thread_node)
@@ -1485,6 +1830,8 @@ int perf_evlist__del_thread(struct perf_evlist *evlist, pid_t pid,
 	reap->tid = pid;
 	reap->complete = true;
 	*reapp = reap;
+	/* Stopped: no new evsel opens on it any more. */
+	perf_evlist__thread_set_del(evlist, pid);
 	if (!nr) {
 		perf_evlist__thread_close(evlist, pid);
 		return 0;
@@ -1533,6 +1880,8 @@ int perf_evlist__hup(struct perf_evlist *evlist, int fd, const struct perf_evlis
 
 	/* A dying thread needs no replacement hup fd. */
 	th->hup = true;
+	/* New evsels would fail on it with -ESRCH. A reused tid is added again. */
+	perf_evlist__thread_set_del(evlist, th->tid);
 	list_for_each_entry(dom, &th->domain_list, thread_node) {
 		if (!dom->dead)
 			perf_evlist__reap_add(reap, dom->map);
@@ -1609,9 +1958,12 @@ int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu)
 		if (perf_evlist__cpu_evsel(evsel) && !evsel->del && !c)
 			nr++;
 	}
-	/* No evsel takes the cpu, or every one has it already. */
+	/*
+	 * No evsel takes the cpu - not open yet, or all opened on any cpu - or
+	 * every one has it already. It goes into the set only.
+	 */
 	if (!nr)
-		return 0;
+		return perf_evlist__cpu_set_add(evlist, cpu);
 	nr = 0;
 
 	/* In open order; the evsels taking the cpu are compacted to the front. */
@@ -1651,6 +2003,9 @@ int perf_evlist__add_cpu(struct perf_evlist *evlist, int cpu)
 		if (err)
 			goto out_del;
 	}
+	err = perf_evlist__cpu_set_add(evlist, cpu);
+	if (err)
+		goto out_del;
 	evlist->adding = false;
 	free(added);
 
@@ -1695,11 +2050,13 @@ int perf_evlist__del_cpu(struct perf_evlist *evlist, int cpu,
 			return -EBUSY;
 		nr++;
 	}
-	if (!nr)
+	if (!nr && !perf_evlist__cpu_set_has(evlist, cpu))
 		return -ENOENT;
 	reap = perf_evlist__reap_alloc(PERF_EVLIST_REAP__CPU, 2);
 	if (!reap)
 		return -ENOMEM;
+	/* Stopped: no new evsel opens on it any more. */
+	perf_evlist__cpu_set_del(evlist, cpu);
 
 	/* Stop. */
 	perf_evlist__for_each_entry(evlist, evsel) {

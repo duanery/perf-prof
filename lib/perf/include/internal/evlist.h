@@ -64,10 +64,15 @@ struct perf_mmap_domain {
 };
 
 /*
- * Exit state of one thread: EPOLLHUP (@hup) and perf_evlist__del_thread()
- * (@del) may arrive in either order. The first one reaps the ring buffers and
- * sets its flag, the other one is not set then: @del closes the fds on done,
- * @hup keeps them open until perf_evlist__del_thread() closes them.
+ * Exit state of one thread, for the ring buffers it writes into: a task, never
+ * a cgroup, since only a task can HUP. Created with its first task domain,
+ * freed once its removal is done or by perf_evlist__munmap(); not the follow
+ * set, see struct perf_evlist_member.
+ *
+ * EPOLLHUP (@hup) and perf_evlist__del_thread() (@del) may arrive in either
+ * order. The first one reaps the ring buffers and sets its flag, the other one
+ * is not set then: @del closes the fds on done, @hup keeps them open until
+ * perf_evlist__del_thread() closes them.
  */
 struct perf_evlist_thread {
 	pid_t			 tid;
@@ -76,6 +81,26 @@ struct perf_evlist_thread {
 	struct perf_mmap_domain	*hup_domain;   /* registered for its EPOLLHUP */
 	struct list_head	 domain_list;  /* perf_mmap_domain::thread_node */
 	struct hlist_node	 hnode;        /* perf_evlist::thread_heads */
+};
+
+/*
+ * One entry of the thread follow set, see perf_evlist::member_list: a thread,
+ * any thread (@tid -1), or a cgroup of the thread map
+ * (perf_thread_map__pid_cgroup()), as the pid argument of perf_event_open()
+ * takes any of them; the set may mix them. perf_evlist__add_thread()/
+ * del_thread() add and remove threads only. Only what the evsels
+ * following the evlist open on, from perf_evlist__set_maps() on, open or not:
+ * no fd, no ring buffer, no exit state - those are in struct
+ * perf_evlist_thread.
+ */
+struct perf_evlist_member {
+	union {
+		pid_t		 tid;          /* !@cgroup, -1: any thread */
+		int		 cgroup_fd;    /* @cgroup */
+	};
+	bool			 cgroup;
+	struct list_head	 node;         /* perf_evlist::member_list */
+	struct hlist_node	 hnode;        /* perf_evlist::member_heads */
 };
 
 struct perf_evlist_poll {
@@ -95,10 +120,8 @@ struct perf_evlist {
 	int			 nr_entries;
 	bool			 needs_map_propagation;
 	/*
-	 * The maps the evlist is opened with, set by perf_evlist__set_maps():
-	 * the default of every evsel without its own maps, see
-	 * __perf_evlist__propagate_maps(). Fixed from perf_evlist__open() to
-	 * perf_evlist__close(), see @opened.
+	 * The maps set by perf_evlist__set_maps(), only before
+	 * perf_evlist__open(), see @opened.
 	 *
 	 * @user_requested_cpus: the cpus passed from the command line or all
 	 * online CPUs by default.
@@ -107,6 +130,45 @@ struct perf_evlist {
 	 */
 	struct perf_cpu_map	*user_requested_cpus;
 	struct perf_thread_map	*user_requested_threads;
+	/*
+	 * The follow set: the cpus and threads the evsels without their own
+	 * maps open on, see perf_evlist__cpus()/threads(). It starts as the
+	 * maps above, perf_evlist__add_cpu()/del_cpu()/add_thread()/
+	 * del_thread() change it at any stage, EPOLLHUP takes an exited
+	 * thread out. It is what is asked for, not what is open: the evsels
+	 * hold that in their records.
+	 *
+	 * Cpus in a bitmap, grown as needed: small and dense, kept in
+	 * ascending order for free. Any cpu (-1) is no member: an empty set
+	 * stands for it.
+	 *
+	 * Threads, cgroups and any thread (-1) in a list in the order they
+	 * came, the map's first, hashed for the lookup: sparse up to pid_max.
+	 * Any thread and cgroups may go together, any thread and threads not:
+	 * @nr_tids counts the threads (tid >= 0, not the cgroups), any thread
+	 * leaves when it goes above 0. It comes back when it drops to 0 if
+	 * @map_any_thread, the map of perf_evlist__set_maps() had any thread
+	 * (NULL and an empty map do); and when the last member goes, the set
+	 * never empties. See perf_evlist__member_del().
+	 *
+	 * Whether an open evsel takes a cpu or thread added later is up to
+	 * it, see perf_evsel::any_cpu/any_thread.
+	 *
+	 * @cpus_changed/@threads_changed: a set no longer matches its map;
+	 * @cpus_snap/@threads_snap are built from it on demand, dropped with
+	 * the next change.
+	 */
+	unsigned long		*cpu_bits;
+	int			 nr_cpu_bits;
+	bool			 cpus_changed;
+	struct perf_cpu_map	*cpus_snap;
+	struct list_head	 member_list;  /* perf_evlist_member::node */
+	struct hlist_head	 member_heads[PERF_EVLIST__THREAD_HLIST_SIZE];  /* perf_evlist_member::hnode */
+	int			 nr_members;
+	int			 nr_tids;
+	bool			 map_any_thread;
+	bool			 threads_changed;
+	struct perf_thread_map	*threads_snap;
 	/* perf_evlist__open() until perf_evlist__close(): the maps are fixed. */
 	bool			 opened;
 	int			 rl_file;
