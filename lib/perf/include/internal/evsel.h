@@ -98,6 +98,8 @@ struct perf_evsel_fd {
 	struct list_head	 cpu_node;     /* perf_evsel_cpu::fd_list */
 	struct list_head	 thread_node;  /* perf_evsel_thread::fd_list */
 	struct hlist_node	 hnode;        /* perf_evsel::fd_heads */
+	/* perf_evsel__set_fd_priv(): perf_evsel::fd_priv_size bytes, zeroed. */
+	u64			 priv[];
 };
 
 struct perf_evsel {
@@ -142,6 +144,8 @@ struct perf_evsel {
 	/* perf_evsel__set_priv() */
 	void			*priv;
 	void			(*priv_destructor)(void *priv);
+	/* The size of perf_evsel_fd::priv, see perf_evsel__set_fd_priv(). */
+	size_t			 fd_priv_size;
 	bool			 keep_disable;
 	bool			 init_enabled;
 	/*
@@ -196,8 +200,6 @@ struct perf_evsel_fd *__perf_evsel__fd_find(struct perf_evsel *evsel, int cpu,
 					    pid_t tid, bool cgroup);
 struct perf_evsel_thread *perf_evsel__thread_find(struct perf_evsel *evsel,
 						  pid_t tid, bool cgroup);
-/* Any fd at (@cpu, @tid), the cgroup flag aside. */
-struct perf_evsel_fd *perf_evsel__fd_find(struct perf_evsel *evsel, int cpu, pid_t tid);
 bool perf_evsel__has_thread(struct perf_evsel *evsel, pid_t pid);
 bool perf_evsel__has_cpu(struct perf_evsel *evsel, int cpu);
 void perf_evsel__set_rank(struct perf_evsel *evsel, struct perf_cpu_map *cpus,

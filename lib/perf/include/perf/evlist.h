@@ -89,6 +89,12 @@ LIBPERF_API int perf_evlist__poll_mmap(struct perf_evlist *evlist, int timeout, 
 LIBPERF_API int perf_evlist__poll(struct perf_evlist *evlist, int timeout);
 LIBPERF_API struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
                                uint64_t id, int *pcpu);
+/*
+ * The fd of a sample id (PERF_SAMPLE_ID, or PERF_FORMAT_ID in a read value),
+ * NULL for an id of no fd of the evlist. Valid until the fd closes.
+ */
+LIBPERF_API struct perf_evsel_fd *perf_evlist__id_to_fd(struct perf_evlist *evlist,
+							 uint64_t id);
 LIBPERF_API int perf_evlist__mmap(struct perf_evlist *evlist, int pages);
 LIBPERF_API void perf_evlist__munmap(struct perf_evlist *evlist);
 

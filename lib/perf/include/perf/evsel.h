@@ -123,8 +123,26 @@ LIBPERF_API uint64_t perf_evsel__get_id(struct perf_evsel *evsel, int cpu, pid_t
 LIBPERF_API int perf_evsel__fd(struct perf_evsel *evsel, int cpu, pid_t tid);
 LIBPERF_API struct perf_evsel_fd *perf_evsel__next_fd(struct perf_evsel *evsel,
 						      struct perf_evsel_fd *prev);
+/* The fd at (@cpu, @tid), the cgroup flag aside; NULL when there is none. */
+LIBPERF_API struct perf_evsel_fd *perf_evsel__fd_find(struct perf_evsel *evsel,
+						      int cpu, pid_t tid);
 LIBPERF_API int perf_evsel_fd__cpu(struct perf_evsel_fd *pos);
 LIBPERF_API pid_t perf_evsel_fd__tid(struct perf_evsel_fd *pos);
+LIBPERF_API struct perf_evsel *perf_evsel_fd__evsel(struct perf_evsel_fd *pos);
+
+/*
+ * Private data of the caller on every fd of the evsel: @size bytes, zeroed
+ * when the fd opens, freed when it closes - also the fds added later with
+ * perf_evsel__add_cpu()/add_thread(). Nothing is called on the free, so keep
+ * plain values there, e.g. the last counter value of the fd to compute the
+ * deltas of PERF_SAMPLE_READ or perf_evsel__read(); find the fd with
+ * perf_evlist__id_to_fd() or perf_evsel__fd_find().
+ *
+ * Set it before the evsel opens: -EBUSY while it has fds. 0 for none, the
+ * default; perf_evsel_fd__priv() is NULL then.
+ */
+LIBPERF_API int perf_evsel__set_fd_priv(struct perf_evsel *evsel, size_t size);
+LIBPERF_API void *perf_evsel_fd__priv(struct perf_evsel_fd *pos);
 
 #define perf_evsel__for_each_fd(evsel, pos)			\
 	for ((pos) = perf_evsel__next_fd((evsel), NULL);	\

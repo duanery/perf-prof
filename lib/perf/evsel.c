@@ -155,6 +155,24 @@ pid_t perf_evsel_fd__tid(struct perf_evsel_fd *pos)
 	return pos->tid;
 }
 
+struct perf_evsel *perf_evsel_fd__evsel(struct perf_evsel_fd *pos)
+{
+	return pos->evsel;
+}
+
+int perf_evsel__set_fd_priv(struct perf_evsel *evsel, size_t size)
+{
+	if (evsel->nr_fds)
+		return -EBUSY;
+	evsel->fd_priv_size = size;
+	return 0;
+}
+
+void *perf_evsel_fd__priv(struct perf_evsel_fd *pos)
+{
+	return pos->evsel->fd_priv_size ? pos->priv : NULL;
+}
+
 static int perf_evsel__thread_hash(pid_t tid)
 {
 	return hash_32((u32)(tid + 1), PERF_EVSEL__THREAD_HLIST_BITS);
@@ -520,7 +538,7 @@ static int perf_evsel__open_one(struct perf_evsel *evsel, struct perf_evsel_cpu 
 			return -errno;
 	}
 
-	entry = zalloc(sizeof(*entry));
+	entry = zalloc(sizeof(*entry) + evsel->fd_priv_size);
 	if (!entry) {
 		close(fd);
 		return -ENOMEM;

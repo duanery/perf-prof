@@ -69,6 +69,10 @@ LIBPERF_0.0.1 {
 		perf_evsel__next_fd;
 		perf_evsel_fd__cpu;
 		perf_evsel_fd__tid;
+		perf_evsel_fd__evsel;
+		perf_evsel__fd_find;
+		perf_evsel__set_fd_priv;
+		perf_evsel_fd__priv;
 		perf_evlist__new;
 		perf_evlist__delete;
 		perf_evlist__open;
@@ -96,6 +100,7 @@ LIBPERF_0.0.1 {
 		perf_evlist__del_evsel;
 		perf_evlist__reap_done;
 		perf_evlist__id_to_evsel;
+		perf_evlist__id_to_fd;
 		perf_evlist__find_mmap;
 		perf_evlist__next_mmap;
 		perf_evlist__set_leader;

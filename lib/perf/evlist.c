@@ -783,6 +783,17 @@ struct perf_evsel *perf_evlist__id_to_evsel(struct perf_evlist *evlist,
     return NULL;
 }
 
+struct perf_evsel_fd *perf_evlist__id_to_fd(struct perf_evlist *evlist, uint64_t id)
+{
+	struct perf_sample_id *sid;
+
+	hlist_for_each_entry(sid, &evlist->id_heads[hash_64(id, PERF_EVLIST__ID_HLIST_BITS)], node) {
+		if (sid->id == id)
+			return container_of(sid, struct perf_evsel_fd, sid);
+	}
+	return NULL;
+}
+
 /*
  * Ring buffer management.
  *
