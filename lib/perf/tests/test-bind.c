@@ -2283,6 +2283,127 @@ static int test_evsels_before_open(int id)
 	return 0;
 }
 
+/* The counters of the fds of PERF_SAMPLE_READ, see test_fd_priv(). */
+struct fd_count {
+	u64 prev;
+	int nr;
+};
+
+/*
+ * Drain every ring buffer, counting the samples on the private data of their
+ * fds, PERF_SAMPLE_READ with PERF_FORMAT_ID: the number of samples whose fd
+ * is unknown or whose counter did not go up by one.
+ */
+static int drain_deltas(struct perf_evlist *evlist)
+{
+	union perf_event *event;
+	struct perf_mmap *map;
+	int bad = 0;
+	bool writable;
+
+	perf_evlist__for_each_mmap(evlist, map, false) {
+		if (perf_mmap__read_init(map) < 0)
+			continue;
+		while ((event = perf_mmap__read_event(map, &writable)) != NULL) {
+			if (event->header.type == PERF_RECORD_SAMPLE) {
+				u64 value = event->sample.array[0];
+				struct perf_evsel_fd *fd = perf_evlist__id_to_fd(evlist, event->sample.array[1]);
+				struct fd_count *c = fd ? perf_evsel_fd__priv(fd) : NULL;
+
+				if (!fd)
+					bad++;
+				else if (c) {
+					if (c->nr && value - c->prev != 1)
+						bad++;
+					c->prev = value;
+					c->nr++;
+				}
+			}
+			perf_mmap__consume(map);
+		}
+		perf_mmap__read_done(map);
+	}
+	return bad;
+}
+
+static struct fd_count *fd_count(struct perf_evsel *evsel, pid_t pid)
+{
+	struct perf_evsel_fd *fd = perf_evsel__fd_find(evsel, -1, pid);
+
+	return fd ? perf_evsel_fd__priv(fd) : NULL;
+}
+
+/*
+ * The private data of the fds: zeroed on every fd as it opens, also the
+ * ones added later, gone with the fd; found from a sample id.
+ */
+static int test_fd_priv(int id)
+{
+	struct child a = {}, b = {};
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT, .config = id, .size = sizeof(attr),
+		.sample_period = 1, .sample_type = PERF_SAMPLE_READ,
+		.read_format = PERF_FORMAT_ID, .disabled = 1, .wakeup_events = 1,
+	};
+	struct perf_evlist *list = perf_evlist__new();
+	struct perf_evsel *counted = perf_evsel__new(&attr), *plain = perf_evsel__new(&attr);
+	struct perf_thread_map *threads = perf_thread_map__new_dummy();
+	struct perf_evsel_fd *fd;
+	struct fd_count *ca, *cb;
+
+	__T("start child a", !child_start(&a));
+	__T("start child b", !child_start(&b));
+	__T("failed to create evlist", list && counted && plain && threads);
+	perf_thread_map__set_pid(threads, 0, a.pid);
+	perf_evlist__set_maps(list, NULL, threads);
+	perf_evlist__add(list, counted);
+	perf_evlist__add(list, plain);
+
+	__T("set before the open", !perf_evsel__set_fd_priv(counted, sizeof(struct fd_count)));
+	__T("open evlist", !perf_evlist__open(list));
+	__T("not once open", perf_evsel__set_fd_priv(counted, 8) == -EBUSY);
+	__T("map evlist", !perf_evlist__mmap(list, 4));
+	perf_evlist__enable(list);
+
+	fd = perf_evsel__fd_find(counted, -1, a.pid);
+	__T("the id finds its fd", fd &&
+	    perf_evlist__id_to_fd(list, perf_evsel__get_id(counted, -1, a.pid)) == fd &&
+	    perf_evsel_fd__evsel(fd) == counted);
+	__T("an unknown id finds none", !perf_evlist__id_to_fd(list, ~0ULL));
+	ca = fd_count(counted, a.pid);
+	__T("zeroed on the open", ca && !ca->prev && !ca->nr);
+	__T("none without a size", !fd_count(plain, a.pid) &&
+	    perf_evsel__fd_find(plain, -1, a.pid));
+
+	child_poke(&a);
+	child_poke(&a);
+	child_poke(&a);
+	__T("a delta of one per sample", !drain_deltas(list) && ca->nr == 3);
+
+	/* A thread added later. */
+	__T("add thread b", !perf_evlist__add_thread(list, b.pid));
+	cb = fd_count(counted, b.pid);
+	__T("its fd is zeroed", cb && cb != ca && !cb->prev && !cb->nr);
+	child_poke(&b);
+	child_poke(&b);
+	__T("each fd counts its own", !drain_deltas(list) && cb->nr == 2 && ca->nr == 3);
+
+	/* Gone with the fd, zeroed again with the next one. */
+	__T("delete thread b", del_thread(list, b.pid) >= 0);
+	__T("its fd is gone", !perf_evsel__fd_find(counted, -1, b.pid));
+	__T("add thread b again", !perf_evlist__add_thread(list, b.pid));
+	cb = fd_count(counted, b.pid);
+	__T("the new fd starts over", cb && !cb->prev && !cb->nr);
+	child_poke(&b);
+	__T("and counts again", !drain_deltas(list) && cb->nr == 1);
+
+	perf_evlist__delete(list);
+	perf_thread_map__put(threads);
+	child_stop(&a);
+	child_stop(&b);
+	return 0;
+}
+
 int test_bind(int argc, char **argv)
 {
 	int id;
@@ -2323,6 +2444,7 @@ int test_bind(int argc, char **argv)
 	test_unmapped_threads(id);
 	test_follow_set(id);
 	test_evsels_before_open(id);
+	test_fd_priv(id);
 
 	__T_END;
 	return tests_failed == 0 ? 0 : -1;
