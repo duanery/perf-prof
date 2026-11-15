@@ -6,13 +6,10 @@
 #include "trace_helpers.h"
 #include "tep.h"
 
+/* Private data of each fd. */
 struct swevent_stat {
     uint64_t count;
     uint64_t diff;
-};
-struct swevent_binding {
-    struct prof_binding binding;
-    struct swevent_stat stat;
 };
 struct evsel_node {
     struct rb_node rbnode;
@@ -21,12 +18,10 @@ struct evsel_node {
     const char *name;
     int name_len;
     bool cpu_idle;
-    struct prof_bindings bindings;
     struct swevent_stat total_stats;
 };
 
 struct percpu_stat_ctx {
-    struct prof_bindings bindings;
     struct evsel_node *first;
     struct evsel_node **p_next;
     struct rblist evsel_list;
@@ -57,7 +52,6 @@ static struct rb_node *evsel_node_new(struct rblist *rlist, const void *new_entr
         e->name = n->name;
         e->name_len = (int)strlen(e->name);
         e->cpu_idle = n->cpu_idle;
-        e->bindings = (struct prof_bindings) { .size = sizeof(struct swevent_binding) };
         e->total_stats = (struct swevent_stat) {};
         *ctx->p_next = e;
         ctx->p_next = &e->next;
@@ -70,7 +64,6 @@ static struct rb_node *evsel_node_new(struct rblist *rlist, const void *new_entr
 static void evsel_node_delete(struct rblist *rblist, struct rb_node *rb_node)
 {
     struct evsel_node *e = container_of(rb_node, struct evsel_node, rbnode);
-    prof_bindings_exit(&e->bindings);
     free(e);
 }
 
@@ -80,8 +73,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx)
         return -1;
     dev->private = ctx;
-
-    ctx->bindings.size = sizeof(struct prof_binding);
 
     ctx->first = NULL;
     ctx->p_next = &ctx->first;
@@ -98,7 +89,6 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     rblist__exit(&ctx->evsel_list);
-    prof_bindings_exit(&ctx->bindings);
     free(ctx);
 }
 
@@ -161,6 +151,7 @@ static void __evsel_name(struct percpu_stat_ctx *ctx, struct perf_evsel *evsel, 
 {
     struct evsel_node n;
     if (evsel) {
+        perf_evsel__set_fd_priv(evsel, sizeof(struct swevent_stat));
         n.evsel = evsel;
         n.name = name;
         n.cpu_idle = cpu_idle;
@@ -222,43 +213,32 @@ static void percpu_stat_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static int percpu_stat_del_thread(struct prof_dev *dev, pid_t tid)
-{
-    struct percpu_stat_ctx *ctx = dev->private;
-    struct evsel_node *e;
-
-    for (e = ctx->first; e; e = e->next)
-        prof_bindings_remove_thread(&e->bindings, tid);
-    prof_bindings_remove_thread(&ctx->bindings, tid);
-    return 0;
-}
-
 static int percpu_stat_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     struct evsel_node n = {.evsel = evsel};
     struct rb_node *rbn = rblist__find(&ctx->evsel_list, &n);
     struct evsel_node *e = rbn ? container_of(rbn, struct evsel_node, rbnode) : NULL;
-    struct swevent_binding *state;
+    struct perf_evsel_fd *fd;
+    struct swevent_stat *stat;
 
     if (e == NULL)
         return 0;
-    if (!prof_binding_get(&ctx->bindings, cpu, tid))
+    fd = perf_evsel__fd_find(evsel, cpu, tid);
+    if (!fd)
         return 0;
-    state = prof_binding_get(&e->bindings, cpu, tid);
-    if (!state)
-        return 0;
+    stat = perf_evsel_fd__priv(fd);
 
-    state->stat.diff = 0;
-    if (count->val > state->stat.count) {
-        state->stat.diff = count->val - state->stat.count;
-        state->stat.count = count->val;
+    stat->diff = 0;
+    if (count->val > stat->count) {
+        stat->diff = count->val - stat->count;
+        stat->count = count->val;
         if (e->cpu_idle) {
             //cpu_idle, contains enter and exit, must be divided by 2
-            state->stat.diff /= 2;
+            stat->diff /= 2;
         }
     }
-    e->total_stats.diff += state->stat.diff;
+    e->total_stats.diff += stat->diff;
     return 0;
 }
 
@@ -266,7 +246,7 @@ static void percpu_stat_interval(struct prof_dev *dev)
 {
     struct percpu_stat_ctx *ctx = dev->private;
     struct evsel_node *next = ctx->first;
-    struct prof_binding *binding;
+    struct perf_evsel_fd *fd;
 
     print_time(stdout);
     printf("\n[CPU] ");
@@ -275,13 +255,18 @@ static void percpu_stat_interval(struct prof_dev *dev)
         next = next->next;
     }
 
-    if (dev->env->perins)
-    prof_bindings_for_each(&ctx->bindings, binding) {
-        printf("\n[%03d] ", binding->cpu >= 0 ? binding->cpu : binding->tid);
+    /* Every evsel follows the evlist: the fds of the first one are the rows. */
+    if (dev->env->perins && ctx->first)
+    perf_evsel__for_each_fd(ctx->first->evsel, fd) {
+        int cpu = perf_evsel_fd__cpu(fd);
+        int tid = perf_evsel_fd__tid(fd);
+
+        printf("\n[%03d] ", cpu >= 0 ? cpu : tid);
         next = ctx->first;
         while (next) {
-            struct swevent_binding *state = prof_binding_find(&next->bindings, binding->cpu, binding->tid);
-            printf("%*lu ", next->name_len, state ? state->stat.diff : 0);
+            struct perf_evsel_fd *pos = perf_evsel__fd_find(next->evsel, cpu, tid);
+            struct swevent_stat *stat = pos ? perf_evsel_fd__priv(pos) : NULL;
+            printf("%*lu ", next->name_len, stat ? stat->diff : 0);
             next = next->next;
         }
     }
@@ -328,7 +313,6 @@ static profiler percpu_stat = {
     .pages = 0,
     .init = percpu_stat_init,
     .deinit = percpu_stat_exit,
-    .del_thread = percpu_stat_del_thread,
     .interval = percpu_stat_interval,
     .read   = percpu_stat_read,
     .sample = percpu_stat_sample,

@@ -10,16 +10,20 @@
 #include <count_helpers.h>
 
 
-struct hrcount_binding {
-    struct prof_binding binding;
+/*
+ * Private data of each fd: the last counter value read. The fd of the leader
+ * also holds the instance, its (cpu, tid): @pos counts its hrtimer periods
+ * from @inited, its first read on.
+ */
+struct hrcount_fd {
+    u64 prev;
     u64 pos;
-    u64 counters[];
+    bool inited;
 };
 
 struct hrcount_ctx {
     struct perf_evsel *leader;
     struct tp_list *tp_list;
-    struct prof_bindings bindings;
     int ins_oncpu;
     struct count_dist *count_dist;
     int hist_size;
@@ -98,7 +102,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
         goto failed;
 
     ctx->ins_oncpu = prof_dev_oncpu(dev);
-    ctx->bindings.size = sizeof(struct hrcount_binding) + (ctx->tp_list->nr_tp + 1) * sizeof(u64);
 
     ctx->rounds = 0;
     ctx->slots = 2;
@@ -149,7 +152,6 @@ static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct hrcount_ctx *ctx = dev->private;
     count_dist_free(ctx->count_dist);
-    prof_bindings_exit(&ctx->bindings);
     if (ctx->pertp_max_len)
         free(ctx->pertp_max_len);
     tp_list_free(ctx->tp_list);
@@ -210,6 +212,7 @@ static int hrcount_init(struct prof_dev *dev)
         goto failed;
     }
     perf_evlist__add(evlist, evsel);
+    perf_evsel__set_fd_priv(evsel, sizeof(struct hrcount_fd));
 
     for_each_real_tp(ctx->tp_list, tp, i) {
         evsel = tp_evsel_new(tp, &tp_attr);
@@ -217,6 +220,7 @@ static int hrcount_init(struct prof_dev *dev)
             goto failed;
         }
         perf_evlist__add(evlist, evsel);
+        perf_evsel__set_fd_priv(evsel, sizeof(struct hrcount_fd));
     }
 
     perf_evlist__set_leader(evlist);
@@ -252,14 +256,16 @@ static void hrcount_sigusr(struct prof_dev *dev, int signum)
 static void hrcount_reset(struct prof_dev *dev)
 {
     struct hrcount_ctx *ctx = dev->private;
-    struct hrcount_binding *state;
+    struct perf_evsel_fd *fd;
     print_time(stdout);
     printf("hrcount reset\n");
     perf_evsel__disable(ctx->leader);
     perf_evsel__enable(ctx->leader);
     count_dist_reset(ctx->count_dist);
-    prof_bindings_for_each(&ctx->bindings, state)
-        state->pos = 0;
+    perf_evsel__for_each_fd(ctx->leader, fd) {
+        struct hrcount_fd *ins = perf_evsel_fd__priv(fd);
+        ins->pos = 0;
+    }
     ctx->rounds = 0;
     ctx->round_nr = 0;
 }
@@ -395,16 +401,22 @@ static void __hrcount_interval(struct prof_dev *dev)
     int len, i;
     u64 print_pos = (ctx->rounds + 1) * ctx->hist_size;
     u64 max_pos = 0;
-    struct hrcount_binding *state;
+    struct perf_evsel_fd *fd;
+    int nr_ins = 0;
 
     // Determine if all instances are complete
-    prof_bindings_for_each(&ctx->bindings, state) {
-        if (state->pos < print_pos)
+    perf_evsel__for_each_fd(ctx->leader, fd) {
+        struct hrcount_fd *ins = perf_evsel_fd__priv(fd);
+
+        if (!ins->inited)
+            continue;
+        if (ins->pos < print_pos)
             return ;
-        if (state->pos > max_pos)
-            max_pos = state->pos;
+        if (ins->pos > max_pos)
+            max_pos = ins->pos;
+        nr_ins++;
     }
-    if (ctx->bindings.nr >= 2 && ctx->hist_size >= 2 &&
+    if (nr_ins >= 2 && ctx->hist_size >= 2 &&
         max_pos - print_pos >= ctx->hist_size/2)
         ctx->need_reset = true;
 
@@ -451,31 +463,76 @@ static void hrcount_interval(struct prof_dev *dev)
     }
 }
 
-static struct hrcount_binding *hrcount_binding(struct prof_dev *dev, int cpu, int tid)
+/* The instance of the leader @fd; it joins at the current round. */
+static struct hrcount_fd *hrcount_ins(struct hrcount_ctx *ctx, struct perf_evsel_fd *fd)
 {
-    struct hrcount_ctx *ctx = dev->private;
-    struct hrcount_binding *state = prof_binding_find(&ctx->bindings, cpu, tid);
+    struct hrcount_fd *ins;
 
-    if (!state) {
-        state = prof_binding_get(&ctx->bindings, cpu, tid);
-        if (state)
-            state->pos = ctx->rounds * ctx->hist_size;
+    if (!fd || perf_evsel_fd__evsel(fd) != ctx->leader)
+        return NULL;
+    ins = perf_evsel_fd__priv(fd);
+    if (!ins->inited) {
+        ins->inited = true;
+        ins->pos = ctx->rounds * ctx->hist_size;
     }
-    return state;
+    return ins;
 }
 
-static int hrcount_del_thread(struct prof_dev *dev, pid_t tid)
+static int hrcount_nr_ins(struct hrcount_ctx *ctx)
+{
+    struct perf_evsel_fd *fd;
+    int nr = 0;
+
+    perf_evsel__for_each_fd(ctx->leader, fd) {
+        struct hrcount_fd *ins = perf_evsel_fd__priv(fd);
+        nr += ins->inited;
+    }
+    return nr;
+}
+
+/*
+ * The group read of a leader: the delta of each counter since its last read
+ * goes to the period @ins is at.
+ */
+struct hrcount_value {
+    u64 value;
+    u64 id;
+};
+
+static void hrcount_group(struct prof_dev *dev, struct hrcount_fd *ins, u64 binding,
+                          u64 nr, struct hrcount_value *ctnr, u64 *cpu_clock)
 {
     struct hrcount_ctx *ctx = dev->private;
-    prof_bindings_remove_thread(&ctx->bindings, tid);
-    return 0;
+    u64 i;
+
+    for (i = 0; i < nr; i++) {
+        struct perf_evsel_fd *fd = perf_evlist__id_to_fd(dev->evlist, ctnr[i].id);
+        struct hrcount_fd *prev;
+        u64 delta;
+        struct tp *tp;
+
+        if (!fd)
+            continue;
+        prev = perf_evsel_fd__priv(fd);
+        delta = ctnr[i].value - prev->prev;
+        prev->prev = ctnr[i].value;
+        if (perf_evsel_fd__evsel(fd) == ctx->leader) {
+            *cpu_clock = delta;
+            if (delta >= ctx->period * 2)
+                ins->pos += delta / ctx->period - 1;
+            continue;
+        }
+        tp = tp_from_evsel(perf_evsel_fd__evsel(fd), ctx->tp_list);
+        if (tp)
+            count_dist_insert(ctx->count_dist, binding, tp->idx, 0, ins->pos, delta);
+    }
 }
 
 static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     u64 binding = prof_binding_key(cpu, tid);
     struct hrcount_ctx *ctx = dev->private;
-    struct hrcount_binding *state = hrcount_binding(dev, cpu, tid);
+    struct hrcount_fd *ins;
     /* PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ */
     struct sample_type_data {
         struct {
@@ -489,48 +546,25 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int cp
         }    cpu_entry;
         struct {
             __u64 nr;
-            struct {
-                __u64 value;
-                __u64 id;
-            } ctnr[0];
+            struct hrcount_value ctnr[0];
         } groups;
     } *data = (void *)event->sample.array;
-    int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter;
-    u64 counter, cpu_clock = 0;
-    u64 i, j;
+    u64 cpu_clock = 0;
     int verbose = dev->env->verbose;
     u64 print_pos = (ctx->rounds + 1) * ctx->hist_size;
 
-    if (!state)
+    /* The leader comes first in the group read. */
+    if (!data->groups.nr)
         return;
-    ins_counter = state->counters;
+    ins = hrcount_ins(ctx, perf_evlist__id_to_fd(dev->evlist, data->groups.ctnr[0].id));
+    if (!ins)
+        return;
 
-    for (i = 0; i < data->groups.nr; i++) {
-        struct perf_evsel *evsel;
-        struct tp *tp;
-        evsel = perf_evlist__id_to_evsel(dev->evlist, data->groups.ctnr[i].id, NULL);
-        if (!evsel)
-            continue;
-        if (evsel == ctx->leader) {
-            cpu_clock = data->groups.ctnr[i].value - ins_counter[n];
-            ins_counter[n] = data->groups.ctnr[i].value;
-            if (cpu_clock >= ctx->period * 2) {
-                state->pos += cpu_clock / ctx->period - 1;
-                verbose = VERBOSE_NOTICE;
-            }
-            continue;
-        }
-        tp = tp_from_evsel(evsel, ctx->tp_list);
-        if (tp) {
-            j = tp->idx;
-            counter = data->groups.ctnr[i].value - ins_counter[j];
-            ins_counter[j] = data->groups.ctnr[i].value;
-            count_dist_insert(ctx->count_dist, binding, j, 0, state->pos, counter);
-        }
-    }
+    hrcount_group(dev, ins, binding, data->groups.nr, data->groups.ctnr, &cpu_clock);
+    if (cpu_clock >= ctx->period * 2)
+        verbose = VERBOSE_NOTICE;
 
-    state->pos ++;
+    ins->pos ++;
 
     if (verbose) {
         if (dev->print_title) prof_dev_print_time(dev, data->time, stdout);
@@ -548,9 +582,9 @@ static void hrcount_sample(struct prof_dev *dev, union perf_event *event, int cp
      * After the perf event is throttled, it needs to wait for a tick to resume.
      * However, tick may be closed by nohz. It takes a long time to be unthrottled.
     **/
-    if (state->pos >= print_pos) {
+    if (ins->pos >= print_pos) {
         ctx->round_nr ++;
-        if (ctx->round_nr >= ctx->bindings.nr) {
+        if (ctx->round_nr >= hrcount_nr_ins(ctx)) {
             ctx->round_nr = 0;
             __hrcount_interval(dev);
         }
@@ -634,7 +668,6 @@ static profiler hrcount = {
     .init = hrcount_init,
     .filter = hrcount_filter,
     .deinit = hrcount_exit,
-    .del_thread = hrcount_del_thread,
     .sigusr = hrcount_sigusr,
     .interval = hrcount_interval,
     .sample = hrcount_sample,
@@ -649,50 +682,21 @@ static void stat_help(struct help_ctx *hctx)
 static int stat_read(struct prof_dev *dev, struct perf_evsel *leader, struct perf_counts_values *count, int cpu, int tid)
 {
     struct hrcount_ctx *ctx = dev->private;
-    struct hrcount_binding *state = hrcount_binding(dev, cpu, tid);
-    u64 binding = prof_binding_key(cpu, tid);
+    struct hrcount_fd *ins;
     struct perf_counts {
         u64 nr;
-        struct {
-            u64 value;
-            u64 id;
-        } ctnr[0];
+        struct hrcount_value ctnr[0];
     } *groups = (void *)count;
-    int n = ctx->tp_list->nr_tp;
-    u64 *ins_counter;
-    u64 counter, cpu_clock;
-    u64 i, j;
+    u64 cpu_clock;
 
     if (leader != ctx->leader)
         return 0;
-    if (!state)
+    ins = hrcount_ins(ctx, perf_evsel__fd_find(leader, cpu, tid));
+    if (!ins)
         return 0;
-    ins_counter = state->counters;
 
-    for (i = 0; i < groups->nr; i++) {
-        struct perf_evsel *evsel;
-        struct tp *tp;
-        evsel = perf_evlist__id_to_evsel(dev->evlist, groups->ctnr[i].id, NULL);
-        if (!evsel)
-            continue;
-        if (evsel == ctx->leader) {
-            cpu_clock = groups->ctnr[i].value - ins_counter[n];
-            ins_counter[n] = groups->ctnr[i].value;
-            if (cpu_clock >= ctx->period * 2) {
-                state->pos += cpu_clock / ctx->period - 1;
-            }
-            continue;
-        }
-        tp = tp_from_evsel(evsel, ctx->tp_list);
-        if (tp) {
-            j = tp->idx;
-            counter = groups->ctnr[i].value - ins_counter[j];
-            ins_counter[j] = groups->ctnr[i].value;
-            count_dist_insert(ctx->count_dist, binding, j, 0, state->pos, counter);
-        }
-    }
-
-    state->pos ++;
+    hrcount_group(dev, ins, prof_binding_key(cpu, tid), groups->nr, groups->ctnr, &cpu_clock);
+    ins->pos ++;
     return 1;
 }
 
@@ -732,7 +736,6 @@ static profiler stat = {
     .init = hrcount_init,
     .filter = hrcount_filter,
     .deinit = hrcount_exit,
-    .del_thread = hrcount_del_thread,
     .sigusr = hrcount_sigusr,
     .interval = hrcount_interval,
     .read = stat_read,

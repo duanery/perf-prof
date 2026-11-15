@@ -6,11 +6,16 @@
 #include <linux/string.h>
 #include <stack_helpers.h>
 
+/* The order of the events of each (cpu, tid). */
 struct event_care_binding {
     struct prof_binding binding;
     union perf_event *event;
     u64 evtime;
-    unsigned long counters[];
+};
+
+/* Private data of each fd: the counter of its last sample. */
+struct event_care_fd {
+    u64 counter;
 };
 
 struct event_care_ctx {
@@ -44,7 +49,7 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx->tp_list)
         goto failed;
 
-    ctx->bindings.size = sizeof(struct event_care_binding) + ctx->tp_list->nr_tp * sizeof(unsigned long);
+    ctx->bindings.size = sizeof(struct event_care_binding);
     ctx->bindings.destroy = event_care_binding_free;
 
     if (env->callchain) {
@@ -110,6 +115,7 @@ static int event_care_init(struct prof_dev *dev)
             goto failed;
         }
         perf_evlist__add(dev->evlist, evsel);
+        perf_evsel__set_fd_priv(evsel, sizeof(struct event_care_fd));
     }
 
     return 0;
@@ -200,19 +206,21 @@ static void event_care_sample(struct prof_dev *dev, union perf_event *event, int
     struct event_care_binding *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct tp_list *tp_list = ctx->tp_list;
     struct sample_type_header *hdr = (void *)event->sample.array;
+    struct perf_evsel_fd *fd;
     struct perf_evsel *evsel;
+    struct event_care_fd *prev;
     struct tp *tp = NULL;
-    unsigned long *counters;
     int i;
 
     if (!state)
         return;
 
-    evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
-    if (!evsel) {
+    fd = perf_evlist__id_to_fd(dev->evlist, hdr->id);
+    if (!fd) {
         fprintf(stderr, "failed to find evsel\n");
         return ;
     }
+    evsel = perf_evsel_fd__evsel(fd);
 
     for_each_real_tp(tp_list, tp, i) {
         if (tp->evsel == evsel)
@@ -222,13 +230,13 @@ static void event_care_sample(struct prof_dev *dev, union perf_event *event, int
     return ;
 
 found:
-    counters = &state->counters[tp->idx];
+    prev = perf_evsel_fd__priv(fd);
     // prof_dev_atomic_enable() will discard some events, and counters will no longer be used to detect
     // lost for the first time.
-    if (*counters && hdr->counter - *counters != hdr->period) {
-        fprintf(stderr, "%s:%s lost %lu events\n", tp->sys, tp->name, hdr->counter - *counters - 1);
+    if (prev->counter && hdr->counter - prev->counter != hdr->period) {
+        fprintf(stderr, "%s:%s lost %lu events\n", tp->sys, tp->name, hdr->counter - prev->counter - 1);
     }
-    *counters = hdr->counter;
+    prev->counter = hdr->counter;
 
     if (hdr->time < state->evtime) {
         print_time(stderr);

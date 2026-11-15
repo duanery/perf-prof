@@ -32,8 +32,8 @@ static void *do_split_lock(void *unused) {
 /******************************************************
 split-lock ctx
 ******************************************************/
+/* Private data of each fd. */
 struct lock_info {
-        struct prof_binding binding;
         uint64_t counter; // sample counter
         uint64_t polling; // read
         uint64_t ena;
@@ -42,7 +42,7 @@ struct lock_info {
         uint32_t interval_run;
 };
 struct split_lock_ctx {
-    struct prof_bindings bindings;
+    struct perf_evsel *evsel;
     int print;
     struct callchain_ctx *cc;
     struct key_value_paires *ips;
@@ -55,7 +55,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     if (!ctx)
         return -1;
     dev->private = ctx;
-    ctx->bindings.size = sizeof(struct lock_info);
 
     if (dev->env->callchain) {
         ctx->cc = callchain_ctx_new(callchain_flags(dev, CALLCHAIN_KERNEL | CALLCHAIN_USER), stdout);
@@ -75,7 +74,6 @@ failed:
 static void monitor_ctx_exit(struct prof_dev *dev)
 {
     struct split_lock_ctx *ctx = dev->private;
-    prof_bindings_exit(&ctx->bindings);
     if (ctx->cc)
         callchain_ctx_free(ctx->cc);
     if (ctx->ips)
@@ -94,7 +92,7 @@ static int split_lock_init(struct prof_dev *dev)
         .sample_period = env->trigger_freq,
         .sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ |
                        (env->callchain ? PERF_SAMPLE_CALLCHAIN : 0),
-        .read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
+        .read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID,
         .pinned      = 0,
         .disabled    = 1,
         .exclude_host = env->exclude_host,
@@ -102,6 +100,7 @@ static int split_lock_init(struct prof_dev *dev)
         .exclude_callchain_kernel = exclude_callchain_kernel(dev, CALLCHAIN_KERNEL | CALLCHAIN_USER),
         .wakeup_events = 1,
     };
+    struct split_lock_ctx *ctx;
     struct perf_evsel *evsel;
     pthread_t t;
     int vendor = get_cpu_vendor();
@@ -130,6 +129,7 @@ static int split_lock_init(struct prof_dev *dev)
 
     if (monitor_ctx_init(dev) < 0)
         return -1;
+    ctx = dev->private;
 
     prof_dev_env2attr(dev, &attr);
 
@@ -139,6 +139,8 @@ static int split_lock_init(struct prof_dev *dev)
         goto failed;
     }
     perf_evlist__add(evlist, evsel);
+    perf_evsel__set_fd_priv(evsel, sizeof(struct lock_info));
+    ctx->evsel = evsel;
     return 0;
 
 failed:
@@ -151,17 +153,11 @@ static void split_lock_exit(struct prof_dev *dev)
     monitor_ctx_exit(dev);
 }
 
-static int split_lock_del_thread(struct prof_dev *dev, pid_t tid)
-{
-    struct split_lock_ctx *ctx = dev->private;
-    prof_bindings_remove_thread(&ctx->bindings, tid);
-    return 0;
-}
-
 static int split_lock_read(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid)
 {
     struct split_lock_ctx *ctx = dev->private;
-    struct lock_info *state = prof_binding_get(&ctx->bindings, cpu, tid);
+    struct perf_evsel_fd *fd = perf_evsel__fd_find(evsel, cpu, tid);
+    struct lock_info *state = fd ? perf_evsel_fd__priv(fd) : NULL;
     uint64_t counter = 0;
     uint64_t enabled = 0;
     uint64_t running = 0;
@@ -209,7 +205,7 @@ static void print_ip(void *opaque, struct_key *key, void *value, unsigned int n)
 static void split_lock_interval(struct prof_dev *dev)
 {
     struct split_lock_ctx *ctx = dev->private;
-    struct lock_info *state;
+    struct perf_evsel_fd *fd;
 
     if (ctx->print) {
         print_time(stdout);
@@ -222,9 +218,12 @@ static void split_lock_interval(struct prof_dev *dev)
     }
     if (ctx->print) {
         printf(" CPU  SPLIT_LOCKS  RUN%%\n");
-        prof_bindings_for_each(&ctx->bindings, state) {
+        perf_evsel__for_each_fd(ctx->evsel, fd) {
+            struct lock_info *state = perf_evsel_fd__priv(fd);
+            int cpu = perf_evsel_fd__cpu(fd);
+
             if (state->interval_counter)
-                printf(" %3d  %11lu  %4u\n", state->binding.cpu >= 0 ? state->binding.cpu : state->binding.tid,
+                printf(" %3d  %11lu  %4u\n", cpu >= 0 ? cpu : perf_evsel_fd__tid(fd),
                         state->interval_counter, state->interval_run);
         }
     }
@@ -233,6 +232,7 @@ static void split_lock_interval(struct prof_dev *dev)
 
 // in linux/perf_event.h
 // PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CPU | PERF_SAMPLE_READ
+// read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID
 struct sample_type_data {
     __u64   ip;
     struct {
@@ -247,6 +247,7 @@ struct sample_type_data {
     __u64 counter; //split-lock次数
     __u64 enabled;
     __u64 running;
+    __u64 id;
     struct callchain callchain;
 };
 
@@ -279,8 +280,9 @@ static void split_lock_print_event(struct prof_dev *dev, union perf_event *event
 static void split_lock_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct split_lock_ctx *ctx = dev->private;
-    struct lock_info *state = prof_binding_get(&ctx->bindings, cpu, tid);
     struct sample_type_data *data = (void *)event->sample.array;
+    struct perf_evsel_fd *fd = perf_evlist__id_to_fd(dev->evlist, data->id);
+    struct lock_info *state = fd ? perf_evsel_fd__priv(fd) : NULL;
     uint64_t counter = 0;
     struct misc_ip_key key = {2, event->header.misc, data->ip};
 
@@ -318,7 +320,6 @@ struct monitor split_lock = {
     .pages = 1,
     .init = split_lock_init,
     .deinit = split_lock_exit,
-    .del_thread = split_lock_del_thread,
     .read = split_lock_read,
     .interval = split_lock_interval,
     .print_event = split_lock_print_event,
