@@ -1960,10 +1960,6 @@ int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int
     profiler *prof;
     struct env *env;
 
-    if (event->header.type == PERF_RECORD_SAMPLE && dev->prof->accept &&
-        !dev->prof->accept(dev, event, cpu, tid))
-        return 0;
-
     if (dev->forward.target) {
         // Forward upward.
         if (event->header.type == PERF_RECORD_SAMPLE) {

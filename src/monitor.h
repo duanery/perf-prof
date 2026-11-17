@@ -284,8 +284,6 @@ typedef struct monitor {
 
     // return 0:continue; 1:break;
     int (*read)(struct prof_dev *dev, struct perf_evsel *evsel, struct perf_counts_values *count, int cpu, int tid);
-    /* Runs before both sample() and forwarding, including dynamic PID filters. */
-    bool (*accept)(struct prof_dev *dev, union perf_event *event, int cpu, int tid);
 
     /* PERF_RECORD_* */
 

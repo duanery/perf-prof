@@ -95,7 +95,7 @@ struct task_state_ctx {
         };
     };
     bool dup;
-    /* tids change via ptrace; pid is matched in sample(), not SET_FILTER. */
+    /* tids change via ptrace; pid is matched in ftrace_filter, not SET_FILTER. */
     bool dynamic_threads;
 
     // lost
@@ -323,8 +323,10 @@ static int task_state_init(struct prof_dev *dev)
          */
         if (!env->filter && (env->using_ptrace || env->workload.pid > 0 ||
                              (dev->links.parent &&
-                              dev->links.parent->env->using_ptrace)))
+                              dev->links.parent->env->using_ptrace))) {
             ctx->dynamic_threads = true;
+            dev->ftrace_filter = 1;
+        }
     }
 
     ctx->task_report = TASK_REPORT;
@@ -796,7 +798,12 @@ static void __raw_size(struct prof_dev *dev, union perf_event *event, void **pra
     }
 }
 
-static bool task_state_accept(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+/*
+ * The kernel filter cannot follow the threads (see task_state_init()):
+ * keep the records of the followed threads only, for both sample() and
+ * forwarding. Each evsel checks the pid it is about.
+ */
+static long task_state_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
     struct task_state_ctx *ctx = dev->private;
     struct sample_type_header *data = (void *)event->sample.array;
@@ -804,20 +811,15 @@ static bool task_state_accept(struct prof_dev *dev, union perf_event *event, int
     void *raw;
     int size;
 
-    if (!ctx->dynamic_threads || !ctx->thread_map)
-        return true;
     evsel = perf_evlist__id_to_evsel(dev->evlist, data->id, NULL);
     __raw_size(dev, event, &raw, &size);
-    if (evsel == ctx->sched_switch || evsel == ctx->sched_switch_next) {
-        struct sched_switch *sw = raw;
-        if (evsel == ctx->sched_switch_next)
-            return task_state_tracked(ctx, sw->next_pid);
-        return task_state_tracked(ctx, sw->prev_pid) ||
-               (!ctx->sched_switch_next && task_state_tracked(ctx, sw->next_pid));
-    }
+    if (evsel == ctx->sched_switch)
+        return task_state_tracked(ctx, ((struct sched_switch *)raw)->prev_pid);
+    if (evsel == ctx->sched_switch_next)
+        return task_state_tracked(ctx, ((struct sched_switch *)raw)->next_pid);
     if (evsel == ctx->sched_wakeup || evsel == ctx->sched_wakeup_new)
         return task_state_tracked(ctx, ((struct sched_wakeup *)raw)->pid);
-    return true;
+    return 1;
 }
 
 static inline void __print_callchain(struct prof_dev *dev, union perf_event *event)
@@ -961,7 +963,7 @@ static void task_state_sample(struct prof_dev *dev, union perf_event *event, int
     if (evsel == ctx->sched_switch) {
         sw = &sched_event->sched_switch;
 
-        if (sw->prev_pid > 0 && task_state_tracked(ctx, sw->prev_pid)) {
+        if (sw->prev_pid > 0) {
             tmp.pid = sw->prev_pid;
             rbn = rblist__findnew(&ctx->task_states, &tmp);
             task = rb_entry_safe(rbn, struct task_state_node, rbnode);
@@ -998,7 +1000,7 @@ static void task_state_sample(struct prof_dev *dev, union perf_event *event, int
     } else if (evsel == ctx->sched_switch_next) {
         sw = &sched_event->sched_switch;
 parse_next:
-        if (sw->next_pid > 0 && task_state_tracked(ctx, sw->next_pid)) {
+        if (sw->next_pid > 0) {
             tmp.pid = sw->next_pid;
             rbn = rblist__findnew(&ctx->task_states, &tmp);
             task = rb_entry_safe(rbn, struct task_state_node, rbnode);
@@ -1035,8 +1037,6 @@ parse_next:
     } else if (evsel == ctx->sched_wakeup || evsel == ctx->sched_wakeup_new) {
         struct sched_wakeup *wakeup = &sched_event->sched_wakeup;
 
-        if (!task_state_tracked(ctx, wakeup->pid))
-            goto free_event;
         tmp.pid = wakeup->pid;
         if (ctx->SD)
              rbn = rblist__find(&ctx->task_states, &tmp);
@@ -1163,7 +1163,7 @@ struct monitor task_state = {
     .order = 1,
     .init = task_state_init,
     .filter = task_state_filter,
-    .accept = task_state_accept,
+    .ftrace_filter = task_state_ftrace_filter,
     .add_thread = task_state_add_thread,
     .del_thread = task_state_del_thread,
     .enabled = task_state_enabled,
