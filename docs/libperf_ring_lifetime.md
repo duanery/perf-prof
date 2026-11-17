@@ -867,6 +867,33 @@ perf_evsel__delete(leader);
 `perf_evsel__set_priv()` 挂上的私有数据（perf-prof 的 evsel 状态）仍在，`perf_evsel__close()` 也不动它，
 到 `perf_evsel__delete()` 才由 destructor 释放。
 
+#### 替换 evsel：换一个过滤器
+
+tracepoint 的 fd 只能设置一次过滤器（`SET_FILTER` 再设返回 `-EEXIST`），要换过滤器只能换 evsel。
+先加入新的、再删除旧的，中间没有空窗：
+
+```c
+struct perf_event_attr attr = *perf_evsel__attr(old);
+struct perf_evsel *new;
+
+attr.disabled = 1;
+new = perf_evsel__new(&attr);
+if (perf_evsel__open(new, perf_evlist__cpus(evlist), perf_evlist__threads(evlist)) < 0 ||
+    perf_evsel__apply_filter(new, filter) < 0)
+	goto out_close;
+if (perf_evlist__add_evsel(evlist, new) < 0)    /* 加入即 enable：与 old 同时在写 */
+	goto out_close;
+perf_evlist__del_evsel(evlist, old, &r);         /* old 停止 */
+reap(evlist, r);                                 /* old 写过的 ring 读到末尾，old 的 id 仍能解析 */
+perf_evsel__close(old);
+perf_evsel__delete(old);
+```
+
+`add` 与 `del` 之间两个 evsel 都启用，同时满足两个过滤器的事件写两次：同一个 tracepoint 调用里依次写入
+同一 cpu 的 (c,-1) ring，前后相邻，raw 相同，sample id 与时间（相差几十 ns）不同。调用方按需去重。
+`add` 失败时 old 不受影响。perf-prof 的 `prof_dev_replace_evsel()`（`src/monitor.c`）就是这几步，
+task-state 用它跟随 `--ptrace` 新建的线程。
+
 ### 7.10 跟随集合：任何阶段的增删
 
 evlist 把"集合"与"fd"分开：
@@ -968,7 +995,8 @@ __poll_del(ext, fd, events, map, retired):
 
 堆排序器保证参与排序的所有 ring 上的事件按时间有序。堆持有 ring 的引用：`new_map` 时加入，
 `retired` 时 `order_mmap_del()`。退役发生在完成步骤，此前收割时 ring 还在堆里，`order_drain()` 能
-把它的事件按序读完。ptrace 不操作 order。
+把它的事件按序读完。drain 期间所有 ring 都不做丢失检测：别的 ring 等待 lost_start 事件会让堆停下，
+drain 读不到末尾，被删 writer 的事件留到 id 注销之后。ptrace 不操作 order。
 
 ### 8.3 ptrace
 
