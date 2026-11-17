@@ -2,10 +2,11 @@ CC=gcc
 
 CFLAGS=-Wall -g -O2
 
-SRCS=pthread.c binding-workload.c
+SRCS=pthread.c binding-workload.c task-threads.c
 
 CFLAGS_pthread=-lpthread
 CFLAGS_binding-workload=-lpthread
+CFLAGS_task-threads=-lpthread
 
 OBJS=$(SRCS:.c=.o)
 
