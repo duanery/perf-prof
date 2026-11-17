@@ -887,8 +887,12 @@ void order_process(struct prof_dev *dev, struct perf_mmap *target_map, perfclock
             break;
         }
 
-        // Don't care about the correctness of lost.
-        if (!dev->prof->lost || map == main_dev->order.drain_map || main_dev->inclose)
+        /*
+         * Don't care about the correctness of lost. A drain reads its ring
+         * buffer to the end: waiting for the lost of another one would stop
+         * it short, leaving the events of the removed writers behind.
+         */
+        if (!dev->prof->lost || main_dev->order.drain_map || main_dev->inclose)
             goto skip_lost_detect;
 
         /*                     lost
