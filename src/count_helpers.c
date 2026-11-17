@@ -184,6 +184,19 @@ void count_dist_reset(struct count_dist *dist)
     dist->max = 0;
 }
 
+void count_dist_prune(struct count_dist *dist, bool (*keep)(void *opaque, struct count_node *node), void *opaque)
+{
+    struct rb_node *node, *next;
+
+    if (!dist)
+        return;
+    for (node = rb_first_cached(&dist->dist.entries); node; node = next) {
+        next = rb_next(node);
+        if (!keep(opaque, rb_entry(node, struct count_node, rbn)))
+            rblist__remove_node(&dist->dist, node);
+    }
+}
+
 bool count_dist_empty(struct count_dist *dist)
 {
     if (!dist)
