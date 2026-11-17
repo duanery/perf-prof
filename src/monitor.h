@@ -51,6 +51,7 @@ int prof_dev_oncpu(struct prof_dev *dev);
  */
 int prof_dev_add_thread(struct prof_dev *dev, pid_t pid);
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid);
+int prof_dev_replace_evsel(struct prof_dev *dev, struct perf_evsel *old, struct perf_evsel *new);
 int main_epoll_add(int fd, unsigned int events, void *ptr, handle_event handle);
 int main_epoll_del(int fd);
 

@@ -2180,6 +2180,42 @@ static void prof_dev_reap(struct prof_dev *dev, const struct perf_evlist_reap *r
 }
 
 /*
+ * Replace @old by @new, opened disabled on perf_evlist__cpus() with its filter
+ * set. @new is enabled before @old is stopped, so no event is missed; the
+ * events both write meanwhile are delivered twice, one after the other in the
+ * ring buffer of their cpu. @old is reaped (its ring buffers read to the end,
+ * its sample ids still resolve) and deleted before the return.
+ *
+ * On error @old is left as it was, @new is out of the evlist again, for the
+ * caller to close. -EAGAIN: order is processing events, the ring buffers
+ * cannot be read to the end now; retry outside of event processing.
+ */
+int prof_dev_replace_evsel(struct prof_dev *dev, struct perf_evsel *old, struct perf_evsel *new)
+{
+    const struct perf_evlist_reap *reap;
+    int err;
+
+    if (dev->order.enabled && order_main_dev(dev)->order.inprocess)
+        return -EAGAIN;
+    err = perf_evlist__add_evsel(dev->evlist, new);
+    if (err)
+        return err;
+    err = perf_evlist__del_evsel(dev->evlist, old, &reap);
+    if (err) {
+        perf_evlist__reap_done(dev->evlist, reap);
+        if (perf_evlist__del_evsel(dev->evlist, new, &reap) == 0)
+            prof_dev_reap(dev, reap);
+        else
+            perf_evlist__reap_done(dev->evlist, reap);
+        return err;
+    }
+    prof_dev_reap(dev, reap);
+    perf_evsel__close(old);
+    perf_evsel__delete(old);
+    return 0;
+}
+
+/*
  * Add a new thread to @dev and every child device, which follow the same
  * threads. If a child device fails, the thread is removed from all of them
  * again.
