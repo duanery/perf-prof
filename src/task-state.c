@@ -70,10 +70,22 @@
 #define TASK_REPORT_IDLE  0x80 // kernel 4.14 and later.
 #define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 
-/* Replace the filter of a role once this many records it lets in are dropped. */
+/*
+ * The filters are rebuilt from a timer, by urgency:
+ *  - DROPS: this many records let in are dropped by the tid, the filter lets
+ *    in too much: due at once;
+ *  - ADD_DELAY: no new thread for this long, the open tail is not needed:
+ *    each new thread puts it off (add_due);
+ *  - DEL_DELAY: an exited thread is still let in; ftrace_filter keeps its tid
+ *    off meanwhile: each exit puts it off (del_due), DEL_MAX after the first
+ *    (del_first) at most.
+ * At most once an interval per role: a replacement opens a fd on every cpu.
+ */
 #define TASK_STATE_REFILTER_DROPS     1000
-/* At most once a second per role: a replacement opens a fd on every cpu. */
 #define TASK_STATE_REFILTER_INTERVAL  NSEC_PER_SEC
+#define TASK_STATE_ADD_DELAY          NSEC_PER_SEC
+#define TASK_STATE_DEL_DELAY          (10 * NSEC_PER_SEC)
+#define TASK_STATE_DEL_MAX            (60 * NSEC_PER_SEC)
 /* The records are compared up to this size to find the twins. */
 #define TASK_STATE_TWIN_RAW           128
 
@@ -100,12 +112,19 @@ struct task_state_role {
     bool uncovered;             // a followed thread is not in @ranges
     /*
      * The tail: the filter also lets in the pids allocated from @tail on,
-     * for the threads to come. Opened by a new thread, closed by tightening
-     * when none came since the last build.
+     * for the threads to come. Opened by a new thread not let in, closed by
+     * a rebuild once no new thread came for TASK_STATE_ADD_DELAY.
      */
     bool tail_open;
     int tail;
-    bool added;                 // a new thread since the last build
+    u64 add_due;                // ktime the tail may close, 0: none
+    /* Exited threads let in: ktime the rebuild is due, and of the first exit; 0: none. */
+    u64 del_due, del_first;
+    /*
+     * The filter lets in the followed threads only: no tail, no merged gap,
+     * no thread exited since the build (its tid may be reused).
+     */
+    bool exact;
 };
 
 /* The last record of a role on a cpu, while replacing. */
@@ -146,6 +165,7 @@ struct task_state_ctx {
     int nr_cpus;
     struct task_state_twin *twin; // [nr_cpus][ROLE_MAX]
     struct timer refilter;
+    u64 refilter_at;            // ktime the timer fires, 0: not started
     bool refilter_inited;
     struct prof_dev *dev;
 
@@ -607,6 +627,42 @@ static char *task_state_pid_filter(struct prof_dev *dev, int role, int tail, str
     return filter;
 }
 
+/* No tail, every pid of @ranges a followed thread. */
+static bool task_state_exact(struct task_state_ctx *ctx, const struct pid_ranges *ranges)
+{
+    unsigned long covered = 0;
+    int i;
+
+    for (i = 0; i < ranges->nr; i++) {
+        if (ranges->r[i].hi == INT_MAX)
+            return false;
+        covered += ranges->r[i].hi - ranges->r[i].lo + 1;
+    }
+    return covered == rblist__nr_entries(&ctx->tids.tids);
+}
+
+/*
+ * ftrace_filter is needed while a kernel filter lets in more than the
+ * followed threads, and while replacing, for the twins. Not needed, the
+ * records skip it.
+ */
+static void task_state_ftrace_filter_update(struct prof_dev *dev)
+{
+    struct task_state_ctx *ctx = dev->private;
+    bool need = ctx->replacing;
+    int role;
+
+    for (role = 0; role < ROLE_MAX; role++) {
+        if (ctx->role[role].evsel && !ctx->role[role].exact)
+            need = true;
+    }
+    if (dev->ftrace_filter != need && dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("task-state: ftrace_filter %s\n", need ? "on" : "off");
+    }
+    dev->ftrace_filter = need;
+}
+
 static int task_state_filter(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -648,8 +704,11 @@ static int task_state_filter(struct prof_dev *dev)
         free(r->ranges);
         r->filter = filter;
         r->ranges = ranges;
+        r->exact = ranges && task_state_exact(ctx, ranges);
         r->built = get_ktime_ns();
     }
+    if (ctx->follow)
+        task_state_ftrace_filter_update(dev);
     return err < 0 ? err : 0;
 }
 
@@ -699,12 +758,65 @@ static int task_state_max_tid(struct task_state_ctx *ctx)
     return max;
 }
 
+/* When @r is to be rebuilt, 0: never. The rate limit comes on top. */
+static u64 task_state_role_due(struct task_state_role *r)
+{
+    u64 due = 0;
+
+    if (!r->evsel)
+        return 0;
+    // The most urgent: the earliest.
+    if (r->uncovered || r->dropped >= TASK_STATE_REFILTER_DROPS)
+        due = r->built;
+    if (r->tail_open && r->add_due && (!due || r->add_due < due))
+        due = r->add_due;
+    if (r->del_due && (!due || r->del_due < due))
+        due = r->del_due;
+    if (due && due < r->built + TASK_STATE_REFILTER_INTERVAL)
+        due = r->built + TASK_STATE_REFILTER_INTERVAL;
+    return due;
+}
+
+/* Fire at the first role due, at least 1ms on: 0 stops a timerfd. */
+static void task_state_refilter_schedule(struct task_state_ctx *ctx)
+{
+    u64 now, at = 0;
+    int role;
+
+    for (role = 0; role < ROLE_MAX; role++) {
+        u64 due = task_state_role_due(&ctx->role[role]);
+        if (due && (!at || due < at))
+            at = due;
+    }
+    if (at == ctx->refilter_at)
+        return;
+    ctx->refilter_at = at;
+    if (!at) {
+        timer_cancel(&ctx->refilter);
+        return;
+    }
+    now = get_ktime_ns();
+    timer_start(&ctx->refilter, at > now + NSEC_PER_MSEC ? at - now : NSEC_PER_MSEC, true);
+}
+
+/* @r has a new filter, of @r->ranges: what was due is done. */
+static void task_state_built(struct task_state_ctx *ctx, struct task_state_role *r, int tail)
+{
+    r->dropped = 0;
+    r->uncovered = false;
+    r->tail_open = tail >= 0;
+    r->tail = tail;
+    if (!r->tail_open)
+        r->add_due = 0;
+    r->del_due = r->del_first = 0;
+    r->exact = task_state_exact(ctx, r->ranges);
+}
+
 /*
  * Replace the evsel of @role by one whose filter covers the followed threads
- * now. @tighten: replaced for the records dropped. The tail moves on to the
- * pid allocated last if a thread came since the last build; if none came,
- * the tail closes, the filter lets in the followed threads only. Else the
- * tail is where task_state_add_thread() put it.
+ * now. The tail stays open while new threads come (@add_due ahead), else it
+ * closes. @tighten: replaced for the records dropped, an open tail moves on
+ * to the pid allocated last.
  *
  * On error the old evsel keeps working with its filter.
  */
@@ -719,14 +831,15 @@ static int task_state_refilter(struct prof_dev *dev, int role, bool tighten)
     int tail = r->tail_open ? r->tail : -1;
     int err;
 
-    if (tighten && r->tail_open) {
-        if (r->added) {
+    r->built = get_ktime_ns();
+    if (r->tail_open) {
+        if (!r->add_due || r->add_due <= r->built)
+            tail = -1;
+        else if (tighten) {
             int last = task_state_last_pid();
             tail = (last > 0 ? last : task_state_max_tid(ctx)) + 1;
-        } else
-            tail = -1;
+        }
     }
-    r->built = get_ktime_ns();
     filter = task_state_pid_filter(dev, role, tail, &ranges);
     if (!filter) {
         ctx->stat.replace_failed++;
@@ -736,11 +849,8 @@ static int task_state_refilter(struct prof_dev *dev, int role, bool tighten)
     if (r->filter && !strcmp(filter, r->filter)) {
         free(r->ranges);
         r->ranges = ranges;
-        r->dropped = 0;
-        r->uncovered = false;
-        r->tail_open = tail >= 0;
-        r->tail = tail;
-        r->added = false;
+        task_state_built(ctx, r, tail);
+        task_state_ftrace_filter_update(dev);
         free(filter);
         return 0;
     }
@@ -761,26 +871,26 @@ static int task_state_refilter(struct prof_dev *dev, int role, bool tighten)
 
     memset(ctx->twin, 0, ctx->nr_cpus * ROLE_MAX * sizeof(*ctx->twin));
     ctx->replacing = true;
+    task_state_ftrace_filter_update(dev);
     err = prof_dev_replace_evsel(dev, r->evsel, evsel);
     ctx->replacing = false;
-    if (err < 0)
+    if (err < 0) {
+        task_state_ftrace_filter_update(dev);
         goto out_close;
+    }
 
     r->evsel = evsel;
     free(r->filter);
     free(r->ranges);
     r->filter = filter;
     r->ranges = ranges;
-    r->dropped = 0;
-    r->uncovered = false;
-    r->tail_open = tail >= 0;
-    r->tail = tail;
-    r->added = false;
+    task_state_built(ctx, r, tail);
     ctx->stat.replaced++;
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
         printf("task-state: replace sched:%s filter \"%s\"\n", role_name[role], filter);
     }
+    task_state_ftrace_filter_update(dev);
     return 0;
 
 out_close:
@@ -794,47 +904,28 @@ out_free:
     return err;
 }
 
-/* Fire once a role may be replaced again, at least 1ms on: 0 stops a timerfd. */
-static void task_state_refilter_arm(struct task_state_ctx *ctx, u64 at)
-{
-    u64 now = get_ktime_ns();
 
-    if (timer_started(&ctx->refilter))
-        return;
-    timer_start(&ctx->refilter, at > now + NSEC_PER_MSEC ? at - now : NSEC_PER_MSEC, true);
-}
-
-/*
- * Out of event processing: replace the roles that miss a followed thread or
- * let in too many records of others, each at most once an interval.
- */
+/* Out of event processing: rebuild the roles due, see TASK_STATE_REFILTER_DROPS. */
 static void task_state_refilter_timer(struct timer *timer)
 {
     struct task_state_ctx *ctx = container_of(timer, struct task_state_ctx, refilter);
     struct prof_dev *dev = ctx->dev;
-    u64 now = get_ktime_ns(), next = 0;
+    u64 now = get_ktime_ns();
     int role;
 
     timer_cancel(timer);
+    ctx->refilter_at = 0;
     if (dev->inclose)
         return;
     for (role = 0; role < ROLE_MAX; role++) {
         struct task_state_role *r = &ctx->role[role];
-        u64 at;
+        u64 due = task_state_role_due(r);
 
-        if (!r->evsel || (!r->uncovered && r->dropped < TASK_STATE_REFILTER_DROPS))
-            continue;
-        at = r->built + TASK_STATE_REFILTER_INTERVAL;
-        if (at <= now) {
-            if (task_state_refilter(dev, role, r->dropped >= TASK_STATE_REFILTER_DROPS) == 0)
-                continue;
-            at = r->built + TASK_STATE_REFILTER_INTERVAL;
-        }
-        if (!next || at < next)
-            next = at;
+        // On error the role is due again an interval on.
+        if (due && due <= now)
+            task_state_refilter(dev, role, r->dropped >= TASK_STATE_REFILTER_DROPS);
     }
-    if (next)
-        task_state_refilter_arm(ctx, next);
+    task_state_refilter_schedule(ctx);
 }
 
 static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
@@ -871,7 +962,8 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
 
         if (!r->evsel)
             continue;
-        r->added = true;
+        // Keep the tail open a while for the threads to come.
+        r->add_due = get_ktime_ns() + TASK_STATE_ADD_DELAY;
         if (pid_ranges_has(r->ranges, pid))
             continue;
         r->tail_open = true;
@@ -880,7 +972,6 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
         if (ret < 0) {
             /* The thread stays followed; this role misses it until the retry. */
             r->uncovered = true;
-            task_state_refilter_arm(ctx, r->built + TASK_STATE_REFILTER_INTERVAL);
             if (!ctx->warned) {
                 fprintf(stderr, "task-state: sched:%s misses thread %d, retry later: %s\n",
                         role_name[role], pid, strerror(-ret));
@@ -888,6 +979,7 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
             }
         }
     }
+    task_state_refilter_schedule(ctx);
     return 0;
 }
 
@@ -938,7 +1030,31 @@ static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
         print_time(stdout);
         printf("task-state: del thread %d\n", pid);
     }
-    /* Not replaced: an exited thread writes no records, a reused tid is dropped by ftrace_filter. */
+    /*
+     * The filters still let in the tid, a new task may get it after a pid
+     * wrap: ftrace_filter drops its records from now on. The pid does not
+     * wrap soon, the rebuild waits for the exits to settle, then
+     * ftrace_filter may be off again.
+     */
+    if (ctx->follow) {
+        u64 now = get_ktime_ns();
+        int role;
+
+        for (role = 0; role < ROLE_MAX; role++) {
+            struct task_state_role *r = &ctx->role[role];
+
+            if (!r->evsel)
+                continue;
+            r->exact = false;
+            if (!r->del_first)
+                r->del_first = now;
+            r->del_due = now + TASK_STATE_DEL_DELAY;
+            if (r->del_due > r->del_first + TASK_STATE_DEL_MAX)
+                r->del_due = r->del_first + TASK_STATE_DEL_MAX;
+        }
+        task_state_ftrace_filter_update(dev);
+        task_state_refilter_schedule(ctx);
+    }
     return 0;
 }
 
@@ -1175,8 +1291,8 @@ static long task_state_ftrace_filter(struct prof_dev *dev, union perf_event *eve
 
     r = &ctx->role[role];
     ctx->stat.dropped++;
-    if (++r->dropped >= TASK_STATE_REFILTER_DROPS)
-        task_state_refilter_arm(ctx, r->built + TASK_STATE_REFILTER_INTERVAL);
+    if (++r->dropped == TASK_STATE_REFILTER_DROPS)
+        task_state_refilter_schedule(ctx);
     return 0;
 }
 
