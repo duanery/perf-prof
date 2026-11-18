@@ -9,6 +9,9 @@
  *   task-threads gaps <threads> <seconds>
  *       Every other one of <threads> threads exits at once: the tids left
  *       have gaps. Prints READY when they have exited.
+ *   task-threads exits <threads> <seconds>
+ *       Prints READY with <threads> threads up, a second later they exit one
+ *       by one, 200ms apart; the process stays for <seconds>.
  */
 #define _GNU_SOURCE
 #include <assert.h>
@@ -127,6 +130,37 @@ static int gaps(int nr, double seconds)
     return 0;
 }
 
+static volatile int nr_exit;
+
+static void *exit_worker(void *arg)
+{
+    long i = (long)arg;
+
+    while (nr_exit <= i)
+        usleep(10000);
+    return NULL;
+}
+
+static int exits(int nr, double seconds)
+{
+    pthread_t *threads = calloc(nr, sizeof(*threads));
+    long i;
+
+    assert(threads);
+    for (i = 0; i < nr; i++)
+        assert(pthread_create(&threads[i], NULL, exit_worker, (void *)i) == 0);
+    printf("READY %d\n", getpid());
+    sleep(1);
+    for (i = 0; i < nr; i++) {
+        nr_exit = i + 1;
+        assert(pthread_join(threads[i], NULL) == 0);
+        usleep(200000);
+    }
+    usleep(seconds * 1000000);
+    free(threads);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setbuf(stdout, NULL);
@@ -136,6 +170,9 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && !strcmp(argv[1], "gaps"))
         return gaps(atoi(argv[2]), atof(argv[3]));
-    fprintf(stderr, "Usage: %s pingpong <seconds> [<spawn seconds>] | gaps <threads> <seconds>\n", argv[0]);
+    if (argc == 4 && !strcmp(argv[1], "exits"))
+        return exits(atoi(argv[2]), atof(argv[3]));
+    fprintf(stderr, "Usage: %s pingpong <seconds> [<spawn seconds>] | gaps <threads> <seconds> | "
+                    "exits <threads> <seconds>\n", argv[0]);
     return 1;
 }
