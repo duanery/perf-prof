@@ -987,11 +987,14 @@ NULL_tidmap:
  *                   used by profiler event sources (dev_tp) to access fields
  *                   in forwarded events. Built by perf_event_members() on the
  *                   first perf_evsel_member_cache(), when sample_type is final.
+ *   - cookie:       A profiler private mark, e.g. what the evsel is for. Set by
+ *                   perf_evsel_set_cookie(). The libperf private data itself is
+ *                   always the prof_evsel: profilers must not set it.
  *
  * It is set by perf_evsel__set_priv() and freed by perf_evsel__delete(), on
  * every path that deletes the evsel.
  *
- * Access helpers: perf_evsel_tp(), perf_evsel_member_cache().
+ * Access helpers: perf_evsel_tp(), perf_evsel_member_cache(), perf_evsel_cookie().
  */
 
 static void prof_evsel_free(void *priv)
@@ -1021,6 +1024,16 @@ int perf_evsel_link_tp(struct perf_evsel *evsel, struct tp *tp)
     if (!pe)
         return -1;
     pe->tp = tp;
+    return 0;
+}
+
+int perf_evsel_set_cookie(struct perf_evsel *evsel, long cookie)
+{
+    struct prof_evsel *pe = prof_evsel_get(evsel);
+
+    if (!pe)
+        return -1;
+    pe->cookie = cookie;
     return 0;
 }
 

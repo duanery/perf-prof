@@ -767,6 +767,7 @@ struct perf_event_member_cache {
 struct prof_evsel {
     struct tp *tp;   // evsel -> tp, set by tp_evsel_new()
     struct perf_event_member_cache *member_cache;  // sample layout, built on first use
+    long cookie;     // profiler private mark, 0 if unset
 };
 
 int perf_evsel_link_tp(struct perf_evsel *evsel, struct tp *tp);
@@ -774,6 +775,12 @@ static inline struct tp *perf_evsel_tp(struct perf_evsel *evsel)
 {
     struct prof_evsel *pe = perf_evsel__priv(evsel);
     return pe ? pe->tp : NULL;
+}
+int perf_evsel_set_cookie(struct perf_evsel *evsel, long cookie);
+static inline long perf_evsel_cookie(struct perf_evsel *evsel)
+{
+    struct prof_evsel *pe = perf_evsel__priv(evsel);
+    return pe ? pe->cookie : 0;
 }
 struct perf_event_member_cache *__perf_evsel_member_cache(struct perf_evsel *evsel);
 static inline struct perf_event_member_cache *perf_evsel_member_cache(struct perf_evsel *evsel)

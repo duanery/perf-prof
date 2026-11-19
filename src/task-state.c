@@ -353,19 +353,20 @@ static int task_state_notify(struct comm_notify *notify, int pid, int state, u64
     return 0;
 }
 
+/* The role is the evsel cookie + 1: 0 is an evsel of no role. */
 static inline int task_state_role(struct perf_evsel *evsel)
 {
-    void *priv = evsel ? perf_evsel__priv(evsel) : NULL;
-
-    return (int)(long)priv - 1;
+    return evsel ? (int)perf_evsel_cookie(evsel) - 1 : -1;
 }
 
 static struct perf_evsel *task_state_evsel_new(int role, struct perf_event_attr *attr)
 {
     struct perf_evsel *evsel = perf_evsel__new(attr);
 
-    if (evsel)
-        perf_evsel__set_priv(evsel, (void *)(long)(role + 1), NULL);
+    if (evsel && perf_evsel_set_cookie(evsel, role + 1) < 0) {
+        perf_evsel__delete(evsel);
+        evsel = NULL;
+    }
     return evsel;
 }
 
@@ -1264,6 +1265,18 @@ static long task_state_ftrace_filter(struct prof_dev *dev, union perf_event *eve
     return 0;
 }
 
+/*
+ * The evsels share one sample layout: build by the current sched_switch one,
+ * the evsel of a kept record may be replaced and deleted since.
+ */
+static inline void task_state_callchain_data(struct prof_dev *dev, union perf_event *event,
+                                             struct callchain_data *cd)
+{
+    struct task_state_ctx *ctx = dev->private;
+
+    perf_event_build_callchain_data(ctx->role[ROLE_SWITCH].evsel, event, cd);
+}
+
 static inline void __print_callchain(struct prof_dev *dev, union perf_event *event)
 {
     struct task_state_ctx *ctx = dev->private;
@@ -1271,7 +1284,7 @@ static inline void __print_callchain(struct prof_dev *dev, union perf_event *eve
 
     if (dev->env->callchain) {
         struct callchain_data cd;
-        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+        task_state_callchain_data(dev, event, &cd);
         if (!dev->env->flame_graph) {
             print_callchain_data(ctx->cc, &cd);
         } else {
@@ -1342,7 +1355,7 @@ static void task_state_print_event(struct prof_dev *dev, union perf_event *event
 
     if (dev->env->callchain && !(flags & OMIT_CALLCHAIN)) {
         struct callchain_data cd;
-        perf_event_build_callchain_data(perf_event_evsel(dev, event), event, &cd);
+        task_state_callchain_data(dev, event, &cd);
         print_callchain_data(ctx->cc, &cd);
     }
 }
