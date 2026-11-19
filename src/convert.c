@@ -1037,6 +1037,22 @@ int perf_evsel_set_cookie(struct perf_evsel *evsel, long cookie)
     return 0;
 }
 
+/* @dst replaces @src: the same tp and cookie, its own member_cache. */
+int perf_evsel_copy_priv(struct perf_evsel *dst, struct perf_evsel *src)
+{
+    struct prof_evsel *s = perf_evsel__priv(src);
+    struct prof_evsel *d;
+
+    if (!s)
+        return 0;
+    d = prof_evsel_get(dst);
+    if (!d)
+        return -1;
+    d->tp = s->tp;
+    d->cookie = s->cookie;
+    return 0;
+}
+
 struct perf_event_member_cache *__perf_evsel_member_cache(struct perf_evsel *evsel)
 {
     struct prof_evsel *pe = prof_evsel_get(evsel);

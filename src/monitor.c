@@ -1955,10 +1955,140 @@ perf_event_forward(struct prof_dev *dev, union perf_event *event, int *cpu, int 
     return (union perf_event *)event_dev;
 }
 
+/*
+ * A ring buffer while an evsel is replaced: the old and the new evsel both
+ * write the records passing both filters, the new one first, see
+ * prof_dev_replace_dup().
+ */
+struct replace_ring {
+    int cpu, tid;   // the binding, (c,-1) or (-1,t)
+    bool used;
+    bool seen_new;  // a record of the new evsel was read from it
+    u32 size, hash; // the raw data of the last record of the old one before
+                    // seen_new, with r->check
+};
+
+struct prof_dev_replace {
+    struct perf_evsel *old, *new;
+    struct replace_ring *rings;
+    int mask;
+    bool check;     // the old evsel may write first, see prof_dev_replace_dup()
+    u64 kept;
+    struct replace_ring *first_kept;
+};
+
+static struct replace_ring *prof_dev_replace_ring(struct prof_dev_replace *r, int cpu, int tid)
+{
+    u32 i = (u32)(cpu * 31 + tid) & r->mask;
+
+    // Sized for twice the rings, there is always an empty slot.
+    while (r->rings[i].used) {
+        if (r->rings[i].cpu == cpu && r->rings[i].tid == tid)
+            return &r->rings[i];
+        i = (i + 1) & r->mask;
+    }
+    r->rings[i].used = true;
+    r->rings[i].cpu = cpu;
+    r->rings[i].tid = tid;
+    return &r->rings[i];
+}
+
+/* FNV-1a */
+static u32 replace_hash(const u8 *data, u32 size)
+{
+    u32 hash = 2166136261u;
+
+    while (size--)
+        hash = (hash ^ *data++) * 16777619u;
+    return hash;
+}
+
+/* The raw data of a record, false if it has none. */
+static bool prof_dev_replace_digest(struct perf_evsel *evsel, union perf_event *event,
+                                    u32 *size, u32 *hash)
+{
+    struct perf_event_member_cache *cache = perf_evsel_member_cache(evsel);
+    void *data = event->sample.array;
+    int offset;
+
+    if (!cache || !cache->raw)
+        return false;
+    offset = perf_event_member_offset(cache, cache->raw, event);
+    *size = *(u32 *)(data + offset);
+    *hash = replace_hash(data + offset + sizeof(u32), *size);
+    return true;
+}
+
+/*
+ * While an evsel is replaced, drop the records of the old one that the new one
+ * wrote too.
+ *
+ * Both write into the same ring buffers. A tracepoint writes into the evsels on
+ * the per cpu hlist of its perf events from its head, perf_trace_add() adds at
+ * the head: the new evsel writes first. So once a ring buffer has a record of
+ * the new evsel, the following records of the old one are either twins, or
+ * passed the old filter only, of no more interest. Records of the new evsel
+ * are always kept; the window ends with the reap of the old one.
+ *
+ * The one exception: a tracepoint with a target task (sched_waking,
+ * sched_wakeup*, sched_stat_*) also writes into the evsels of that task, when
+ * it is not current. Since 571f97f7d51f ("perf: Optimize perf_tp_event()"), in
+ * v6.2, perf_tp_event_target_task() walks them in group order, the old one
+ * first; it walks the evsels of this cpu only, bound to both a cpu and a
+ * thread. Then the old evsel writes an event first, the new one second, and
+ * that first new record lets the old twin before it through: one twin per ring
+ * buffer. Only these evsels are checked (r->check): no hash for the others, the
+ * common ones bound to a cpu or a thread alone, and none of their records of
+ * the same raw data taken for twins.
+ *
+ * The check is the simplest: the old record right before the first new one,
+ * of the same raw data, is taken for its twin and reported. It may be wrong,
+ * two events of the same raw data, the old evsel alone wrote the first one
+ * before the new one was enabled; the ring buffers are read to the end before,
+ * that leaves a short time. No time is compared, a guest may exit to the host
+ * between the two writes.
+ */
+static bool prof_dev_replace_dup(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    struct prof_dev_replace *r = dev->replace;
+    u64 id = *(u64 *)((void *)event->sample.array + dev->pos.id_pos);
+    struct perf_evsel *evsel = perf_evlist__id_to_evsel(dev->evlist, id, NULL);
+    struct replace_ring *ring;
+    u32 size, hash;
+
+    if (evsel != r->old && evsel != r->new)
+        return false;
+    ring = prof_dev_replace_ring(r, cpu, tid);
+    if (evsel == r->old) {
+        if (ring->seen_new) {
+            dev->replace_stat.dups++;
+            return true;
+        }
+        if (r->check && !prof_dev_replace_digest(evsel, event, &ring->size, &ring->hash))
+            ring->size = 0;
+        return false;
+    }
+    if (!ring->seen_new) {
+        ring->seen_new = true;
+        if (r->check && ring->size && prof_dev_replace_digest(evsel, event, &size, &hash) &&
+            size == ring->size && hash == ring->hash) {
+            r->kept++;
+            dev->replace_stat.kept++;
+            if (!r->first_kept)
+                r->first_kept = ring;
+        }
+    }
+    return false;
+}
+
 int perf_event_process_record(struct prof_dev *dev, union perf_event *event, int cpu, int tid, bool writable, bool converted)
 {
     profiler *prof;
     struct env *env;
+
+    if (unlikely(dev->replace) && event->header.type == PERF_RECORD_SAMPLE &&
+        prof_dev_replace_dup(dev, event, cpu, tid))
+        return 0;
 
     if (dev->forward.target) {
         // Forward upward.
@@ -2182,9 +2312,10 @@ static void prof_dev_reap(struct prof_dev *dev, const struct perf_evlist_reap *r
 /*
  * Replace @old by @new, opened disabled on perf_evlist__cpus() with its filter
  * set. @new is enabled before @old is stopped, so no event is missed; the
- * events both write meanwhile are delivered twice, one after the other in the
- * ring buffer of their cpu. @old is reaped (its ring buffers read to the end,
- * its sample ids still resolve) and deleted before the return.
+ * events both write meanwhile are delivered once, see prof_dev_replace_dup().
+ * Every ring buffer is read to the end first, the window starts with little
+ * of @old to read. @old is reaped (its ring buffers read to the end, its
+ * sample ids still resolve) and deleted before the return. The records need a sample id.
  *
  * On error @old is left as it was, @new is out of the evlist again, for the
  * caller to close. -EAGAIN: order is processing events, the ring buffers
@@ -2193,13 +2324,41 @@ static void prof_dev_reap(struct prof_dev *dev, const struct perf_evlist_reap *r
 int prof_dev_replace_evsel(struct prof_dev *dev, struct perf_evsel *old, struct perf_evsel *new)
 {
     const struct perf_evlist_reap *reap;
-    int err;
+    struct prof_dev_replace r = {.old = old, .new = new};
+    struct perf_cpu_map *cpus = perf_evsel__cpus(old);
+    struct perf_thread_map *threads = perf_evsel__threads(old);
+    int nr, err;
 
     if (dev->order.enabled && order_main_dev(dev)->order.inprocess)
         return -EAGAIN;
+    if (dev->replace)
+        return -EBUSY;
+    if (dev->pos.id_pos < 0)
+        return -EINVAL;
+
+    // Bound to both a cpu and a thread, see prof_dev_replace_dup().
+    r.check = perf_evsel__attr(old)->type == PERF_TYPE_TRACEPOINT &&
+              !perf_cpu_map__empty(cpus) && perf_thread_map__pid(threads, 0) != -1;
+    nr = perf_cpu_map__nr(cpus) + perf_thread_map__nr(threads);
+    r.mask = 1;
+    while (r.mask < 2 * nr)
+        r.mask <<= 1;
+    r.rings = calloc(r.mask, sizeof(*r.rings));
+    if (!r.rings)
+        return -ENOMEM;
+    r.mask--;
+
+    if (dev->pages && dev->state == PROF_DEV_STATE_ACTIVE) {
+        struct perf_mmap *map;
+
+        perf_evlist__for_each_mmap(dev->evlist, map, dev->env->overwrite)
+            prof_dev_drain_mmap(dev, map);
+    }
+
     err = perf_evlist__add_evsel(dev->evlist, new);
     if (err)
-        return err;
+        goto out_free;
+    dev->replace = &r;
     err = perf_evlist__del_evsel(dev->evlist, old, &reap);
     if (err) {
         perf_evlist__reap_done(dev->evlist, reap);
@@ -2207,12 +2366,72 @@ int prof_dev_replace_evsel(struct prof_dev *dev, struct perf_evsel *old, struct 
             prof_dev_reap(dev, reap);
         else
             perf_evlist__reap_done(dev->evlist, reap);
-        return err;
+        goto out_window;
     }
     prof_dev_reap(dev, reap);
+    if (r.kept) {
+        struct perf_event_attr *attr = perf_evsel__attr(old);
+        struct tep_event *e = NULL;
+
+        print_time(stderr);
+        if (attr->type == PERF_TYPE_TRACEPOINT)
+            e = tep_find_event(tep__ref_light(), attr->config);
+        if (e)
+            fprintf(stderr, "%s: replace %s:%s: ", dev->prof->name, e->system, e->name);
+        else
+            fprintf(stderr, "%s: replace type %u config %llu: ", dev->prof->name, attr->type, attr->config);
+        if (attr->type == PERF_TYPE_TRACEPOINT)
+            tep__unref();
+        fprintf(stderr, "the old evsel wrote first on ring cpu %d tid %d, %lu duplicates kept\n",
+                r.first_kept->cpu, r.first_kept->tid, r.kept);
+    }
     perf_evsel__close(old);
     perf_evsel__delete(old);
+    dev->replace_stat.replaced++;
+
+out_window:
+    dev->replace = NULL;
+out_free:
+    free(r.rings);
+    return err;
+}
+
+/*
+ * Replace *@evsel by a copy with @filter: the same attr, cpus and threads, tp
+ * and cookie. See prof_dev_replace_evsel(). On success *@evsel is the new
+ * evsel, the old one is deleted; on error it is left as it was.
+ */
+int prof_dev_replace_filter(struct prof_dev *dev, struct perf_evsel **evsel, const char *filter)
+{
+    struct perf_evsel *old = *evsel;
+    struct perf_event_attr attr = *perf_evsel__attr(old);
+    struct perf_evsel *new;
+    int err;
+
+    attr.disabled = 1;
+    new = perf_evsel__new(&attr);
+    if (!new)
+        return -ENOMEM;
+    err = -ENOMEM;
+    if (perf_evsel_copy_priv(new, old) < 0)
+        goto out_delete;
+    err = perf_evsel__open(new, perf_evsel__cpus(old), perf_evsel__threads(old));
+    if (err < 0)
+        goto out_delete;
+    err = perf_evsel__apply_filter(new, filter);
+    if (err < 0)
+        goto out_close;
+    err = prof_dev_replace_evsel(dev, old, new);
+    if (err < 0)
+        goto out_close;
+    *evsel = new;
     return 0;
+
+out_close:
+    perf_evsel__close(new);
+out_delete:
+    perf_evsel__delete(new);
+    return err;
 }
 
 /*

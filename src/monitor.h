@@ -52,6 +52,7 @@ int prof_dev_oncpu(struct prof_dev *dev);
 int prof_dev_add_thread(struct prof_dev *dev, pid_t pid);
 int prof_dev_del_thread(struct prof_dev *dev, pid_t pid);
 int prof_dev_replace_evsel(struct prof_dev *dev, struct perf_evsel *old, struct perf_evsel *new);
+int prof_dev_replace_filter(struct prof_dev *dev, struct perf_evsel **evsel, const char *filter);
 int main_epoll_add(int fd, unsigned int events, void *ptr, handle_event handle);
 int main_epoll_del(int fd);
 
@@ -408,6 +409,12 @@ struct prof_dev {
     int pages;
     int nr_pollfd; // poll fds keeping the device alive, see prof_dev_pollfd_counts()
     bool ftrace_filter;
+    struct prof_dev_replace *replace; // an evsel being replaced, see prof_dev_replace_evsel()
+    struct prof_dev_replace_stat {
+        u64 replaced; // evsels replaced
+        u64 dups;     // records of the old evsel dropped, the new one wrote them
+        u64 kept;     // duplicates kept: the old evsel wrote first
+    } replace_stat;
     bool clone; // prof_dev is cloned
     bool silent; // Silent device, no output.
     // | title                        | detail                                                                       |
@@ -777,6 +784,7 @@ static inline struct tp *perf_evsel_tp(struct perf_evsel *evsel)
     return pe ? pe->tp : NULL;
 }
 int perf_evsel_set_cookie(struct perf_evsel *evsel, long cookie);
+int perf_evsel_copy_priv(struct perf_evsel *dst, struct perf_evsel *src);
 static inline long perf_evsel_cookie(struct perf_evsel *evsel)
 {
     struct prof_evsel *pe = perf_evsel__priv(evsel);
