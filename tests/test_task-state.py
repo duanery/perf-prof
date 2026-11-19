@@ -178,6 +178,8 @@ def test_task_state_ptrace_refilter(runtime, memleak_check):
         tails, summary = [], None
         for std, line in task_state.run(max(runtime, 10), memleak_check):
             result_check(std, line, runtime, memleak_check)
+            # The framework drops the twins of a replacement, the new evsel writes first.
+            assert 'wrote first' not in line
             m = FILTER.search(line)
             if m and 'replace' in line:
                 tails.extend(_tail(m.group(2)))
@@ -219,6 +221,8 @@ def test_task_state_forward_no_twins(runtime, memleak_check):
         prof = PerfProf(['trace', '-e', 'task-state/-S -v -m 256/', '--ptrace', '--', './task-threads', 'pingpong', '6'])
         for std, line in prof.run(max(runtime, 10), memleak_check):
             result_check(std, line, runtime, memleak_check)
+            # The framework drops the twins of a replacement, the new evsel writes first.
+            assert 'wrote first' not in line
             m = re.search(r'\[(\d+)\]\s+(\d+\.\d+):\s+(sched:\w+):\s+(.*)$', line)
             if m:
                 cpu, time, key = m.group(1), float(m.group(2)), (m.group(3), m.group(4))
@@ -242,6 +246,8 @@ def test_task_state_ptrace_tail_close(runtime, memleak_check):
         last, opened, summary, ftrace_filter = {}, set(), None, []
         for std, line in task_state.run(max(runtime, 12), memleak_check):
             result_check(std, line, runtime, memleak_check)
+            # The framework drops the twins of a replacement, the new evsel writes first.
+            assert 'wrote first' not in line
             if 'task-state: ftrace_filter' in line:
                 ftrace_filter.append(line.split()[-1])
             if 'replace sched' in line:
@@ -331,3 +337,28 @@ def test_task_state_ptrace_exits(runtime, memleak_check):
     assert len(dels) == 4 and len(replaces) == 3, kinds
     assert min(replaces) - max(dels) > 5, events
     assert kinds[-1] == 'ftrace_filter off', kinds
+
+PERINS = re.compile(r'^(\d+)\s+(\S+)\s')
+
+def test_task_state_ptrace_perins(runtime, memleak_check):
+    # perf-prof task-state --ptrace --perins -i 1000 -m 256 -- ./task-threads pingpong 6 2, with forks around
+    load = _fork_load()
+    try:
+        task_state = PerfProf(['task-state', '--ptrace', '--perins', '-i', '1000', '-m', '256',
+                               '--', './task-threads', 'pingpong', '6', '2'])
+        threads, seen = set(), {}
+        for std, line in task_state.run(max(runtime, 10), memleak_check):
+            result_check(std, line, runtime, memleak_check)
+            m = re.match(r'(WORKLOAD|WORKER) (\d+)', line)
+            if m:
+                threads.add(int(m.group(2)))
+            m = PERINS.match(line)
+            if m:
+                seen[int(m.group(1))] = m.group(2)
+    finally:
+        _stop(load)
+    # The threads created under ptrace are counted, the forks around are not.
+    assert len(threads) > 10, threads
+    assert set(seen) - threads == set(), seen
+    assert threads - set(seen) == set(), threads - set(seen)
+    assert set(seen.values()) == {'task-threads'}, seen
