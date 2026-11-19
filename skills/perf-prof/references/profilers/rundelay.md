@@ -70,9 +70,11 @@ perf-prof rundelay [OPTION...] -e sched:sched_wakeup*,sched:sched_switch \
 1. **`--filter`选项（内核态）**:
   - 起点事件：`sched:sched_wakeup*`自动转换为comm字段过滤器；`sched:sched_switch`自动转换为prev_comm过滤器
   - 终点事件：`sched:sched_switch`自动转换为next_comm过滤器
-2. **`-p`/`-t`选项（内核态）**:
+2. **`-p`/`-t`/`--ptrace`/workload（内核态 + 用户态）**:
   - 起点事件：`sched:sched_wakeup*`自动转换为pid字段过滤器；`sched:sched_switch`自动转换为prev_pid过滤器
   - 终点事件：`sched:sched_switch`自动转换为next_pid过滤器
+  - 与task-state相同：内核过滤器是线程集合的超集（合并tid缝隙，不超过一页），用户态精确匹配；新线程到来时替换事件，开放末尾`pid>=新tid`，之后自动收窄；`-v`打印替换过程
+  - 终点`sched:sched_switch`带过滤器，"不必要的唤醒"只识别线程唤醒自己
 
 ### 事件处理
 

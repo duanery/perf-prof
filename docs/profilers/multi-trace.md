@@ -1021,9 +1021,13 @@ perf-prof rundelay [OPTION...] -e sched:sched_wakeup*,sched:sched_switch \
 
 rundelay根据attach方式自动优化性能：
 
-**进程/线程模式**（使用`-p`或`-t`）：
+**进程/线程模式**（使用`-p`、`-t`、`--ptrace`或workload）：
 - 问题：sched事件不适合绑定到特定线程
-- 解决：自动切换到全局CPU模式，并过滤线程id
+- 解决：自动切换到全局CPU模式，并用内核过滤器跟踪线程id，与task-state相同（见[task-state](task-state.md)特殊情况2、3）：
+  - 内核过滤器放过线程集合的超集，用户态过滤器精确匹配。线程多时合并tid之间的缝隙，过滤器不超过一页。
+  - `--ptrace`或workload新建线程时替换事件：第一个新线程把过滤器转为开放末尾`pid>=新tid`，1秒内没有新线程再关闭末尾；线程退出后延迟重新生成。替换期间新旧事件的重复记录由框架去掉。
+  - 内核过滤器精确时不执行用户态过滤。`-v`打印每次替换（`rundelay: replace ...`）、`ftrace_filter on/off`和结束时的统计。
+  - 终点`sched:sched_switch`有了next_pid过滤器，"不必要的唤醒"只能识别线程唤醒自己的情况。
 
 **CPU模式**（使用`-C`或默认）：
 - 直接在指定CPU上采集事件
@@ -1049,15 +1053,15 @@ multi-trace提供智能过滤器支持，根据选项不同自动应用不同的
   # sched:sched_switch(终点): next_comm=="java" || next_comm~"pyth*"
 ```
 
-**2. 使用 `-p`/`-t` 选项时**：
-- 指定一个或多个进程/线程，逗号分隔。
+**2. 使用 `-p`/`-t`/`--ptrace` 选项时**：
+- 指定一个或多个进程/线程，逗号分隔。连续的tid合并成区间`(pid>=a&&pid<=b)`，有新线程时可能带开放末尾`pid>=新tid`。
 ```bash
 # 进程234包含线程：234, 345
 -p 234 # 自动转换为：
-  # sched:sched_wakeup: pid==234 || pid==345
-  # sched:sched_wakeup_new: pid==234 || pid==345
-  # sched:sched_switch(起点): prev_state==0 && (prev_pid==234 || prev_pid==345)
-  # sched:sched_switch(终点): next_pid==234 || next_pid==345
+  # sched:sched_wakeup: pid==234||pid==345
+  # sched:sched_wakeup_new: pid==234||pid==345
+  # sched:sched_switch(起点): (prev_state==256||prev_state==0) && (prev_pid==234||prev_pid==345)
+  # sched:sched_switch(终点): next_pid==234||next_pid==345
 ```
 
 #### 4. 内核版本兼容性
