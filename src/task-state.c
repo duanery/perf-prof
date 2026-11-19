@@ -290,14 +290,9 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->task_states.node_new = task_state_node_new;
     ctx->task_states.node_delete = task_state_node_delete;
 
-    if (prof_dev_is_cloned(dev)) {
-        struct task_state_ctx *pctx = prof_dev_is_cloned(dev)->private;
-        ctx->lat_dist = latency_dist_ref(pctx->lat_dist);
-    } else {
-        ctx->lat_dist = latency_dist_new_quantile(env->perins, true, 0);
-        if (!ctx->lat_dist)
-            goto failed;
-    }
+    ctx->lat_dist = latency_dist_new_quantile(env->perins, true, 0);
+    if (!ctx->lat_dist)
+        goto failed;
     return 0;
 
 failed:
@@ -1058,33 +1053,6 @@ static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
     return 0;
 }
 
-static void task_state_enabled(struct prof_dev *dev)
-{
-    if (prof_dev_is_cloned(dev)) {
-        struct task_state_ctx *ctx = dev->private;
-        struct perf_thread_map *threads;
-        int idx, pid;
-        if (!ctx->thread_map)
-            return;
-        threads = tid_set__map(&ctx->tids);
-        if (!threads)
-            return;
-        perf_thread_map__for_each_thread(pid, idx, threads) {
-            if (kill(pid, 0) == 0) {
-                perf_thread_map__put(threads);
-                return;
-            }
-        }
-        perf_thread_map__put(threads);
-        if (dev->env->verbose) {
-            pid = perf_thread_map__pid(ctx->thread_map, 0);
-            print_time(stdout);
-            printf("%s close %d in task_state_enabled()\n", dev->prof->name, pid);
-        }
-        prof_dev_close(dev);
-    }
-}
-
 static void task_print_node(void *opaque, struct latency_node *node)
 {
     struct prof_dev *dev = opaque;
@@ -1652,7 +1620,6 @@ struct monitor task_state = {
     .ftrace_filter = task_state_ftrace_filter,
     .add_thread = task_state_add_thread,
     .del_thread = task_state_del_thread,
-    .enabled = task_state_enabled,
     .deinit = task_state_deinit,
     .sigusr = task_state_sigusr,
     .print_dev = task_state_print_dev,
