@@ -191,6 +191,26 @@ def test_task_state_ptrace_refilter(runtime, memleak_check):
     assert summary and summary[0] > 3 and summary[1] == 0
     assert max(tails) > min(tails)
 
+def test_task_state_ptrace_callchain(runtime, memleak_check):
+    # perf-prof task-state --ptrace -S -g --than 1ms -v -m 256 -- ./task-threads pingpong 6, with forks around
+    load = _fork_load()
+    try:
+        task_state = PerfProf(['task-state', '--ptrace', '-S', '-g', '--than', '1ms', '-v', '-m', '256',
+                               '--', './task-threads', 'pingpong', '6'])
+        frames, summary = 0, None
+        for std, line in task_state.run(max(runtime, 10), memleak_check):
+            result_check(std, line, runtime, memleak_check)
+            if re.match(r'\s+[0-9a-f]{16} ', line):
+                frames += 1
+            m = SUMMARY.search(line)
+            if m:
+                summary = list(map(int, m.groups()))
+    finally:
+        _stop(load)
+    # The callchains of the replaced evsels print.
+    assert summary and summary[0] > 0
+    assert frames > 0
+
 def test_task_state_forward_no_twins(runtime, memleak_check):
     # perf-prof trace -e task-state/-S -v -m 256/ --ptrace -- ./task-threads pingpong 6, with forks around
     load = _fork_load()
