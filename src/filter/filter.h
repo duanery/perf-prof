@@ -38,31 +38,6 @@ char *pid_filter(struct perf_thread_map *threads, const char *field);
 // Return an allocated string, which needs to be freed.
 char *cpu_filter(struct perf_cpu_map *cpus, const char *field);
 
-/*
- * Pid ranges for a tracepoint filter that covers a set of pids, and maybe
- * every pid from a tail on, within a length budget: the filter is a superset,
- * the exact match is left to userspace.
- */
-struct pid_ranges {
-    int nr;
-    struct pid_range {
-        int lo, hi; // hi == INT_MAX: the open tail, field>=lo.
-    } r[];
-};
-
-/*
- * Cover the pids of @threads and, when @tail >= 0, the pids allocated next:
- * from @tail up to the next pid of @threads, every pid from @tail on when
- * there is none above it. The gaps are merged, smallest first, until the
- * filter on @field fits in @budget bytes; with no gap left it is taken as it
- * is.
- */
-struct pid_ranges *pid_ranges_new(struct perf_thread_map *threads, int tail,
-                                  const char *field, size_t budget);
-bool pid_ranges_has(const struct pid_ranges *ranges, int pid);
-// Return an allocated string, which needs to be freed. No range: field<0.
-char *pid_ranges_filter(const struct pid_ranges *ranges, const char *field);
-
 struct tp_filter *tp_filter_new(struct perf_thread_map *threads, const char *pid_field,
                                      const char *filter, const char *comm_field);
 void tp_filter_free(struct tp_filter *tp_filter);
