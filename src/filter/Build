@@ -1,3 +1,4 @@
 perf-prof-$(CONFIG_LIBBPF) += perf_event.skel.h
 perf-prof-y += bpf_filter.o
 perf-prof-y += tp_filter.o
+perf-prof-y += event_filter.o
