@@ -15,7 +15,6 @@
 #include <stack_helpers.h>
 #include <latency_helpers.h>
 #include <tp_struct.h>
-#include <timer.h>
 #include <time.h>
 
 #define TASK_RUNNING		0
@@ -70,25 +69,6 @@
 #define TASK_REPORT_IDLE  0x80 // kernel 4.14 and later.
 #define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 
-/*
- * The filters are rebuilt from a timer, by urgency:
- *  - DROPS: this many records let in are dropped by the tid, the filter lets
- *    in too much: due at once;
- *  - ADD_DELAY: no new thread for this long, the open tail is not needed:
- *    each new thread puts it off (add_due);
- *  - DEL_DELAY: an exited thread is still let in; ftrace_filter keeps its tid
- *    off meanwhile: each exit puts it off (del_due), DEL_MAX after the first
- *    (del_first) at most.
- * At most once an interval per role: a replacement opens a fd on every cpu.
- */
-#define TASK_STATE_REFILTER_DROPS     1000
-#define TASK_STATE_REFILTER_INTERVAL  NSEC_PER_SEC
-#define TASK_STATE_ADD_DELAY          NSEC_PER_SEC
-#define TASK_STATE_DEL_DELAY          (10 * NSEC_PER_SEC)
-#define TASK_STATE_DEL_MAX            (60 * NSEC_PER_SEC)
-/* The records are compared up to this size to find the twins. */
-#define TASK_STATE_TWIN_RAW           128
-
 /* What an evsel is for; its evsels are replaced, the role stays. */
 enum {
     ROLE_SWITCH,        // sched_switch, the prev side
@@ -104,42 +84,16 @@ static const char *role_comm[ROLE_MAX] = {"prev_comm", "next_comm", "comm", "com
 
 struct task_state_role {
     struct perf_evsel *evsel;   // the current one
-    char *filter;
-    /* Following the threads: the pids the kernel filter lets in. */
-    struct pid_ranges *ranges;
-    u64 dropped;                // let in by the kernel filter, dropped by the tid
-    u64 built;                  // ktime of the last filter build, for the rate limit
-    bool uncovered;             // a followed thread is not in @ranges
-    /*
-     * The tail: the filter also lets in the pids allocated from @tail on,
-     * for the threads to come. Opened by a new thread not let in, closed by
-     * a rebuild once no new thread came for TASK_STATE_ADD_DELAY.
-     */
-    bool tail_open;
-    int tail;
-    u64 add_due;                // ktime the tail may close, 0: none
-    /* Exited threads let in: ktime the rebuild is due, and of the first exit; 0: none. */
-    u64 del_due, del_first;
-    /*
-     * The filter lets in the followed threads only: no tail, no merged gap,
-     * no thread exited since the build (its tid may be reused).
-     */
-    bool exact;
-};
-
-/* The last record of a role on a cpu, while replacing. */
-struct task_state_twin {
-    struct perf_evsel *evsel;
-    int size;
-    u8 raw[TASK_STATE_TWIN_RAW];
+    char *filter;               // not following the threads
+    /* Following the threads: the kernel filter over their pids, sharing the ones of ROLE_SWITCH. */
+    struct pid_filter *pf;
 };
 
 struct task_state_ctx {
     struct callchain_ctx *cc;
     struct flame_graph *flame;
-    /* The threads asked for, and the ones followed now (ptrace adds and removes). */
+    /* The threads asked for; the ones followed now are in the pid filters (ptrace adds and removes). */
     struct perf_thread_map *thread_map;
-    struct tid_set tids;
     struct task_state_role role[ROLE_MAX];
     struct tp_matcher *matcher_switch, *matcher_wakeup, *matcher_wakeup_new;
     struct rblist task_states;
@@ -160,14 +114,8 @@ struct task_state_ctx {
      * of them, ftrace_filter keeps the exact ones.
      */
     bool follow;
-    bool replacing; // drop the twins, see task_state_twin()
     bool warned;
-    int nr_cpus;
-    struct task_state_twin *twin; // [nr_cpus][ROLE_MAX]
-    struct timer refilter;
-    u64 refilter_at;            // ktime the timer fires, 0: not started
-    bool refilter_inited;
-    struct prof_dev *dev;
+    int nr_ftrace_filter;       // the roles letting in more than the followed threads
 
     // lost
     struct list_head lost_list; // struct task_lost_node
@@ -183,7 +131,6 @@ struct task_state_ctx {
         u64 replaced;
         u64 replace_failed;
         u64 dropped;
-        u64 twins;
     } stat;
 
 };
@@ -309,16 +256,11 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     list_for_each_entry_safe(lost, next, &ctx->lost_list, lost_link)
         free(lost);
 
-    if (ctx->refilter_inited)
-        timer_destroy(&ctx->refilter);
     for (i = 0; i < ROLE_MAX; i++) {
         free(ctx->role[i].filter);
-        free(ctx->role[i].ranges);
+        pid_filter_free(ctx->role[i].pf);
     }
-    free(ctx->twin);
 
-    if (ctx->thread_map)
-        tid_set__exit(&ctx->tids);
     perf_thread_map__put(ctx->thread_map);
     rblist__exit(&ctx->task_states);
     if (dev->env->callchain) {
@@ -382,8 +324,6 @@ static int task_state_new_evsel(struct prof_dev *dev, int role, struct perf_even
     return 0;
 }
 
-static void task_state_refilter_timer(struct timer *timer);
-
 static int task_state_init(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -414,8 +354,6 @@ static int task_state_init(struct prof_dev *dev)
      * sched:sched_switch and sched:sched_wakeup are not suitable for binding to threads
     **/
     if (!prof_dev_oncpu(dev)) {
-        if (tid_set__init(&ctx->tids, dev->threads) < 0)
-            goto failed;
         ctx->thread_map = dev->threads;
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
@@ -424,20 +362,12 @@ static int task_state_init(struct prof_dev *dev)
          * The kernel pid filter is a superset: the gaps are merged to fit
          * the length limit, and a fd's filter cannot be changed (SET_FILTER
          * returns EEXIST), the evsel is replaced to follow new threads.
-         * ftrace_filter matches the threads exactly. --filter matches the
-         * comm instead of the pid.
+         * ftrace_filter matches the threads exactly, on until the filters
+         * are set. --filter matches the comm instead of the pid.
          */
         if (!env->filter) {
             ctx->follow = true;
-            ctx->dev = dev;
             dev->ftrace_filter = 1;
-            ctx->nr_cpus = perf_cpu_map__max(dev->cpus) + 1;
-            ctx->twin = calloc(ctx->nr_cpus * ROLE_MAX, sizeof(*ctx->twin));
-            if (!ctx->twin)
-                goto failed;
-            if (timer_init(&ctx->refilter, 1, task_state_refilter_timer) < 0)
-                goto failed;
-            ctx->refilter_inited = true;
         }
     }
 
@@ -584,80 +514,84 @@ static char *task_state_compose(struct prof_dev *dev, int role, const char *who)
 }
 
 /*
- * The filter of @role over the followed threads, and the pids allocated from
- * @tail on if @tail >= 0 (see pid_ranges_new()); the pids it lets in go to
- * @pranges. The whole filter fits in
- * a page, see perf_event_set_filter().
- */
-static char *task_state_pid_filter(struct prof_dev *dev, int role, int tail, struct pid_ranges **pranges)
-{
-    struct task_state_ctx *ctx = dev->private;
-    struct perf_thread_map *threads;
-    struct pid_ranges *ranges;
-    char *rest, *pids, *filter = NULL;
-    long budget = sysconf(_SC_PAGESIZE) - 1;
-
-    rest = task_state_compose(dev, role, "");
-    if (!rest)
-        return NULL;
-    budget -= strlen(rest);
-    free(rest);
-
-    threads = tid_set__map(&ctx->tids);
-    if (!threads)
-        return NULL;
-    ranges = pid_ranges_new(threads, tail, role_pid[role], budget > 0 ? budget : 0);
-    perf_thread_map__put(threads);
-    if (!ranges)
-        return NULL;
-    pids = pid_ranges_filter(ranges, role_pid[role]);
-    if (pids) {
-        filter = task_state_compose(dev, role, pids);
-        free(pids);
-    }
-    if (!filter) {
-        free(ranges);
-        return NULL;
-    }
-    *pranges = ranges;
-    return filter;
-}
-
-/* No tail, every pid of @ranges a followed thread. */
-static bool task_state_exact(struct task_state_ctx *ctx, const struct pid_ranges *ranges)
-{
-    unsigned long covered = 0;
-    int i;
-
-    for (i = 0; i < ranges->nr; i++) {
-        if (ranges->r[i].hi == INT_MAX)
-            return false;
-        covered += ranges->r[i].hi - ranges->r[i].lo + 1;
-    }
-    return covered == rblist__nr_entries(&ctx->tids.tids);
-}
-
-/*
  * ftrace_filter is needed while a kernel filter lets in more than the
- * followed threads, and while replacing, for the twins. Not needed, the
- * records skip it.
+ * followed threads. Not needed, the records skip it.
  */
 static void task_state_ftrace_filter_update(struct prof_dev *dev)
 {
     struct task_state_ctx *ctx = dev->private;
-    bool need = ctx->replacing;
-    int role;
+    bool need = ctx->nr_ftrace_filter > 0;
 
-    for (role = 0; role < ROLE_MAX; role++) {
-        if (ctx->role[role].evsel && !ctx->role[role].exact)
-            need = true;
-    }
     if (dev->ftrace_filter != need && dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
         printf("task-state: ftrace_filter %s\n", need ? "on" : "off");
     }
     dev->ftrace_filter = need;
 }
+
+static int task_state_pf_role(struct task_state_ctx *ctx, struct pid_filter *pf)
+{
+    int role;
+
+    for (role = 0; role < ROLE_MAX; role++)
+        if (ctx->role[role].pf == pf)
+            break;
+    return role;
+}
+
+/*
+ * Put the filter of a role in the kernel: applied before the evsel is
+ * enabled, then the evsel is replaced. On error the old one keeps working,
+ * pid_filter retries later.
+ */
+static int task_state_set_filter(struct pid_filter *pf, void *opaque, const char *filter, bool initial)
+{
+    struct prof_dev *dev = opaque;
+    struct task_state_ctx *ctx = dev->private;
+    int role = task_state_pf_role(ctx, pf);
+    struct task_state_role *r = &ctx->role[role];
+    int err;
+
+    if (initial) {
+        err = perf_evsel__apply_filter(r->evsel, filter);
+        if (err < 0 || dev->env->verbose >= VERBOSE_NOTICE)
+            fprintf(err < 0 ? stderr : stdout, "sched:%s filter \"%s\"\n", role_name[role], filter);
+        return err;
+    }
+    if (dev->inclose)
+        return -EBUSY;
+    err = prof_dev_replace_filter(dev, &r->evsel, filter);
+    if (err < 0) {
+        ctx->stat.replace_failed++;
+        if (!ctx->warned) {
+            fprintf(stderr, "task-state: replace sched:%s filter failed, retry later: %s\n",
+                    role_name[role], strerror(-err));
+            ctx->warned = true;
+        }
+        return err;
+    }
+    ctx->stat.replaced++;
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("task-state: replace sched:%s filter \"%s\"\n", role_name[role], filter);
+    }
+    return 0;
+}
+
+/* The roles letting in more are counted: one needs ftrace_filter, all do not. */
+static void task_state_need_ftrace_filter(struct pid_filter *pf, void *opaque, bool need)
+{
+    struct prof_dev *dev = opaque;
+    struct task_state_ctx *ctx = dev->private;
+
+    ctx->nr_ftrace_filter += need ? 1 : -1;
+    task_state_ftrace_filter_update(dev);
+}
+
+static const struct pid_filter_ops task_state_pf_ops = {
+    .set = task_state_set_filter,
+    .ftrace_filter = task_state_need_ftrace_filter,
+};
 
 static int task_state_filter(struct prof_dev *dev)
 {
@@ -667,17 +601,29 @@ static int task_state_filter(struct prof_dev *dev)
 
     for (role = 0; role < ROLE_MAX; role++) {
         struct task_state_role *r = &ctx->role[role];
-        struct pid_ranges *ranges = NULL;
         char *filter = NULL;
 
         if (!r->evsel)
             continue;
         if (ctx->follow) {
-            filter = task_state_pid_filter(dev, role, -1, &ranges);
-            if (!filter) {
+            char *states = task_state_compose(dev, role, NULL);
+
+            // The roles share the pids of ROLE_SWITCH, the first one.
+            r->pf = pid_filter_new(role_pid[role], states,
+                                   role == ROLE_SWITCH ? NULL : ctx->role[ROLE_SWITCH].pf,
+                                   &task_state_pf_ops, dev);
+            free(states);
+            if (!r->pf) {
                 err = -ENOMEM;
                 break;
             }
+            if (role == ROLE_SWITCH)
+                err = pid_filter_add_threads(r->pf, ctx->thread_map);
+            if (err == 0)
+                err = pid_filter_start(r->pf);
+            if (err < 0)
+                break;
+            continue;
         } else if (env->filter) {
             struct tp_filter *tp_filter = tp_filter_new(NULL, role_pid[role], env->filter, role_comm[role]);
             filter = task_state_compose(dev, role, tp_filter ? tp_filter->filter : NULL);
@@ -693,235 +639,14 @@ static int task_state_filter(struct prof_dev *dev)
 
         if (err < 0) {
             free(filter);
-            free(ranges);
             break;
         }
         free(r->filter);
-        free(r->ranges);
         r->filter = filter;
-        r->ranges = ranges;
-        r->exact = ranges && task_state_exact(ctx, ranges);
-        r->built = get_ktime_ns();
     }
     if (ctx->follow)
         task_state_ftrace_filter_update(dev);
     return err < 0 ? err : 0;
-}
-
-/*
- * The pid allocated last, from /proc/loadavg. It counts in the pid namespace
- * of perf-prof, the tracepoints report the pids of the init one: -1 when not
- * there, or unknown.
- */
-static int task_state_last_pid(void)
-{
-    char line[256];
-    int pid = -1;
-    FILE *fp;
-
-    fp = fopen("/proc/self/status", "r");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            int a, b;
-            // NSpid: 1234 1 - a nested pid namespace.
-            if (!strncmp(line, "NSpid:", 6) && sscanf(line + 6, "%d %d", &a, &b) == 2) {
-                fclose(fp);
-                return -1;
-            }
-        }
-        fclose(fp);
-    }
-    fp = fopen("/proc/loadavg", "r");
-    if (fp) {
-        if (fscanf(fp, "%*s %*s %*s %*s %d", &pid) != 1)
-            pid = -1;
-        fclose(fp);
-    }
-    return pid;
-}
-
-static int task_state_max_tid(struct task_state_ctx *ctx)
-{
-    struct perf_thread_map *threads = tid_set__map(&ctx->tids);
-    int idx, pid, max = 0;
-
-    if (threads) {
-        perf_thread_map__for_each_thread(pid, idx, threads)
-            if (pid > max)
-                max = pid;
-        perf_thread_map__put(threads);
-    }
-    return max;
-}
-
-/* When @r is to be rebuilt, 0: never. The rate limit comes on top. */
-static u64 task_state_role_due(struct task_state_role *r)
-{
-    u64 due = 0;
-
-    if (!r->evsel)
-        return 0;
-    // The most urgent: the earliest.
-    if (r->uncovered || r->dropped >= TASK_STATE_REFILTER_DROPS)
-        due = r->built;
-    if (r->tail_open && r->add_due && (!due || r->add_due < due))
-        due = r->add_due;
-    if (r->del_due && (!due || r->del_due < due))
-        due = r->del_due;
-    if (due && due < r->built + TASK_STATE_REFILTER_INTERVAL)
-        due = r->built + TASK_STATE_REFILTER_INTERVAL;
-    return due;
-}
-
-/* Fire at the first role due, at least 1ms on: 0 stops a timerfd. */
-static void task_state_refilter_schedule(struct task_state_ctx *ctx)
-{
-    u64 now, at = 0;
-    int role;
-
-    for (role = 0; role < ROLE_MAX; role++) {
-        u64 due = task_state_role_due(&ctx->role[role]);
-        if (due && (!at || due < at))
-            at = due;
-    }
-    if (at == ctx->refilter_at)
-        return;
-    ctx->refilter_at = at;
-    if (!at) {
-        timer_cancel(&ctx->refilter);
-        return;
-    }
-    now = get_ktime_ns();
-    timer_start(&ctx->refilter, at > now + NSEC_PER_MSEC ? at - now : NSEC_PER_MSEC, true);
-}
-
-/* @r has a new filter, of @r->ranges: what was due is done. */
-static void task_state_built(struct task_state_ctx *ctx, struct task_state_role *r, int tail)
-{
-    r->dropped = 0;
-    r->uncovered = false;
-    r->tail_open = tail >= 0;
-    r->tail = tail;
-    if (!r->tail_open)
-        r->add_due = 0;
-    r->del_due = r->del_first = 0;
-    r->exact = task_state_exact(ctx, r->ranges);
-}
-
-/*
- * Replace the evsel of @role by one whose filter covers the followed threads
- * now. The tail stays open while new threads come (@add_due ahead), else it
- * closes. @tighten: replaced for the records dropped, an open tail moves on
- * to the pid allocated last.
- *
- * On error the old evsel keeps working with its filter.
- */
-static int task_state_refilter(struct prof_dev *dev, int role, bool tighten)
-{
-    struct task_state_ctx *ctx = dev->private;
-    struct task_state_role *r = &ctx->role[role];
-    struct perf_event_attr attr;
-    struct pid_ranges *ranges;
-    struct perf_evsel *evsel;
-    char *filter;
-    int tail = r->tail_open ? r->tail : -1;
-    int err;
-
-    r->built = get_ktime_ns();
-    if (r->tail_open) {
-        if (!r->add_due || r->add_due <= r->built)
-            tail = -1;
-        else if (tighten) {
-            int last = task_state_last_pid();
-            tail = (last > 0 ? last : task_state_max_tid(ctx)) + 1;
-        }
-    }
-    filter = task_state_pid_filter(dev, role, tail, &ranges);
-    if (!filter) {
-        ctx->stat.replace_failed++;
-        return -ENOMEM;
-    }
-    // Nothing to tighten, count again.
-    if (r->filter && !strcmp(filter, r->filter)) {
-        free(r->ranges);
-        r->ranges = ranges;
-        task_state_built(ctx, r, tail);
-        task_state_ftrace_filter_update(dev);
-        free(filter);
-        return 0;
-    }
-
-    attr = *perf_evsel__attr(r->evsel);
-    attr.disabled = 1;
-    evsel = task_state_evsel_new(role, &attr);
-    if (!evsel) {
-        err = -ENOMEM;
-        goto out_free;
-    }
-    err = perf_evsel__open(evsel, perf_evlist__cpus(dev->evlist), perf_evlist__threads(dev->evlist));
-    if (err < 0)
-        goto out_delete;
-    err = perf_evsel__apply_filter(evsel, filter);
-    if (err < 0)
-        goto out_close;
-
-    memset(ctx->twin, 0, ctx->nr_cpus * ROLE_MAX * sizeof(*ctx->twin));
-    ctx->replacing = true;
-    task_state_ftrace_filter_update(dev);
-    err = prof_dev_replace_evsel(dev, r->evsel, evsel);
-    ctx->replacing = false;
-    if (err < 0) {
-        task_state_ftrace_filter_update(dev);
-        goto out_close;
-    }
-
-    r->evsel = evsel;
-    free(r->filter);
-    free(r->ranges);
-    r->filter = filter;
-    r->ranges = ranges;
-    task_state_built(ctx, r, tail);
-    ctx->stat.replaced++;
-    if (dev->env->verbose >= VERBOSE_NOTICE) {
-        print_time(stdout);
-        printf("task-state: replace sched:%s filter \"%s\"\n", role_name[role], filter);
-    }
-    task_state_ftrace_filter_update(dev);
-    return 0;
-
-out_close:
-    perf_evsel__close(evsel);
-out_delete:
-    perf_evsel__delete(evsel);
-out_free:
-    free(filter);
-    free(ranges);
-    ctx->stat.replace_failed++;
-    return err;
-}
-
-
-/* Out of event processing: rebuild the roles due, see TASK_STATE_REFILTER_DROPS. */
-static void task_state_refilter_timer(struct timer *timer)
-{
-    struct task_state_ctx *ctx = container_of(timer, struct task_state_ctx, refilter);
-    struct prof_dev *dev = ctx->dev;
-    u64 now = get_ktime_ns();
-    int role;
-
-    timer_cancel(timer);
-    ctx->refilter_at = 0;
-    if (dev->inclose)
-        return;
-    for (role = 0; role < ROLE_MAX; role++) {
-        struct task_state_role *r = &ctx->role[role];
-        u64 due = task_state_role_due(r);
-
-        // On error the role is due again an interval on.
-        if (due && due <= now)
-            task_state_refilter(dev, role, r->dropped >= TASK_STATE_REFILTER_DROPS);
-    }
-    task_state_refilter_schedule(ctx);
 }
 
 static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
@@ -932,50 +657,28 @@ static int task_state_add_thread(struct prof_dev *dev, pid_t pid)
     /* No tid filter to follow the thread: the default. */
     if (!ctx->thread_map)
         return perf_evlist__add_thread(dev->evlist, pid);
-    /* The events stay on all cpus, only the tid filter takes the thread. */
-    if (pid < 0)
+    /* The events stay on all cpus, only the pid filters take the thread. */
+    if (pid < 0 || !ctx->follow)
         return 0;
-    ret = tid_set__add(&ctx->tids, pid);
-    if (ret <= 0)
-        return ret;
+    if (pid_filter_follows(ctx->role[ROLE_SWITCH].pf, pid))
+        return 0;
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
         printf("task-state: add thread %d\n", pid);
     }
-    if (!ctx->follow)
-        return 0;
 
     /*
-     * A new thread not let in opens the tail from its tid on: the later ones
-     * get the next tids, they are let in without another replacement. After
-     * a pid wrap the tail ends at the next followed thread; a new thread past
-     * it, or past the gaps, moves the tail on to its tid. ptrace keeps the
-     * thread stopped until this returns, no event of it is missed.
+     * A role not letting in the thread replaces its evsel at once. ptrace
+     * keeps the thread stopped until this returns, no event of it is missed.
      */
     for (role = 0; role < ROLE_MAX; role++) {
-        struct task_state_role *r = &ctx->role[role];
-
-        if (!r->evsel)
+        if (!ctx->role[role].pf)
             continue;
-        // Keep the tail open a while for the threads to come.
-        r->add_due = get_ktime_ns() + TASK_STATE_ADD_DELAY;
-        if (pid_ranges_has(r->ranges, pid))
-            continue;
-        r->tail_open = true;
-        r->tail = pid;
-        ret = task_state_refilter(dev, role, false);
-        if (ret < 0) {
-            /* The thread stays followed; this role misses it until the retry. */
-            r->uncovered = true;
-            if (!ctx->warned) {
-                fprintf(stderr, "task-state: sched:%s misses thread %d, retry later: %s\n",
-                        role_name[role], pid, strerror(-ret));
-                ctx->warned = true;
-            }
-        }
+        ret = pid_filter_add(ctx->role[role].pf, pid);
+        if (ret < 0)
+            return ret;
     }
-    task_state_refilter_schedule(ctx);
     return 0;
 }
 
@@ -1013,14 +716,14 @@ static void task_state_settle_node(struct prof_dev *dev, int pid)
 static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
 {
     struct task_state_ctx *ctx = dev->private;
+    int role;
 
-    if (!ctx->thread_map || pid < 0)
+    if (!ctx->follow || pid < 0)
         return 0;
-    if (!tid_set__has(&ctx->tids, pid))
+    if (!pid_filter_follows(ctx->role[ROLE_SWITCH].pf, pid))
         return 0;
 
     task_state_settle_node(dev, pid);
-    tid_set__del(&ctx->tids, pid);
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
@@ -1028,28 +731,12 @@ static int task_state_del_thread(struct prof_dev *dev, pid_t pid)
     }
     /*
      * The filters still let in the tid, a new task may get it after a pid
-     * wrap: ftrace_filter drops its records from now on. The pid does not
-     * wrap soon, the rebuild waits for the exits to settle, then
-     * ftrace_filter may be off again.
+     * wrap: ftrace_filter drops its records from now on. The filters are
+     * tightened once the exits settle, then ftrace_filter may be off again.
      */
-    if (ctx->follow) {
-        u64 now = get_ktime_ns();
-        int role;
-
-        for (role = 0; role < ROLE_MAX; role++) {
-            struct task_state_role *r = &ctx->role[role];
-
-            if (!r->evsel)
-                continue;
-            r->exact = false;
-            if (!r->del_first)
-                r->del_first = now;
-            r->del_due = now + TASK_STATE_DEL_DELAY;
-            if (r->del_due > r->del_first + TASK_STATE_DEL_MAX)
-                r->del_due = r->del_first + TASK_STATE_DEL_MAX;
-        }
-        task_state_ftrace_filter_update(dev);
-        task_state_refilter_schedule(ctx);
+    for (role = 0; role < ROLE_MAX; role++) {
+        if (ctx->role[role].pf)
+            pid_filter_del(ctx->role[role].pf, pid);
     }
     return 0;
 }
@@ -1114,7 +801,7 @@ static void task_state_deinit(struct prof_dev *dev)
     task_state_interval(dev);
     if (ctx->follow && dev->env->verbose >= VERBOSE_NOTICE)
         printf("task-state: replaced %lu replace_failed %lu dropped %lu twins %lu\n",
-               ctx->stat.replaced, ctx->stat.replace_failed, ctx->stat.dropped, ctx->stat.twins);
+               ctx->stat.replaced, ctx->stat.replace_failed, ctx->stat.dropped, dev->replace_stat.dups);
 
     monitor_ctx_exit(dev);
 }
@@ -1189,45 +876,10 @@ static void __raw_size(struct prof_dev *dev, union perf_event *event, void **pra
 }
 
 /*
- * While an evsel is replaced, the old and the new one both write the records
- * that pass their filters: twins with the same raw data, different sample ids
- * and times tens of ns apart, one after the other in the ring buffer of the
- * cpu. Other roles may come between, sched_switch has two; not another
- * record of the same role. So a record of the role of the last one, from the
- * other evsel and with the same raw data, is the twin: drop it and forget the
- * last one, a pair is dropped once.
- *
- * Two real records in a row with the same raw data take nothing more: before
- * the twins come, the last of the old evsel only takes the place of the first
- * twin, which differs by its time only.
- */
-static bool task_state_twin(struct task_state_ctx *ctx, int cpu, int role,
-                            struct perf_evsel *evsel, void *raw, int size)
-{
-    struct task_state_twin *last;
-
-    if (cpu < 0 || cpu >= ctx->nr_cpus)
-        return false;
-    last = &ctx->twin[cpu * ROLE_MAX + role];
-    if (last->evsel && last->evsel != evsel && last->size == size &&
-        !memcmp(last->raw, raw, size)) {
-        last->evsel = NULL;
-        return true;
-    }
-    if (size <= TASK_STATE_TWIN_RAW) {
-        last->evsel = evsel;
-        last->size = size;
-        memcpy(last->raw, raw, size);
-    } else
-        last->evsel = NULL;
-    return false;
-}
-
-/*
  * Keep the records of the followed threads only, for both sample() and
  * forwarding; the kernel filter lets in a superset. Each role checks the pid
- * it is about. Too many dropped: tighten the kernel filter, out of event
- * processing.
+ * it is about. pid_filter_match() counts the dropped ones, too many
+ * tighten the kernel filter.
  */
 static long task_state_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
 {
@@ -1235,33 +887,28 @@ static long task_state_ftrace_filter(struct prof_dev *dev, union perf_event *eve
     struct sample_type_header *data = (void *)event->sample.array;
     struct perf_evsel *evsel;
     struct task_state_role *r;
+    union sched_event *sched_event;
     void *raw;
-    int size, role, pid;
+    int size, role;
+    pid_t pid;
 
     evsel = perf_evlist__id_to_evsel(dev->evlist, data->id, NULL);
     role = task_state_role(evsel);
     if (role < 0)
         return 1;
     __raw_size(dev, event, &raw, &size);
-    if (unlikely(ctx->replacing) &&
-        task_state_twin(ctx, data->cpu_entry.cpu, role, evsel, raw, size)) {
-        ctx->stat.twins++;
-        return 0;
-    }
-
+    sched_event = raw;
     if (role == ROLE_SWITCH)
-        pid = ((struct sched_switch *)raw)->prev_pid;
+        pid = sched_event->sched_switch.prev_pid;
     else if (role == ROLE_SWITCH_NEXT)
-        pid = ((struct sched_switch *)raw)->next_pid;
+        pid = sched_event->sched_switch.next_pid;
     else
-        pid = ((struct sched_wakeup *)raw)->pid;
-    if (pid > 0 && tid_set__has(&ctx->tids, pid))
+        pid = sched_event->sched_wakeup.pid;
+    r = &ctx->role[role];
+    if (!r->pf || pid_filter_match(r->pf, pid))
         return 1;
 
-    r = &ctx->role[role];
     ctx->stat.dropped++;
-    if (++r->dropped == TASK_STATE_REFILTER_DROPS)
-        task_state_refilter_schedule(ctx);
     return 0;
 }
 
@@ -1561,7 +1208,7 @@ static void task_state_sigusr(struct prof_dev *dev, int signum)
                    "  replace_failed: %lu\n"
                    "  dropped: %lu\n"
                    "  twins: %lu\n",
-                   ctx->stat.replaced, ctx->stat.replace_failed, ctx->stat.dropped, ctx->stat.twins);
+                   ctx->stat.replaced, ctx->stat.replace_failed, ctx->stat.dropped, dev->replace_stat.dups);
     }
 }
 
@@ -1573,13 +1220,14 @@ static void task_state_print_dev(struct prof_dev *dev, int indent)
     dev_printf("filter:\n");
     for (role = 0; role < ROLE_MAX; role++) {
         if (ctx->role[role].evsel)
-            dev_printf("    %s: %s\n", role_name[role], ctx->role[role].filter ?: "");
+            dev_printf("    %s: %s\n", role_name[role],
+                       (ctx->follow ? pid_filter_string(ctx->role[role].pf) : ctx->role[role].filter) ?: "");
     }
     if (ctx->follow) {
         dev_printf("replaced: %lu\n", ctx->stat.replaced);
         dev_printf("replace_failed: %lu\n", ctx->stat.replace_failed);
         dev_printf("dropped: %lu\n", ctx->stat.dropped);
-        dev_printf("twins: %lu\n", ctx->stat.twins);
+        dev_printf("twins: %lu\n", dev->replace_stat.dups);
     }
 
     if (!prof_dev_is_final(dev))
