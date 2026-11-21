@@ -92,12 +92,7 @@ struct multi_trace_ctx {
     u64 event_handled;
     u64 sched_wakeup_unnecessary;
     struct callchain_ctx *cc;
-    struct perf_thread_map *thread_map; // profiler rundelay, the threads asked for
-    struct tid_set tids; // profiler rundelay, the threads followed now
     bool comm; // profiler rundelay, syscalls
-    /* profiler rundelay: tids change via ptrace; pid is matched in
-     * sample(), not SET_FILTER. */
-    bool dynamic_threads;
     int level; // level = sched_init()
 
     /* lost */
@@ -604,10 +599,6 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     struct lost_node *lost, *next;
 
     while (multi_trace_first_pending(dev, NULL)) ;
-
-    if (ctx->thread_map)
-        tid_set__exit(&ctx->tids);
-    perf_thread_map__put(ctx->thread_map);
 
     rblist__exit(&ctx->backup);
     rblist__exit(&ctx->timeline);
@@ -1661,24 +1652,6 @@ static long multi_trace_ftrace_filter(struct prof_dev *dev, union perf_event *ev
     return 0;
 }
 
-/*
- * profiler rundelay: in dynamic_threads mode the kernel filter carries no
- * pid list (SET_FILTER cannot be replaced on an enabled tracepoint), so
- * match the followed tids here, like task_state_tracked() does.
- * pid <= 0 (swapper and friends) is dropped, as the kernel `pid' filter
- * does in the static mode.
- */
-static bool rundelay_untracked(struct multi_trace_ctx *ctx, u64 key)
-{
-    pid_t pid = (int)key;
-
-    if (!ctx->thread_map)
-        return false;
-    if (pid <= 0)
-        return true;
-    return !tid_set__has(&ctx->tids, pid);
-}
-
 static int multi_trace_del_thread(struct prof_dev *dev, pid_t tid)
 {
     struct multi_trace_ctx *ctx = dev->private;
@@ -1703,7 +1676,7 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
     struct perf_record_dev *event_dev = NULL;
-    struct tp *tp = NULL, *tp1 = NULL;
+    struct tp *tp = NULL, *tp1 = NULL, *etp = NULL;
     struct timeline_node current;
     struct perf_evsel *evsel;
     void *raw = NULL;
@@ -1723,6 +1696,8 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
         evsel = (void *)prof_dev_top_cloned(event_dev->dev);
     } else {
         evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
+        // tp->evsel may be replaced: the old one is read to the end meanwhile.
+        etp = evsel ? perf_evsel_tp(evsel) : NULL;
     }
     if (!evsel)
         goto not_found;
@@ -1730,7 +1705,7 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     for (i = 0; i < ctx->nr_list; i++) {
         tp1 = NULL;
         for_each_tp(ctx->tp_list[i], tp, j) {
-            if (tp->evsel == evsel)
+            if (tp->evsel == evsel || (etp && tp == etp))
                 goto found;
             if (!tp->untraced)
                 tp1 = tp;
@@ -1803,18 +1778,6 @@ found:
         key = tp_get_key(tp, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size));
     } else
         key = binding;
-
-    /*
-     * profiler rundelay: in dynamic_threads mode, drop events whose key pid
-     * is neither in the followed tids nor recently deleted. The filter
-     * runs after sched_event() above, so the unnecessary-wakeup detection
-     * still sees the full system state. Events without a key (untraced and
-     * other auxiliary events) are never filtered: the kernel pid filter of
-     * the static mode does not filter them either.
-     */
-    if (ctx->dynamic_threads && tp->key_prog &&
-        rundelay_untracked(ctx, key))
-        goto not_found;
 
     current.time = hdr->time;
     current.key = key;
@@ -2497,51 +2460,280 @@ static profiler nested_trace = {
 PROFILER_REGISTER(nested_trace);
 
 
+/*
+ * profiler rundelay: a sched tp with the pid key, following the threads by
+ * its kernel filter, see rundelay_filter().
+ */
+struct rundelay_follow {
+    struct tp *tp;
+    int offset;                 // of the pid in the raw data
+    struct pid_filter *pf;      // shares the pids of follows[0]
+};
+
+/*
+ * profiler rundelay: follow the threads of thread_map, ptrace adds and
+ * removes them. The kernel filters let in a superset, ftrace_filter keeps
+ * the exact ones. The followed ones are in the pids of follows[0].
+ * The multi_trace functions take dev->private as the mt.
+ */
+struct rundelay_ctx {
+    struct multi_trace_ctx mt;  // the first
+    struct perf_thread_map *thread_map; // the threads asked for
+    bool follow;
+    bool warned;
+    int nr_follow;
+    struct rundelay_follow follows[4];
+    int nr_ftrace_filter;       // the follows letting in more than the followed threads
+    struct {
+        u64 replaced;
+        u64 replace_failed;
+        u64 dropped;
+    } follow_stat;
+};
+
+/*
+ * A tp with the pid key but no kernel filter on it, e.g.
+ * sched:sched_migrate_task//untraced/key=pid/: ftrace_filter follows the
+ * threads, see rundelay_untracked().
+ */
+static bool rundelay_unfollowed(struct rundelay_ctx *ctx, struct tp *tp)
+{
+    return ctx->nr_follow && tp->key_prog && !(tp->evsel && perf_evsel_cookie(tp->evsel) > 0);
+}
+
+/*
+ * ftrace_filter is needed while a kernel filter lets in more than the
+ * followed threads, a filter fell back to userspace, or a tp is unfollowed.
+ */
+static void rundelay_ftrace_filter_update(struct prof_dev *dev)
+{
+    struct rundelay_ctx *ctx = dev->private;
+    bool need = ctx->nr_ftrace_filter > 0;
+    struct tp *tp;
+    int i, j;
+
+    for (i = 0; i < ctx->mt.nr_list; i++)
+        for_each_real_tp(ctx->mt.tp_list[i], tp, j)
+            if (tp->ftrace_filter || rundelay_unfollowed(ctx, tp))
+                need = true;
+    if (dev->ftrace_filter != need && dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: ftrace_filter %s\n", need ? "on" : "off");
+    }
+    dev->ftrace_filter = need;
+}
+
+static struct rundelay_follow *rundelay_pf_follow(struct rundelay_ctx *ctx, struct pid_filter *pf)
+{
+    int i;
+
+    for (i = 0; i < ctx->nr_follow; i++)
+        if (ctx->follows[i].pf == pf)
+            break;
+    return &ctx->follows[i];
+}
+
+/*
+ * Put the filter of a followed tp in the kernel: multi_trace_filter()
+ * applies tp->filter, then the evsel is replaced. On error the old one keeps
+ * working, pid_filter retries later.
+ */
+static int rundelay_set_filter(struct pid_filter *pf, void *opaque, const char *filter, bool initial)
+{
+    struct prof_dev *dev = opaque;
+    struct rundelay_ctx *ctx = dev->private;
+    struct rundelay_follow *f = rundelay_pf_follow(ctx, pf);
+    int err;
+
+    if (initial) {
+        tp_update_filter(f->tp, filter);
+        return f->tp->filter ? 0 : -ENOMEM;
+    }
+    if (dev->inclose)
+        return -EBUSY;
+    err = prof_dev_replace_filter(dev, &f->tp->evsel, filter);
+    if (err < 0) {
+        ctx->follow_stat.replace_failed++;
+        if (!ctx->warned) {
+            fprintf(stderr, "rundelay: replace %s:%s filter failed, retry later: %s\n",
+                    f->tp->sys, f->tp->name, strerror(-err));
+            ctx->warned = true;
+        }
+        return err;
+    }
+    tp_update_filter(f->tp, filter);
+    ctx->follow_stat.replaced++;
+    if (dev->env->verbose >= VERBOSE_NOTICE) {
+        print_time(stdout);
+        printf("rundelay: replace %s:%s filter \"%s\"\n", f->tp->sys, f->tp->name, filter);
+    }
+    return 0;
+}
+
+/* The follows letting in more are counted: one needs ftrace_filter, all do not. */
+static void rundelay_need_ftrace_filter(struct pid_filter *pf, void *opaque, bool need)
+{
+    struct prof_dev *dev = opaque;
+    struct rundelay_ctx *ctx = dev->private;
+
+    ctx->nr_ftrace_filter += need ? 1 : -1;
+    rundelay_ftrace_filter_update(dev);
+}
+
+static const struct pid_filter_ops rundelay_pf_ops = {
+    .set = rundelay_set_filter,
+    .ftrace_filter = rundelay_need_ftrace_filter,
+};
+
+/*
+ * Keep the records of the followed threads only; the kernel filter lets in a
+ * superset. pid_filter_match() counts the dropped ones, too many tighten the
+ * kernel filter.
+ */
+static bool rundelay_match(struct rundelay_ctx *ctx, struct rundelay_follow *f, void *raw, int size)
+{
+    pid_t pid = f->offset + (int)sizeof(pid_t) <= size ? *(pid_t *)(raw + f->offset) : -1;
+
+    if (pid_filter_match(f->pf, pid))
+        return true;
+    ctx->follow_stat.dropped++;
+    return false;
+}
+
+/*
+ * The key of an unfollowed tp is a thread not followed. pid <= 0 (swapper
+ * and friends) is dropped, as by the kernel filters.
+ */
+static bool rundelay_untracked(struct rundelay_ctx *ctx, u64 key)
+{
+    pid_t pid = (int)key;
+
+    if (pid <= 0)
+        return true;
+    return !pid_filter_follows(ctx->follows[0].pf, pid);
+}
+
+static long rundelay_ftrace_filter(struct prof_dev *dev, union perf_event *event, int cpu, int tid)
+{
+    struct rundelay_ctx *ctx = dev->private;
+    struct multi_trace_type_header *hdr = (void *)event->sample.array;
+    struct perf_evsel *evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
+    struct tp *tp = evsel ? perf_evsel_tp(evsel) : NULL;
+    long cookie;
+    void *raw;
+    int size;
+
+    if (!tp || !ctx->nr_follow)
+        goto out;
+
+    // The cookie of the evsel of a followed tp: its index + 1.
+    cookie = perf_evsel_cookie(evsel);
+    if (cookie > 0) {
+        multi_trace_raw_size(event, &raw, &size, tp);
+        if (!rundelay_match(ctx, &ctx->follows[cookie - 1], raw, size))
+            return 0;
+    } else if (tp->key_prog) {
+        multi_trace_raw_size(event, &raw, &size, tp);
+        if (rundelay_untracked(ctx, tp_get_key(tp, GLOBAL(hdr->cpu_entry.cpu, hdr->tid_entry.pid, raw, size))))
+            return 0;
+    }
+out:
+    return multi_trace_ftrace_filter(dev, event, cpu, tid);
+}
+
+static void rundelay_print_dev(struct prof_dev *dev, int indent)
+{
+    struct rundelay_ctx *ctx = dev->private;
+
+    multi_trace_print_dev(dev, indent);
+    if (ctx->follow) {
+        dev_printf("replaced: %lu\n", ctx->follow_stat.replaced);
+        dev_printf("replace_failed: %lu\n", ctx->follow_stat.replace_failed);
+        dev_printf("dropped: %lu\n", ctx->follow_stat.dropped);
+        dev_printf("twins: %lu\n", dev->replace_stat.dups);
+    }
+}
+
+static void rundelay_exit(struct prof_dev *dev)
+{
+    struct rundelay_ctx *ctx = dev->private;
+    int i;
+
+    multi_trace_interval(dev);
+
+    if (ctx->follow && dev->env->verbose >= VERBOSE_NOTICE)
+        printf("rundelay: replaced %lu replace_failed %lu dropped %lu twins %lu\n",
+               ctx->follow_stat.replaced, ctx->follow_stat.replace_failed, ctx->follow_stat.dropped,
+               dev->replace_stat.dups);
+    for (i = 0; i < ctx->nr_follow; i++)
+        pid_filter_free(ctx->follows[i].pf);
+    perf_thread_map__put(ctx->thread_map);
+
+    monitor_ctx_exit(dev);
+}
+
 static int rundelay_add_thread(struct prof_dev *dev, pid_t pid)
 {
-    struct multi_trace_ctx *ctx = dev->private;
-    int ret;
+    struct rundelay_ctx *ctx = dev->private;
+    int i, ret;
 
     /* No tid filter to follow the thread: the default. */
     if (!ctx->thread_map)
         return perf_evlist__add_thread(dev->evlist, pid);
-    /* The events stay on all cpus, only the tid filter takes the thread. */
-    if (pid < 0)
+    /* The events stay on all cpus, only the pid filters take the thread. */
+    if (pid < 0 || !ctx->nr_follow)
         return 0;
-    ret = tid_set__add(&ctx->tids, pid);
-    if (ret <= 0)
-        return ret;
+    if (pid_filter_follows(ctx->follows[0].pf, pid))
+        return 0;
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
         printf("rundelay: add thread %d\n", pid);
+    }
+
+    /*
+     * A filter not letting in the thread replaces its evsel at once. ptrace
+     * keeps the thread stopped until this returns, no event of it is missed.
+     */
+    for (i = 0; i < ctx->nr_follow; i++) {
+        ret = pid_filter_add(ctx->follows[i].pf, pid);
+        if (ret < 0)
+            return ret;
     }
     return 0;
 }
 
 static int rundelay_del_thread(struct prof_dev *dev, pid_t pid)
 {
-    struct multi_trace_ctx *ctx = dev->private;
+    struct rundelay_ctx *ctx = dev->private;
+    int i;
 
-    if (!ctx->thread_map || pid < 0)
+    if (pid < 0 || !ctx->nr_follow)
         return 0;
-    if (!tid_set__has(&ctx->tids, pid))
+    if (!pid_filter_follows(ctx->follows[0].pf, pid))
         return 0;
 
     reclaim(dev, pid, REMAINING_EXIT);
-    tid_set__del(&ctx->tids, pid);
 
     if (dev->env->verbose >= VERBOSE_NOTICE) {
         print_time(stdout);
         printf("rundelay: del thread %d\n", pid);
     }
+    /*
+     * The filters still let in the tid, a new task may get it after a pid
+     * wrap: ftrace_filter drops its records from now on. The filters are
+     * tightened once the exits settle.
+     */
+    for (i = 0; i < ctx->nr_follow; i++)
+        pid_filter_del(ctx->follows[i].pf, pid);
     return 0;
 }
 
 static int rundelay_init(struct prof_dev *dev)
 {
     struct env *env = dev->env;
-    struct multi_trace_ctx *ctx = zalloc(sizeof(*ctx));
+    struct rundelay_ctx *ctx = zalloc(sizeof(*ctx));
+    struct perf_thread_map *threads;
     if (!ctx)
         return -1;
     dev->private = ctx;
@@ -2550,28 +2742,23 @@ static int rundelay_init(struct prof_dev *dev)
         /**
          * sched:sched_switch and sched:sched_wakeup are not suitable for binding to threads
         **/
-        if (tid_set__init(&ctx->tids, dev->threads) < 0) {
-            free(ctx);
-            dev->private = NULL;
-            return -1;
-        }
         ctx->thread_map = dev->threads;
         perf_cpu_map__put(dev->cpus);
         dev->cpus = perf_cpu_map__new(NULL);
         dev->threads = perf_thread_map__new_dummy();
         /*
-         * SET_FILTER cannot be replaced on an enabled tracepoint here
-         * (EEXIST). With ptrace the pid set changes, so match in
-         * sample() instead of pinning a kernel pid filter.
-         * With --filter the filter matches comm only, so new threads
-         * of the same comm are let through by the kernel anyway.
+         * The kernel pid filters are a superset: the gaps are merged to fit
+         * the length limit, and a fd's filter cannot be changed (SET_FILTER
+         * returns EEXIST), the evsel is replaced to follow new threads.
+         * ftrace_filter matches the threads exactly, on until the filters
+         * are set. --filter matches the comm instead of the pid.
          */
-        if (!env->filter && (env->using_ptrace || env->workload.pid > 0 ||
-                             (dev->links.parent &&
-                              dev->links.parent->env->using_ptrace)))
-            ctx->dynamic_threads = true;
+        if (!env->filter) {
+            ctx->follow = true;
+            dev->ftrace_filter = 1;
+        }
     }
-    ctx->comm = 1;
+    ctx->mt.comm = 1;
 
     /*
      * The device has been converted to cpu bound, so prof_dev_open() will
@@ -2580,41 +2767,86 @@ static int rundelay_init(struct prof_dev *dev)
      * track the newly created threads.
      */
     if (ctx->thread_map && !env->filter && (env->workload.pid > 0 ||
-                                            env->using_ptrace)) {
+                                               env->using_ptrace)) {
         ptrace_attach(ctx->thread_map, dev);
     }
 
-    return multi_trace_init(dev);
+    threads = ctx->thread_map;
+    // On error ctx is freed by monitor_ctx_exit().
+    if (multi_trace_init(dev) < 0) {
+        perf_thread_map__put(threads);
+        return -1;
+    }
+    return 0;
 }
+
+/*
+ * Follow the threads by the kernel filter of @tp on @field, the pid at
+ * @offset of the raw data, see rundelay_match(). multi_trace_filter()
+ * applies tp->filter.
+ */
+static int rundelay_follow(struct prof_dev *dev, struct tp *tp, const char *field, int offset,
+                           const char *and_filter)
+{
+    struct rundelay_ctx *ctx = dev->private;
+    struct rundelay_follow *f;
+    int err;
+
+    if (ctx->nr_follow == ARRAY_SIZE(ctx->follows) || !tp->evsel)
+        return -EINVAL;
+    f = &ctx->follows[ctx->nr_follow];
+    f->pf = pid_filter_new(field, and_filter, ctx->nr_follow ? ctx->follows[0].pf : NULL,
+                           &rundelay_pf_ops, dev);
+    if (!f->pf)
+        return -ENOMEM;
+    ctx->nr_follow++;
+    f->tp = tp;
+    f->offset = offset;
+    // Found again by the cookie, also on the replaced evsels.
+    if (perf_evsel_set_cookie(tp->evsel, ctx->nr_follow) < 0)
+        return -ENOMEM;
+    if (ctx->nr_follow == 1) {
+        err = pid_filter_add_threads(f->pf, ctx->thread_map);
+        if (err < 0)
+            return err;
+    }
+    return pid_filter_start(f->pf);
+}
+
 #define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 static int rundelay_filter(struct prof_dev *dev)
 {
     struct env *env = dev->env;
-    struct multi_trace_ctx *ctx = dev->private;
-    int i, j, len;
+    struct rundelay_ctx *ctx = dev->private;
+    int i, j, err;
     int sched_wakeup = tep__event_id("sched", "sched_wakeup");
     int sched_wakeup_new = tep__event_id("sched", "sched_wakeup_new");
     int sched_switch = tep__event_id("sched", "sched_switch");
     int match = 0;
 
-    for (i = 0; i < ctx->nr_list; i++) {
+    for (i = 0; i < ctx->mt.nr_list; i++) {
         struct tp *tp;
-        for_each_real_tp(ctx->tp_list[i], tp, j) {
+        for_each_real_tp(ctx->mt.tp_list[i], tp, j) {
             if (!tp->untraced &&
                 (tp->id == sched_wakeup || tp->id == sched_wakeup_new || tp->id == sched_switch)) {
                 struct tp_filter *tp_filter = NULL;
                 char buff[4096];
                 char *filter = NULL;
 
+                err = 0;
                 if (tp->id == sched_wakeup || tp->id == sched_wakeup_new) {
                     if (i == 0) {
                         if (tp_set_key(tp, "pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
-                                                  "pid", env->filter, "comm");
+                        if (ctx->follow)
+                            err = rundelay_follow(dev, tp, "pid", offsetof(struct sched_wakeup, pid), NULL);
+                        else
+                            tp_filter = tp_filter_new(ctx->thread_map, "pid", env->filter, "comm");
                     }
                 } else if (tp->id == sched_switch) {
                     if (i == 0) {
+                        int len;
+
                         if (tp_set_key(tp, "prev_pid") == 0)
                             match ++;
 
@@ -2622,26 +2854,39 @@ static int rundelay_filter(struct prof_dev *dev)
                         // prev_state==TASK_REPORT_MAX: preempted (4.14+)
                         // Both cases the task remains runnable and incurs scheduling delay.
                         if (kernel_release() >= KERNEL_VERSION(4, 14, 0))
-                            len = snprintf(buff, sizeof(buff), "(prev_state==%d||prev_state==0)", TASK_REPORT_MAX);
+                            len = snprintf(buff, sizeof(buff), "prev_state==%d||prev_state==0", TASK_REPORT_MAX);
                         else
                             len = snprintf(buff, sizeof(buff), "prev_state==0");
 
-                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
-                                                  "prev_pid", env->filter, "prev_comm");
-                        if (tp_filter) {
-                            snprintf(buff+len, sizeof(buff)-len, " && (%s)", tp_filter->filter);
-                            filter = buff;
-                        } else {
-                            snprintf(buff+len, sizeof(buff)-len, " && prev_pid>0");
-                            tp_update_filter(tp, buff);
+                        if (ctx->follow)
+                            err = rundelay_follow(dev, tp, "prev_pid", offsetof(struct sched_switch, prev_pid), buff);
+                        else {
+                            tp_filter = tp_filter_new(ctx->thread_map, "prev_pid", env->filter, "prev_comm");
+                            memmove(buff + 1, buff, len + 1);
+                            buff[0] = '(';
+                            len++;
+                            len += snprintf(buff+len, sizeof(buff)-len, ")");
+                            if (tp_filter) {
+                                snprintf(buff+len, sizeof(buff)-len, " && (%s)", tp_filter->filter);
+                                filter = buff;
+                            } else {
+                                snprintf(buff+len, sizeof(buff)-len, " && prev_pid>0");
+                                tp_update_filter(tp, buff);
+                            }
                         }
                     }
                     if (i == 1) {
                         if (tp_set_key(tp, "next_pid") == 0)
                             match ++;
-                        tp_filter = tp_filter_new(ctx->dynamic_threads ? NULL : ctx->thread_map,
-                                                  "next_pid", env->filter, "next_comm");
+                        if (ctx->follow)
+                            err = rundelay_follow(dev, tp, "next_pid", offsetof(struct sched_switch, next_pid), NULL);
+                        else
+                            tp_filter = tp_filter_new(ctx->thread_map, "next_pid", env->filter, "next_comm");
                     }
+                }
+                if (err < 0) {
+                    fprintf(stderr, "rundelay: %s:%s filter failed: %s\n", tp->sys, tp->name, strerror(-err));
+                    return err;
                 }
 
                 if (tp_filter) {
@@ -2660,8 +2905,11 @@ static int rundelay_filter(struct prof_dev *dev)
         fprintf(stderr, "rundelay filter failed, found %d matching events.\n", match);
         return -1;
     }
-    ctx->level = sched_init(ctx->nr_list, ctx->tp_list);
-    return multi_trace_filter(dev);
+    ctx->mt.level = sched_init(ctx->mt.nr_list, ctx->mt.tp_list);
+    err = multi_trace_filter(dev);
+    if (err >= 0 && ctx->nr_follow)
+        rundelay_ftrace_filter_update(dev);
+    return err;
 }
 
 static void rundelay_help(struct help_ctx *hctx)
@@ -2734,14 +2982,14 @@ static profiler rundelay = {
     .init = rundelay_init,
     .filter = rundelay_filter,
     .enabled = multi_trace_enabled,
-    .deinit = multi_trace_exit,
+    .deinit = rundelay_exit,
     .flush = multi_trace_flush,
     .sigusr = multi_trace_sigusr,
-    .print_dev = multi_trace_print_dev,
+    .print_dev = rundelay_print_dev,
     .interval = multi_trace_interval,
     .minevtime = multi_trace_minevtime,
     .lost = multi_trace_lost,
-    .ftrace_filter = multi_trace_ftrace_filter,
+    .ftrace_filter = rundelay_ftrace_filter,
     .sample = multi_trace_sample,
     .add_thread = rundelay_add_thread,
     .del_thread = rundelay_del_thread,
