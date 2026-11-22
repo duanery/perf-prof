@@ -457,6 +457,8 @@ static int monitor_ctx_init(struct prof_dev *dev)
             goto failed;
         }
         stacks += ctx->tp_list[i]->nr_need_stack;
+        for_each_tp(ctx->tp_list[i], tp, j)
+            tp->list = i;
         for_each_real_tp(ctx->tp_list[i], tp, j) {
             if (env->verbose)
                 printf("name %s id %d filter %s stack %d\n", tp->name, tp->id, tp->filter, tp->stack);
@@ -1676,7 +1678,7 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
     struct multi_trace_ctx *ctx = dev->private;
     struct multi_trace_type_header *hdr = (void *)event->sample.array;
     struct perf_record_dev *event_dev = NULL;
-    struct tp *tp = NULL, *tp1 = NULL, *etp = NULL;
+    struct tp *tp = NULL, *tp1 = NULL;
     struct timeline_node current;
     struct perf_evsel *evsel;
     void *raw = NULL;
@@ -1692,29 +1694,32 @@ static void multi_trace_sample(struct prof_dev *dev, union perf_event *event, in
         ctx->recent_time = hdr->time;
 
     if (event->header.type == PERF_RECORD_DEV) {
+        struct prof_dev *source_dev;
+
         event_dev = (void *)event;
-        evsel = (void *)prof_dev_top_cloned(event_dev->dev);
-    } else {
-        evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
-        // tp->evsel may be replaced: the old one is read to the end meanwhile.
-        etp = evsel ? perf_evsel_tp(evsel) : NULL;
+        source_dev = prof_dev_top_cloned(event_dev->dev);
+        for (i = 0; i < ctx->nr_list; i++) {
+            for_each_dev_tp(ctx->tp_list[i], tp, j) {
+                if (tp->source_dev == source_dev)
+                    goto found;
+            }
+        }
+        goto not_found;
     }
+
+    evsel = perf_evlist__id_to_evsel(dev->evlist, hdr->id, NULL);
     if (!evsel)
         goto not_found;
+    /*
+     * The old evsel of a replaced one links the same tp: it is read to the
+     * end meanwhile, see rundelay_set_filter().
+     */
+    tp = perf_evsel_tp(evsel);
+    if (tp)
+        goto found;
 
-    for (i = 0; i < ctx->nr_list; i++) {
-        tp1 = NULL;
-        for_each_tp(ctx->tp_list[i], tp, j) {
-            if (tp->evsel == evsel || (etp && tp == etp))
-                goto found;
-            if (!tp->untraced)
-                tp1 = tp;
-        }
-    }
-
-    if (evsel == ctx->extra_evsel) {
+    if (evsel == ctx->extra_evsel)
         ctx->extra_sample(dev, event, cpu, tid);
-    }
 
 not_found:
     return;
@@ -1733,6 +1738,9 @@ found:
         multi_trace_raw_size(event, &raw, &size, tp);
 
     if (!ctx->nested) {
+        // -e A -e B -e C: A, the first, only backed up; C, the last, only finds the prev.
+        bool first = tp->list == 0;
+        bool last = tp->list == ctx->nr_list - 1;
         bool event_is_sched_wakeup_and_unnecessary = false;
         union {
             unsigned long role;
@@ -1755,17 +1763,17 @@ found:
          * For --cyele, role=3 for all events, you can use role ATTR to make some events
          * only as event1 or only as event2.
          */
-        need_find_prev = (i != 0 || env->cycle) && role.as_event2;
-        need_backup = (i != ctx->nr_list - 1 ? !event_is_sched_wakeup_and_unnecessary : env->cycle) &&
+        need_find_prev = (!first || env->cycle) && role.as_event2;
+        need_backup = (!last ? !event_is_sched_wakeup_and_unnecessary : env->cycle) &&
                       (role.as_event1);
         need_remove_from_backup = 1;
-        // no need to use tp1
-        tp1 = NULL;
 
         if (env->verbose > VERBOSE_NOTICE &&
-            i != ctx->nr_list - 1 && event_is_sched_wakeup_and_unnecessary)
+            !last && event_is_sched_wakeup_and_unnecessary)
             multi_trace_print_title(event, tp, "UNNECESSARY");
     } else {
+        // A_ret finds the backed up A, A is backed up.
+        tp1 = tp->call;
         need_find_prev = ctx->impl_based_on_call || tp1 != NULL;
         need_backup = tp1 == NULL;
         need_remove_from_backup = tp1 != NULL;
@@ -2366,6 +2374,7 @@ static int nested_trace_init(struct prof_dev *dev)
 
         if (!ctx->impl->object_new(ctx->class, tp1, tp2))
             goto failed;
+        tp2->call = tp1;
     }
     return 0;
 

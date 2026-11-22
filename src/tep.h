@@ -92,6 +92,11 @@ struct tp {
     struct expr_prog *role_prog;
     const char *role;
 
+    // multi-trace profiler, the index of its -e.
+    int list;
+    // nested-trace profiler, -e A,A_ret: A_ret's call is A, A's is NULL.
+    struct tp *call;
+
     // event spread
     void *broadcast;
     void *receive;
