@@ -2063,26 +2063,112 @@ static bool __sched_switch_samepid(struct tp *tp, void *raw, int size, int pid)
            pid == ((struct sched_switch *)raw)->next_pid;
 }
 
-static long preempt_state = 0;
-__ctor
-static void __sched_switch_preempt_state(void)
+/*
+ * Kernel constraint: sched:sched_switch reports a preempted prev task by one
+ * prev_state value, __trace_sched_switch_state() in
+ * include/trace/events/sched.h, and that value changed:
+ *  - up to v4.13, TASK_RUNNING | TASK_STATE_MAX. TASK_STATE_MAX moves with the
+ *    task states: 1024 up to v4.1, 2048 since 80ed87c8a9ca ("sched/wait:
+ *    Introduce TASK_NOLOAD and TASK_IDLE"), in v4.2, 4096 since 7dc603c9028e
+ *    ("sched/fair: Fix PELT integrity for new tasks"), in v4.8;
+ *  - TASK_STATE_MAX, 0x1000, since efb40f588b43 ("sched/tracing: Fix
+ *    trace_sched_switch task-state printing"), in v4.14;
+ *  - TASK_REPORT_MAX, 0x100, since 3f5fe9fef5b2 ("sched/debug: Fix task state
+ *    recording/printout"), in v4.15.
+ * Each one is the bit the print fmt tests to print "+":
+ *   REC->prev_state & <bit> ? "+" : ""
+ * so the bit is read from the format, not guessed by the kernel version: a
+ * distribution kernel backports these. A wrong value takes the preempted tasks
+ * for sleeping ones: rundelay misses them, task-state counts them as S/D.
+ */
+static long preempt_state = -1;
+
+static bool preempt_arg_eval(struct tep_print_arg *arg, long long *val)
 {
-    #define TASK_STATE_MAX      1024
+    long long left, right;
 
-    /*
-    #define TASK_REPORT         (TASK_RUNNING | TASK_INTERRUPTIBLE | \
-                         TASK_UNINTERRUPTIBLE | __TASK_STOPPED | \
-                         __TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | \
-                         TASK_PARKED)
-    #define TASK_REPORT_IDLE    (TASK_REPORT + 1)
-    #define TASK_REPORT_MAX     (TASK_REPORT_IDLE << 1)
-    */
-    #define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
+    if (arg->type == TEP_PRINT_ATOM) {
+        *val = strtoll(arg->atom.atom, NULL, 0);
+        return true;
+    }
+    if (arg->type == TEP_PRINT_TYPE)
+        return preempt_arg_eval(arg->typecast.item, val);
+    if (arg->type != TEP_PRINT_OP || !arg->op.left || !arg->op.right ||
+        !preempt_arg_eval(arg->op.left, &left) ||
+        !preempt_arg_eval(arg->op.right, &right))
+        return false;
 
-    if (kernel_release() >= KERNEL_VERSION(4, 14, 0))
-        preempt_state = TASK_REPORT_MAX;
-    else
-        preempt_state = TASK_STATE_MAX;
+    if (!strcmp(arg->op.op, "|")) *val = left | right;
+    else if (!strcmp(arg->op.op, "&")) *val = left & right;
+    else if (!strcmp(arg->op.op, "+")) *val = left + right;
+    else if (!strcmp(arg->op.op, "-")) *val = left - right;
+    else if (!strcmp(arg->op.op, "<<")) *val = left << right;
+    else if (!strcmp(arg->op.op, ">>")) *val = left >> right;
+    else return false;
+    return true;
+}
+
+static bool preempt_arg_is_prev_state(struct tep_print_arg *arg)
+{
+    while (arg && arg->type == TEP_PRINT_TYPE)
+        arg = arg->typecast.item;
+    return arg && arg->type == TEP_PRINT_FIELD && !strcmp(arg->field.name, "prev_state");
+}
+
+/* The bit of `REC->prev_state & <bit> ? "+" : ""', -1 if not there. */
+static long preempt_arg_search(struct tep_print_arg *arg)
+{
+    struct tep_print_arg *cond, *sel;
+    long long bit;
+    long ret;
+
+    if (!arg || arg->type != TEP_PRINT_OP)
+        return -1;
+
+    cond = arg->op.left;
+    sel = arg->op.right;
+    if (!strcmp(arg->op.op, "?") && cond && sel &&
+        cond->type == TEP_PRINT_OP && !strcmp(cond->op.op, "&") &&
+        sel->type == TEP_PRINT_OP && !strcmp(sel->op.op, ":") &&
+        sel->op.left && sel->op.left->type == TEP_PRINT_ATOM &&
+        !strcmp(sel->op.left->atom.atom, "+")) {
+        if (preempt_arg_is_prev_state(cond->op.left) && cond->op.right &&
+            preempt_arg_eval(cond->op.right, &bit))
+            return bit;
+        if (preempt_arg_is_prev_state(cond->op.right) && cond->op.left &&
+            preempt_arg_eval(cond->op.left, &bit))
+            return bit;
+    }
+    ret = preempt_arg_search(arg->op.left);
+    return ret >= 0 ? ret : preempt_arg_search(arg->op.right);
+}
+
+long tep__sched_switch_preempt_state(void)
+{
+    struct tep_print_arg *arg;
+    struct tep_event *event;
+    int id;
+
+    if (preempt_state >= 0)
+        return preempt_state;
+
+    preempt_state = 0;
+    tep__ref_light();
+    id = tep__event_id("sched", "sched_switch");
+    event = id >= 0 ? tep_find_event(tep, id) : NULL;
+    for (arg = event ? event->print_fmt.args : NULL; arg; arg = arg->next) {
+        long bit = preempt_arg_search(arg);
+        if (bit > 0) {
+            preempt_state = bit;
+            break;
+        }
+    }
+    tep__unref();
+
+    // No such format: prev_state==0 only, the preempted tasks are not told apart.
+    if (!preempt_state)
+        fprintf(stderr, "sched:sched_switch: the preempted prev_state is unknown\n");
+    return preempt_state;
 }
 
 static bool __sched_switch_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
@@ -2095,7 +2181,7 @@ static bool __sched_switch_target_cpu(struct tp *tp, void *raw, int size, int cp
         return true;
     } else if (pid == sched_switch->prev_pid) {
         if (sched_switch->prev_state == 0 ||
-            sched_switch->prev_state == preempt_state) {
+            sched_switch->prev_state == tep__sched_switch_preempt_state()) {
             *target_cpu = cpu;
             *reason = "[preempt]";
         } else {

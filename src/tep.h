@@ -20,6 +20,7 @@ bool tep__event_has_field(int id, const char *field);
 bool tep__event_field_size(int id, const char *field);
 bool tep__string_field_as_binary(struct tep_event *event, struct tep_format_field *field);
 int tep__event_size(int id);
+long tep__sched_switch_preempt_state(void);
 
 typedef struct global_var_declare event_fields;
 event_fields *tep__event_fields(int id);

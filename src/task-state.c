@@ -67,7 +67,6 @@
 #define RUNDELAY   (TASK_STATE_MAX << 1)
 
 #define TASK_REPORT_IDLE  0x80 // kernel 4.14 and later.
-#define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 
 /* What an evsel is for; its evsels are replaced, the role stays. */
 enum {
@@ -377,12 +376,12 @@ static int task_state_init(struct prof_dev *dev)
 
     if (kernel_release() >= KERNEL_VERSION(4, 14, 0)) {
         ctx->state_dead = EXIT_ZOMBIE|EXIT_DEAD;
-        ctx->report_max = TASK_REPORT_MAX;
         ctx->task_report |= TASK_REPORT_IDLE;
     } else {
         ctx->state_dead = EXIT_ZOMBIE|EXIT_DEAD|TASK_DEAD;
-        ctx->report_max = TASK_STATE_MAX;
     }
+    // The prev_state of a preempted task, see tep__sched_switch_preempt_state().
+    ctx->report_max = tep__sched_switch_preempt_state();
 
     if (env->greater_than && using_order(dev))
         ctx->dup = true;

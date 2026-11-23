@@ -2822,7 +2822,6 @@ static int rundelay_follow(struct prof_dev *dev, struct tp *tp, const char *fiel
     return pid_filter_start(f->pf);
 }
 
-#define TASK_REPORT_MAX  0x100 // kernel 4.14 and later.
 static int rundelay_filter(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -2854,16 +2853,18 @@ static int rundelay_filter(struct prof_dev *dev)
                     }
                 } else if (tp->id == sched_switch) {
                     if (i == 0) {
+                        long preempt;
                         int len;
 
                         if (tp_set_key(tp, "prev_pid") == 0)
                             match ++;
 
                         // prev_state==0: TASK_RUNNING (voluntary yield, migration, etc.)
-                        // prev_state==TASK_REPORT_MAX: preempted (4.14+)
+                        // prev_state==preempt: preempted, see tep__sched_switch_preempt_state().
                         // Both cases the task remains runnable and incurs scheduling delay.
-                        if (kernel_release() >= KERNEL_VERSION(4, 14, 0))
-                            len = snprintf(buff, sizeof(buff), "prev_state==%d||prev_state==0", TASK_REPORT_MAX);
+                        preempt = tep__sched_switch_preempt_state();
+                        if (preempt)
+                            len = snprintf(buff, sizeof(buff), "prev_state==%ld||prev_state==0", preempt);
                         else
                             len = snprintf(buff, sizeof(buff), "prev_state==0");
 
