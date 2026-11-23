@@ -369,7 +369,13 @@ static int event_filter_make(struct event_filter *ef, bool open, s64 next_value,
     long budget = sysconf(_SC_PAGESIZE) - 1;
     char *values, *filter = NULL;
 
-    // The whole filter fits in a page, see perf_event_set_filter(). "(and_filter) && ()"
+    /*
+     * Kernel constraint: a filter is at most a page, the rest is cut off,
+     * strndup_user(arg, PAGE_SIZE) in perf_event_set_filter() of
+     * kernel/events/core.c, already in v3.10. The values over it have their
+     * smallest gaps merged, the filter lets in more, pid_filter_match() drops
+     * the rest. "(and_filter) && ()"
+     */
     if (ef->and_filter)
         budget -= strlen(ef->and_filter) + 8;
     ranges = value_ranges_new(ef->values, open, next_value, ef->field, budget > 0 ? budget : 0);
@@ -603,6 +609,16 @@ static void pid_filter_notify(struct pid_filter *pf)
  * The pid allocated last, from /proc/loadavg. It counts in the pid namespace
  * of perf-prof, the tracepoints report the pids of the init one: -1 when not
  * there, or unknown.
+ *
+ * Kernel constraint: pids are allocated in a cycle, the next free one after
+ * the last allocated, up to pid_max and then from 300 (RESERVED_PIDS) on,
+ * alloc_pid() in kernel/pid.c; the last one is the 5th field of /proc/loadavg,
+ * loadavg_proc_show() in fs/proc/loadavg.c. Already in v3.10 by a bitmap and
+ * last_pid, by idr_alloc_cyclic() and the idr cursor since 95846ecf9dac ("pid:
+ * replace pid bitmap implementation with IDR API"), in v4.15, the same order.
+ * So the threads to come get the pids after the last one, the open tail
+ * "pid>=x" lets them in without a sync each. Were it not so, each new thread
+ * would sync the filter; the records are still matched exactly.
  */
 static pid_t pid_filter_last_pid(void)
 {

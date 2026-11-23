@@ -46,6 +46,13 @@ const volatile bool irqs_disabled = false;
 //     break;
 const volatile bool filter_tif_need_resched = false;
 const volatile bool tif_need_resched = false;
+/*
+ * Kernel constraint: the TIF_* bits are per arch, arch/<arch>/include/asm/
+ * thread_info.h, and thread_info is the first member of task_struct only with
+ * CONFIG_THREAD_INFO_IN_TASK, on x86 since 15f4eae70d36 ("x86: Move
+ * thread_info into task_struct"), in v4.9. Before it the CO-RE read of
+ * task->thread_info fails to relocate, the load fails.
+ */
 #if defined(__TARGET_ARCH_x86)
 #define TIF_NEED_RESCHED    3
 #elif defined(__TARGET_ARCH_arm)

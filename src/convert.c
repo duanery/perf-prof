@@ -743,9 +743,10 @@ static void tsc_conv_fixed(struct prof_dev *dev)
     static int tsc_khz = 0;
 
     /*
-     * For kernels before 4.12
+     * Kernel constraint: for kernels before 4.12, until aa7b630ea023 ("x86/tsc:
+     * Feed refined TSC calibration into sched_clock()"), in v4.12.
      *
-     * LINUX aa7b630 x86/tsc: Feed refined TSC calibration into sched_clock()
+     * The kernel version is compared: the fix changes no interface to probe.
      *
      * In the Linux kernel, the initial tsc_khz=2500000, is refined in
      * tsc_refine_calibration_work(), and then tsc_khz=2494140. cyc2ns_mul, cyc2ns_shift
@@ -853,8 +854,13 @@ __ctor static void current_clocksource(void)
     char *current_clocksource = NULL;
     size_t size;
     /*
-     * LINUX 698eff6355f (sched/clock, x86/perf: Fix "perf test tsc")
-     * Only for tsc clocksource. Determine whether the current clocksource is tsc.
+     * Kernel constraint: time_zero of perf_event_mmap_page converts a tsc to
+     * the perf clock only when sched_clock is the native tsc one,
+     * arch_perf_update_userpage() checks using_native_sched_clock() since
+     * 698eff6355f7 ("sched/clock, x86/perf: Fix "perf test tsc""), in v4.11.
+     * Older kernels set cap_user_time_zero under a paravirt sched_clock too
+     * (a guest on kvm-clock), wrong. Determine whether the current
+     * clocksource is tsc.
      */
     current_clocksource_is_tsc =
         (sysfs__read_str("devices/system/clocksource/clocksource0/current_clocksource",

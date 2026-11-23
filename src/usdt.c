@@ -297,6 +297,14 @@ static char *sdt_probe_command(struct sdt_probe *probe, const char *prefix, cons
     if (!cmd)
         return NULL;
 
+    /*
+     * Kernel constraint: uprobe_events takes the semaphore of an SDT probe as
+     * "PATH:OFFSET(REF_CTR_OFFSET)" and increments it while the probe is
+     * enabled, __trace_uprobe_create() in kernel/trace/trace_uprobe.c. Since
+     * 1cc33161a83d ("uprobes: Support SDT markers having reference count
+     * (semaphore)"), in v4.20. Before that the offset fails to parse and the
+     * write is rejected: the error is printed and the probe is not created.
+     */
     if (probe->semaphore) {
         cmd = straddf(cmd, free, "(0x%llx)", probe->semaphore_offset);
         if (!cmd)

@@ -37,8 +37,8 @@ struct extra_rundelay {
 
 #if defined(__i386__) || defined(__x86_64__)
 /*
- * Whether exit_reason is still a kvm:kvm_exit tracepoint argument, and so
- * readable by a raw_tp program.
+ * Kernel constraint: whether exit_reason is still a kvm:kvm_exit tracepoint
+ * argument, and so readable by a raw_tp program.
  *
  * It stopped being one in 0a62a0319abb ("KVM: x86: Get exit_reason as part of
  * kvm_x86_ops.get_exit_info"), in v5.16, which dropped it from TP_PROTO() and

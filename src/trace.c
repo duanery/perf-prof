@@ -109,6 +109,11 @@ static int trace_init(struct prof_dev *dev)
         attr.wakeup_watermark = (dev->pages << 12) / 2;
     }
 
+    /*
+     * Kernel constraint: attr.write_backward, since 9ecda41acb97
+     * ("perf/core: Add ::write_backward attribute to perf event"), in v4.7.
+     * Older kernels fail the open of --overwrite.
+     */
     if (env->overwrite) {
         attr.write_backward = 1;
         attr.watermark      = 1;

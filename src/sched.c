@@ -48,6 +48,7 @@ to_check_switch:
     }
 
     level = 1;
+    // Kernel constraint: no success field since 58b9987de86c, see tp_struct.h.
     sched_wakeup_new = !tep__event_has_field(wakeup_id, "success");
     sched_wakeup_id = wakeup_id;
 

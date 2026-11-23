@@ -56,7 +56,7 @@ int BPF_PROG(kvm_exit, int ret, unsigned int esr_ec, unsigned long vcpu_pc)
 }
 #else
 /*
- * x86 has two mutually exclusive ways to read exit_reason, and which one works
+ * Kernel constraint: x86 has two mutually exclusive ways to read exit_reason, and which one works
  * depends on the kernel. kvm_exit_select_prog() in bpf_kvm_exit.c autoloads
  * exactly one of the pair below.
  *

@@ -304,7 +304,15 @@ static int watchdog_filter(struct prof_dev *dev)
                             printf("filter %s for cpu %d\n", filter, cpu);
                     }
                 } else if (config == ctx->sched_switch) {
-                    // Starting from 4.19, softlockup uses cpu_stop_threads.
+                    /*
+                     * Kernel constraint: the softlockup watchdog touches its
+                     * timestamp from a per cpu kthread, "watchdog/%u" up to
+                     * v4.18. Since 9cf57731b63e ("watchdog/softlockup: Replace
+                     * "watchdog/%u" threads with cpu_stop_work"), in v4.19, it
+                     * is a cpu_stop work, run by the "migration/%u" stopper
+                     * thread. The kernel version is compared: no interface
+                     * tells which thread runs it.
+                     */
                     if (kernel_release() >= KERNEL_VERSION(4, 19, 0))
                         snprintf(filter, sizeof(filter), "next_comm~\"migration/*\"");
                     else

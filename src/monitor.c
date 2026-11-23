@@ -1263,6 +1263,13 @@ static void handle_SIGCHLD(void)
     gettimeofday(&start_time, NULL);
     setpriority(PRIO_PROCESS, 0, -20 /*highest priority*/);
     while (__continue(&start_time)) {
+        /*
+         * Kernel constraint: waitid() takes __WALL, to wait for the ptrace'd
+         * threads too, since 91c4e8ea8f05 ("wait: allow sys_waitid() to
+         * accept __WNOTHREAD/__WCLONE/__WALL"), in v4.7. Older kernels fail
+         * it with -EINVAL: fall back to waitpid(__WALL), si_code rebuilt
+         * from the status.
+         */
         if (USE_WAITID) {
             siginfo_t siginfo = {.si_pid = 0};
             if (waitid(P_ALL, 0, &siginfo, WEXITED | WSTOPPED | WCONTINUED | WNOHANG | __WALL) < 0 &&
@@ -1571,16 +1578,21 @@ int kernel_release(void)
 /*
  * BPF JIT Symbols Management Function
  *
- * Background: In early Linux kernels, /proc/kallsyms doesn't include BPF JIT
- * compiled function symbols by default. The net.core.bpf_jit_kallsyms kernel
- * parameter needs to be enabled to include these symbols. Since kernel 5.5,
- * BPF JIT symbols are included by default, no longer depending on this switch.
- *
- * Additionally: Enabling bpf_jit_kallsyms ensures bpf_get_stack can correctly
- * retrieve the stack trace. Kernel call path:
+ * Kernel constraint: the JITed BPF programs are known to the kernel as text by
+ * the sysctl net.core.bpf_jit_kallsyms, since 74451e66d516 ("bpf: make jited
+ * programs visible in traces"), in v4.11. bpf_prog_kallsyms_find() in
+ * kernel/bpf/core.c returned NULL with it off, so is_bpf_text_address() was
+ * false, and the unwinder stopped at a BPF frame:
  *   unwind_get_return_address->
  *     __kernel_text_address->
  *       is_bpf_text_address returns true
+ * Since af91acbc6299 ("bpf: Fix bpf jit kallsym access"), in v5.5, the switch
+ * only hides the names in /proc/kallsyms, the stack traces of bpf_get_stack()
+ * and callchains go through: nothing to do. Before it, turn the switch on
+ * while needed and restore it after.
+ *
+ * The kernel version is compared, not probed: the sysctl is there on both
+ * sides of af91acbc6299, only its effect on the unwinder changed.
  */
 void sysctl_bpf_jit_kallsyms(bool enable)
 {
@@ -1590,8 +1602,7 @@ void sysctl_bpf_jit_kallsyms(bool enable)
     static int bpf_jit_kallsyms = 0;
     static int ref = 0;
 
-    /* Kernel 5.5+ includes BPF JIT symbols by default, no manual handling needed */
-    /* Kernel commit af91acb: "bpf: Fix bpf jit kallsym access" fixed this issue */
+    // af91acbc6299, see above.
     if (kernel_release() >= KERNEL_VERSION(5, 5, 0))
         return;
 
@@ -2023,14 +2034,15 @@ static bool prof_dev_replace_digest(struct perf_evsel *evsel, union perf_event *
  * While an evsel is replaced, drop the records of the old one that the new one
  * wrote too.
  *
- * Both write into the same ring buffers. A tracepoint writes into the evsels on
- * the per cpu hlist of its perf events from its head, perf_trace_add() adds at
- * the head: the new evsel writes first. So once a ring buffer has a record of
+ * Kernel constraint: both write into the same ring buffers. A tracepoint
+ * writes into the evsels on the per cpu hlist of its perf events from its head,
+ * perf_trace_add() in kernel/trace/trace_event_perf.c adds at the head
+ * (hlist_add_head_rcu()), already in v3.10: the new evsel writes first. So once a ring buffer has a record of
  * the new evsel, the following records of the old one are either twins, or
  * passed the old filter only, of no more interest. Records of the new evsel
  * are always kept; the window ends with the reap of the old one.
  *
- * The one exception: a tracepoint with a target task (sched_waking,
+ * Kernel constraint, the one exception: a tracepoint with a target task (sched_waking,
  * sched_wakeup*, sched_stat_*) also writes into the evsels of that task, when
  * it is not current. Since 571f97f7d51f ("perf: Optimize perf_tp_event()"), in
  * v6.2, perf_tp_event_target_task() walks them in group order, the old one
@@ -2400,6 +2412,10 @@ out_free:
  * Replace *@evsel by a copy with @filter: the same attr, cpus and threads, tp
  * and cookie. See prof_dev_replace_evsel(). On success *@evsel is the new
  * evsel, the old one is deleted; on error it is left as it was.
+ *
+ * Kernel constraint: the filter of an open fd cannot be changed, a second
+ * PERF_EVENT_IOC_SET_FILTER fails with -EEXIST, see
+ * perf_evsel__apply_filter_cpu(). So a new filter takes a new evsel.
  */
 int prof_dev_replace_filter(struct prof_dev *dev, struct perf_evsel **evsel, const char *filter)
 {

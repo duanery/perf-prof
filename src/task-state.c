@@ -374,6 +374,21 @@ static int task_state_init(struct prof_dev *dev)
     if (env->interruptible_set && !env->interruptible)
         ctx->task_report &= ~TASK_INTERRUPTIBLE;
 
+    /*
+     * Kernel constraint: the prev_state of sched:sched_switch,
+     * __trace_sched_switch_state() in include/trace/events/sched.h. Up to
+     * v4.13 it is p->state, a dying task is TASK_DEAD. Since 1593baab910d
+     * ("sched/debug: Implement consistent task-state printing"), in v4.14, it
+     * is (p->state | p->exit_state) & TASK_REPORT: a dying task is EXIT_*, no
+     * TASK_DEAD; and TASK_IDLE is TASK_REPORT_IDLE, since 06eb61844d84
+     * ("sched/debug: Add explicit TASK_IDLE printing"), in v4.14. In v4.14
+     * alone the value is the index of the state, fls(), until 3f5fe9fef5b2
+     * ("sched/debug: Fix task state recording/printout"), in v4.15: S and D
+     * are the same, the others are not told apart.
+     *
+     * The kernel version is compared: the states are not in the format as
+     * fields, only in __print_flags() of the print fmt.
+     */
     if (kernel_release() >= KERNEL_VERSION(4, 14, 0)) {
         ctx->state_dead = EXIT_ZOMBIE|EXIT_DEAD;
         ctx->task_report |= TASK_REPORT_IDLE;

@@ -33,6 +33,12 @@ int bpf_filter_open(struct bpf_filter *filter)
         return -1;
     }
 
+    /*
+     * Kernel constraint: BPF_PROG_TYPE_PERF_EVENT, since 0515e5999a46 ("bpf:
+     * introduce BPF_PROG_TYPE_PERF_EVENT program type"), in v4.9, attached
+     * by PERF_EVENT_IOC_SET_BPF to the fd of a perf event: it runs on each
+     * overflow, a nonzero return keeps the sample. Older kernels fail the load.
+     */
     bpf_program__set_type(obj->progs.perf_event_do_filter, BPF_PROG_TYPE_PERF_EVENT);
 
     #define ASSIGN(a) obj->rodata->a = filter->a

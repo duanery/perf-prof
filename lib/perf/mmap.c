@@ -365,6 +365,13 @@ static u64 read_perf_counter(unsigned int counter __maybe_unused) { return 0; }
 static u64 read_timestamp(void) { return 0; }
 #endif
 
+/*
+ * Kernel constraint: the self-monitoring fields of perf_event_mmap_page,
+ * read under its seqlock (pc->lock). cap_user_time_short, since 6c0246a4588d
+ * ("perf: Add perf_event_mmap_page::cap_user_time_short ABI"), in v5.9;
+ * without it time_cycles and time_mask are 0 and ~0. No cap_user_rdpmc: -1,
+ * the caller read()s the counter.
+ */
 int perf_mmap__read_self(struct perf_mmap *map, struct perf_counts_values *count)
 {
 	struct perf_event_mmap_page *pc = map->base;
@@ -428,6 +435,12 @@ int perf_mmap__read_self(struct perf_mmap *map, struct perf_counts_values *count
 	return 0;
 }
 
+/*
+ * Kernel constraint: time_zero and cap_user_time_zero of perf_event_mmap_page,
+ * since c73deb6aecda ("perf/x86: Add ability to calculate TSC from perf sample
+ * timestamps"), in v3.12. Without them -EOPNOTSUPP: --tsc and --kvmclock are
+ * turned off.
+ */
 int perf_mmap__read_tsc_conversion(struct perf_mmap *map, struct perf_tsc_conversion *tc)
 {
 	struct perf_event_mmap_page *pc = map->base;

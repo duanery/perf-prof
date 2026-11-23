@@ -10,6 +10,14 @@
 #include <trace_helpers.h>
 #include "perf_regs_mask.h"
 
+/*
+ * Kernel constraint: the sysctls kernel.perf_event_max_stack, since
+ * c5dfd78eb798 ("perf core: Allow setting up max frame stack depth via
+ * sysctl"), and kernel.perf_event_max_contexts_per_stack, since c85b03349640
+ * ("perf core: Separate accounting of contexts and real addresses in a stack
+ * trace"), in v4.7. Older kernels have a fixed PERF_MAX_STACK_DEPTH and no
+ * context entries counted apart: keep the defaults.
+ */
 int perf_event_max_stack = PERF_MAX_STACK_DEPTH;
 int perf_event_max_contexts_per_stack = 0;
 static __ctor void init(void)
@@ -1135,7 +1143,11 @@ void prof_dev_env2attr(struct prof_dev *dev, struct perf_event_attr *attr)
     // --watermark
     reduce_wakeup_times(dev, attr);
 
-    // --monotonic
+    /*
+     * --monotonic
+     * Kernel constraint: attr.use_clockid, since 34f439278cef ("perf: Add per
+     * event clockid support"), in v4.1. Older kernels fail the open.
+     */
     if (env->monotonic) {
         attr->use_clockid = 1;
         attr->clockid = CLOCK_MONOTONIC;

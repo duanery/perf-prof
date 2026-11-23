@@ -17,11 +17,19 @@
     unsigned char common_preempt_count;/*       offset:3;       size:1; signed:0; */ \
     int common_pid;/*   offset:4;       size:4; signed:1; */
 
+/*
+ * Kernel constraint: the structs here are fixed copies of the trace entries,
+ * the formats in tracing/events/<sys>/<name>/format, read by the profilers
+ * without tep. The ones that changed are told apart at runtime, by a field
+ * (tep__event_has_field()) or the raw size: see sched_wakeup_no_success.
+ * The others have kept their layout from v3.10 on; a change is noticed as
+ * wrong data only, check the format first.
+ */
 struct trace_entry {
     COMMON_HEADER
 };
 
-/* taken from kernel/trace/trace.h */
+/* taken from kernel/trace/trace.h, already in v3.10 */
 struct kprobe_trace_entry_head {
     struct trace_entry  ent;
     unsigned long       ip;
@@ -31,7 +39,7 @@ struct kretprobe_trace_entry_head {
     unsigned long       func;
     unsigned long       ret_ip;
 };
-/* taken from kernel/trace/trace_uprobe.c */
+/* taken from kernel/trace/trace_uprobe.c, already in v3.10 */
 struct uprobe_trace_entry_head {
     struct trace_entry  ent;
     unsigned long       vaddr[];
@@ -48,9 +56,12 @@ struct sched_wakeup {
 };
 
 /*
- * upstream
- * 58b9987 sched/tracing: Remove the redundant 'success' in the sched tracepoint
-**/
+ * Kernel constraint: sched:sched_wakeup and sched_wakeup_new have no success
+ * field since 58b9987de86c ("sched/tracing: Remove the redundant 'success' in
+ * the sched tracepoint"), in v5.14: target_cpu moves from offset 36 to 32.
+ * The layout is told by the field (tep__event_has_field()) or the raw size,
+ * not the kernel version.
+ */
 struct sched_wakeup_no_success {
     COMMON_HEADER
 

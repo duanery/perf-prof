@@ -57,6 +57,17 @@ failed:
     return -1;
 }
 
+/*
+ * Kernel constraint: perf_event_open() fails with -EINVAL on an attr bit the
+ * kernel does not know, it falls in __reserved_1, perf_copy_attr() in
+ * kernel/events/core.c. The bits
+ * came in order: ksymbol, 76193a94522f ("perf, bpf: Introduce
+ * PERF_RECORD_KSYMBOL"), and bpf_event, 6ee52e2a3fe4 ("perf, bpf: Introduce
+ * PERF_RECORD_BPF_EVENT"), in v5.1; cgroup, 96aaab686505 ("perf/core: Add
+ * PERF_RECORD_CGROUP event"), in v5.7; text_poke, e17d43b93e54 ("perf: Add
+ * perf text poke event"), in v5.9. So drop the newest one and reopen, until
+ * none is left.
+ */
 static int misc_reinit(struct prof_dev *dev, int err)
 {
     u64 private = (u64)dev->private;
@@ -212,10 +223,12 @@ void ksymbol_dev_open(void *ksyms)
      * PERF_RECORD_KSYMBOL_TYPE_OOL will be found in /proc/kallsyms.
      * Tracing is not necessary.
      *
-     * PERF_RECORD_KSYMBOL_TYPE_BPF is controlled by bpf_jit_kallsyms.
-     * If enabled, ksymbols can be found in /proc/kallsyms, no need
-     * tracing. If disabled, ksymbols cannot be found, requiring tracing.
-     * See the kernel function bpf_jit_kallsyms_enabled().
+     * Kernel constraint: PERF_RECORD_KSYMBOL_TYPE_BPF is controlled by
+     * bpf_jit_kallsyms. If enabled, ksymbols can be found in /proc/kallsyms,
+     * no need tracing. If disabled, ksymbols cannot be found, requiring
+     * tracing. See bpf_jit_kallsyms_enabled() in include/linux/filter.h: the
+     * names are hidden while bpf_jit_harden is on, since 74451e66d516 ("bpf:
+     * make jited programs visible in traces"), in v4.11.
      */
     if (sysctl__read_int(sysctl_jit_harden, &bpf_jit_harden) < 0 ||
         sysctl__read_int(sysctl_jit_kallsyms, &bpf_jit_kallsyms) < 0 ||

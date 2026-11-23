@@ -598,6 +598,12 @@ static int kvm_mmu_init(struct prof_dev *dev)
         goto failed;
     }
     perf_evlist__add(evlist, evsel);
+    /*
+     * Kernel constraint: mmu_valid_gen of kvmmmu:kvm_mmu_get_page is u8
+     * since ca333add6933 ("KVM: x86/mmu: Explicitly track only a single
+     * invalid mmu generation"), in v5.4, unsigned long before. Its size is
+     * read from the format.
+     */
     ctx->mmu_valid_gen_size = tep__event_field_size(id, "mmu_valid_gen");
 
     // kvmmmu:kvm_mmu_prepare_zap_page

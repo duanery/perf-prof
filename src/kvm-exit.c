@@ -63,6 +63,15 @@ struct trace_kvm_entry {
     unsigned long vcpu_id;//    offset:8;       size:8; signed:0;
 };
 #else
+/*
+ * Kernel constraint: the layout of kvm:kvm_exit on x86, told by the raw size.
+ * trace_kvm_exit1 has common_lock_depth, removed by e6e1e2593592 ("tracing:
+ * Remove lock_depth from event entry"), in v2.6.39, and no isa: kernels
+ * before v2.6.38, as 2.6.32. trace_kvm_exit2 has isa, info1 and info2 since aa17911e3c21
+ * ("KVM: Record instruction set in kvm_exit tracepoint"), in v2.6.38, the
+ * layout of v3.10 on; a larger size is a later one with more fields at the
+ * end.
+ */
 struct trace_kvm_exit1 {
     unsigned short common_type;//	offset:0;	size:2;	signed:0;
 	unsigned char common_flags;//	offset:2;	size:1;	signed:0;

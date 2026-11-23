@@ -29,11 +29,22 @@ int uprobe_type = 0;
 static char *kprobe_retprobe = NULL;
 static char *uprobe_retprobe = NULL;
 
-/* Reserved field names, taken from kernel/trace/trace_probe.h */
+/*
+ * Kernel constraint: the reserved field names of the kprobe/uprobe events,
+ * taken from kernel/trace/trace_probe.h, already in v3.10.
+ */
 #define FIELD_STRING_IP     "__probe_ip"
 #define FIELD_STRING_RETIP  "__probe_ret_ip"
 #define FIELD_STRING_FUNC   "__probe_func"
 
+/*
+ * Kernel constraint: the perf_kprobe and perf_uprobe PMUs create a probe by
+ * perf_event_open() alone, no kprobe_events / uprobe_events, since
+ * e12f03d7031a ("perf/core: Implement the 'perf_kprobe' PMU") and
+ * 33ea4b24277b ("perf/core: Implement the 'perf_uprobe' PMU"), in v4.17. Their
+ * type and the retprobe bit of attr.config are in sysfs. Without them the type
+ * is 0, and kprobe:/uprobe: events are refused.
+ */
 __ctor
 static void __kprobe_uprobe(void)
 {

@@ -492,14 +492,15 @@ static int perf_evsel__group_leader(struct perf_evsel *evsel, int cpu, pid_t tid
  * Open the fd of @evsel at (@c, @t), or find the one already open. A new fd
  * takes a reference on @c and @t; perf_evsel__close_one() drops them.
  *
- * Kernel constraints:
+ * Kernel constraint:
  *  - a group member is scheduled along its leader: in an evlist it opens
  *    enabled (attr.disabled = 0) and is switched by the leader. Outside an
  *    evlist the leader may run already, see perf_evsel__set_leader(): it
  *    opens as the evsel says. Fds added to an open evsel open disabled and
  *    are enabled afterwards, see perf_evsel__enable_new_thread();
- *  - PERF_FLAG_FD_CLOEXEC exists since v3.14; older kernels fail it with
- *    -EINVAL, retry without.
+ *  - PERF_FLAG_FD_CLOEXEC, since a21b0b354d4a ("perf: Introduce a flag to
+ *    enable close-on-exec in perf_event_open()"), in v3.14; older kernels
+ *    fail it with -EINVAL, retry without.
  */
 static int perf_evsel__open_one(struct perf_evsel *evsel, struct perf_evsel_cpu *c,
 				struct perf_evsel_thread *t, struct perf_evsel_fd **out)
@@ -1010,7 +1011,9 @@ void perf_evsel__keep_disable(struct perf_evsel *evsel, bool keep_disable)
 
 /*
  * Kernel constraint: a trace event filter can be set once per fd, a second
- * PERF_EVENT_IOC_SET_FILTER fails with -EEXIST (ftrace_profile_set_filter()).
+ * PERF_EVENT_IOC_SET_FILTER fails with -EEXIST, ftrace_profile_set_filter()
+ * in kernel/trace/trace_events_filter.c, already in v3.10. The filter cannot
+ * be changed on an open fd: prof_dev_replace_filter() replaces the evsel.
  */
 int perf_evsel__apply_filter_cpu(struct perf_evsel *evsel, const char *filter, int cpu)
 {

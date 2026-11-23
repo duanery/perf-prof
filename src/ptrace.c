@@ -15,6 +15,34 @@
  *
  * Initially, ptrace is used to trace the fork, vfork, and clone syscalls.
  * And re-inject all delivered signals.
+ *
+ * Kernel constraint: how a new tracee stops, kernel/fork.c and
+ * kernel/signal.c. The pids are attached by PTRACE_SEIZE, and stopped on
+ * demand by PTRACE_INTERRUPT, and a group stop is left by PTRACE_LISTEN:
+ * since 3544d72a0e10 ("ptrace: implement PTRACE_SEIZE"), fca26f260c52
+ * ("ptrace: implement PTRACE_INTERRUPT") and 544b2c91a9f1 ("ptrace:
+ * implement PTRACE_LISTEN"), in v3.1. PTRACE_O_EXITKILL since 992fb6e17063
+ * ("ptrace: introduce PTRACE_O_EXITKILL"), in v3.8. So a fork/vfork/clone
+ * of a tracee with PTRACE_O_TRACE{FORK,VFORK,CLONE} makes two stops:
+ *
+ *  - the child is auto-attached by ptrace_init_task(), and as the parent is
+ *    PT_SEIZED it gets JOBCTL_TRAP_STOP instead of a SIGSTOP, since
+ *    d184d6eb1dc3 ("ptrace: dont send SIGSTOP on auto-attach if PT_SEIZED"),
+ *    in v3.1. Its first return to user space traps in do_jobctl_trap(): the
+ *    tracer sees SIGTRAP | PTRACE_EVENT_STOP << 8, before the child runs a
+ *    single user instruction. That is the "initial ptrace-stop".
+ *  - the parent reports PTRACE_EVENT_FORK/VFORK/CLONE with the child pid in
+ *    PTRACE_GETEVENTMSG, ptrace_event_pid() in kernel_clone() (do_fork() in
+ *    older kernels), called after
+ *    wake_up_new_task(child).
+ *
+ * The child is woken up before the parent reports, so the two stops arrive in
+ * either order. The child is added to the prof_dev of its parent once both
+ * are seen: the fork tells the parent, the initial stop that the child waits
+ * and has not run yet, its events are not missed. pid_node::initial counts
+ * them, __fork__new() runs at 2. The pids attached by ptrace_attach() start
+ * at 2: they have no parent to wait for, a later PTRACE_EVENT_STOP is a
+ * PTRACE_INTERRUPT of ptrace_detach() or the end of a group stop.
  */
 
 #include <stdio.h>
@@ -30,7 +58,7 @@
 struct pid_node {
     struct rb_node rbnode;
     int pid, ppid;
-    int initial;
+    int initial;    // stops seen of fork + initial ptrace-stop, 2: both, see the top
     bool detach, workload;
 
     struct list_head dev_list; // link &struct pid_link_dev

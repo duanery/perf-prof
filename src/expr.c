@@ -121,7 +121,7 @@ static void synerr(const char *s)
 
 /*
  * Whether `t' is a `char *' for the string operators (~, ==, !=), ignoring
- * signedness: since 3bc753c06dd0 ("kbuild: treat char as always unsigned"),
+ * signedness. Kernel constraint: since 3bc753c06dd0 ("kbuild: treat char as always unsigned"),
  * in v6.2, the kernel is built with -funsigned-char, so a `char comm[16]' is
  * described as signed:0 and arrives here as unsigned. No string operator
  * looks at the sign of a character, so accept either spelling.
@@ -1092,7 +1092,7 @@ static int bpf_size_of(struct bpf_emit *e, long type)
 }
 
 /*
- * True when the running kernel has the "cpu v4" instructions -- BPF
+ * Kernel constraint: true when the running kernel has the "cpu v4" instructions -- BPF
  * instruction-set version 4, what clang calls -mcpu=v4. They all landed
  * together in v6.6: sign-extension loads in 1f9a1ea821ff ("bpf: Support new
  * sign-extension load insns") and signed div/mod in ec0e2da95f72 ("bpf:

@@ -734,6 +734,11 @@ int perf_evlist__id_add_fd(struct perf_evlist *evlist,
 	u64 id;
 	int ret;
 
+	/*
+	 * Kernel constraint: PERF_EVENT_IOC_ID, since cf4957f17f2a ("perf: Add
+	 * PERF_EVENT_IOC_ID ioctl to return event ID"), in v3.12. Older kernels
+	 * fail it with -ENOTTY: read the id by PERF_FORMAT_ID instead.
+	 */
 	ret = ioctl(fd, PERF_EVENT_IOC_ID, &id);
 	if (!ret)
 		goto add;
