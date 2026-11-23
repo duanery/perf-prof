@@ -351,8 +351,8 @@ static void delay_two(struct two_event *two, union perf_event *event1, union per
                     // cpu tracking for event1
                     // opts->comm: rundelay, syscalls. The key is pid.
                     track_tid = opts->comm ? (int)key : e1->tid_entry.tid;
+                    multi_trace_raw_size(event1, &raw, &size, two->tp1);
                     if (track_tid > 0) {
-                        multi_trace_raw_size(event1, &raw, &size, two->tp1);
                         tp_task_cpu(two->tp1, raw, size, e1->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
                     }
                     // tracking running time.
