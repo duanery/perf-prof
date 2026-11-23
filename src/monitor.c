@@ -1456,14 +1456,14 @@ int get_tsc_khz(void)
         return 0;
     }
     vm = ioctl(kvm, KVM_CREATE_VM, 0);
-    if (kvm < 0) {
+    if (vm < 0) {
         fprintf(stderr, "create vm failed\n");
         close(kvm);
         return 0;
     }
     vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     if (vcpu < 0) {
-        fprintf(stderr, "create vm failed\n");
+        fprintf(stderr, "create vcpu failed\n");
         close(vm);
         close(kvm);
         return 0;

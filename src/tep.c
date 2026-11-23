@@ -354,7 +354,7 @@ bool tep__event_has_field(int id, const char *field)
     return has_field;
 }
 
-bool tep__event_field_size(int id, const char *field)
+int tep__event_field_size(int id, const char *field)
 {
     struct tep_event *event;
     struct tep_format_field *format;
