@@ -93,7 +93,8 @@ void perfeval_evaluate(struct prof_dev *dev)
             bool disable = false;
 
             // Exceeding the limit, exit perf-prof.
-            if (dev->env->sampling_limit && matched_interval / perfeval->nr_ins > dev->env->sampling_limit) {
+            if (dev->env->sampling_limit && perfeval->nr_ins &&
+                matched_interval / perfeval->nr_ins > dev->env->sampling_limit) {
                 disable = true;
                 prof_dev_close(dev);
             }

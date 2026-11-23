@@ -749,7 +749,7 @@ static long kvm_mmu_ftrace_filter(struct prof_dev *dev, union perf_event *event,
         return 1;
     else {
         glo = GLOBAL(raw->cpu_entry.cpu, raw->tid_entry.pid, raw->raw.data, raw->raw.size);
-        return tp_list_ftrace_filter(dev, ctx->tp_list, glo);
+        return tp_list_ftrace_filter(dev, ctx->tp_list, event, glo);
     }
 }
 

@@ -1139,12 +1139,16 @@ struct tp_list *tp_list_new(struct prof_dev *dev, char *event_str)
     if (*s)
         nr_tp ++;
 
-    if (nr_tp == 0)
+    if (nr_tp == 0) {
+        free(expanded_str);
         return NULL;
+    }
 
     tp_list = calloc(1, sizeof(struct tp_list) + nr_tp * sizeof(struct tp));
-    if (!tp_list)
+    if (!tp_list) {
+        free(expanded_str);
         return NULL;
+    }
 
     tp_list->event_str = expanded_str;
     tp_list->nr_tp = nr_tp;
@@ -1930,9 +1934,21 @@ err_return:
     return err;
 }
 
-long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list, struct expr_global *global)
+/*
+ * Kernel constraint: the probes created by the perf_kprobe and perf_uprobe
+ * PMUs are local, create_local_trace_kprobe() in kernel/trace/trace_kprobe.c
+ * and create_local_trace_uprobe() in kernel/trace/trace_uprobe.c never
+ * register a trace event type: common_type is 0 in their records. Since
+ * e12f03d7031a ("perf/core: Implement the 'perf_kprobe' PMU") and
+ * 33ea4b24277b ("perf/core: Implement the 'perf_uprobe' PMU"), in v4.17.
+ * Their tp->id is KPROBE..URETPROBE, never equal to it: such a record is
+ * matched to its tp by the evsel, or it would be dropped.
+ */
+long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list,
+                           union perf_event *event, struct expr_global *global)
 {
     unsigned short common_type;
+    struct perf_evsel *evsel;
     struct tp *tp;
     int i;
 
@@ -1942,14 +1958,19 @@ long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list, struct
     common_type = *(unsigned short *)global->data;
 
     for_each_real_tp(tp_list, tp, i) {
-        if (tp->id == common_type) {
-            if (!tp->ftrace_filter)
-                return 1;
-            else
-                return tp_prog_run(tp, tp->ftrace_filter, global);
-        }
+        if (tp->id == common_type)
+            goto found;
     }
-    return -1;
+
+    evsel = perf_event_evsel(dev, event);
+    tp = evsel ? perf_evsel_tp(evsel) : NULL;
+    if (!tp || tp < tp_list->tp || tp >= tp_list->tp + tp_list->nr_tp)
+        return -1;
+
+found:
+    if (!tp->ftrace_filter)
+        return 1;
+    return tp_prog_run(tp, tp->ftrace_filter, global);
 }
 
 static LIST_HEAD(tp_matcher_list);

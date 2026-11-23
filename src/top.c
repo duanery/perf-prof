@@ -462,7 +462,7 @@ static long top_ftrace_filter(struct prof_dev *dev, union perf_event *event, int
     struct top_ctx *ctx = dev->private;
     struct sample_type_raw *raw = (void *)event->sample.array;
     struct expr_global *glo = GLOBAL(raw->cpu_entry.cpu, raw->tid_entry.pid, raw->raw.data, raw->raw.size);
-    return tp_list_ftrace_filter(dev, ctx->tp_list, glo);
+    return tp_list_ftrace_filter(dev, ctx->tp_list, event, glo);
 }
 
 static void top_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)

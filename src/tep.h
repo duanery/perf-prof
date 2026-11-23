@@ -255,7 +255,8 @@ void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, void *data, i
 struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl);
 struct tp *tp_from_evsel(struct perf_evsel *evsel, struct tp_list *tp_list);
 int tp_list_apply_filter(struct prof_dev *dev, struct tp_list *tp_list);
-long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list, struct expr_global *global);
+long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list,
+                           union perf_event *event, struct expr_global *global);
 
 
 /*

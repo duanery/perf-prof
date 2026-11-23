@@ -528,7 +528,8 @@ struct expr_prog *expr_compile_flags(char *expr_str, struct global_var_declare *
     // Original nr_syms = 16 is too small, memory reallocations needed
     nr_syms = 32;
     symtab = calloc(nr_syms, sizeof(struct symbol_table));
-    data = d = malloc(datasize);
+    /* +1: expr_load_data() terminates the data at data[datasize]. */
+    data = d = malloc(datasize + 1);
     str = s = malloc(strsize);
     le = e = calloc(nr_insn, sizeof(long));
 
@@ -625,7 +626,7 @@ struct expr_prog *expr_compile_flags(char *expr_str, struct global_var_declare *
         }
         if (max_offset > datasize) {
             datasize += 256;
-            data = d = realloc(d, datasize);
+            data = d = realloc(d, datasize + 1);
             memset(d, 0, datasize);
             goto restart;
         }
@@ -1696,7 +1697,7 @@ static long expr_ftrace_filter(struct prof_dev *dev, union perf_event *event, in
     struct expression_info *info = dev->private;
     struct sample_type_header *raw = (void *)event->sample.array;
     struct expr_global *glo = GLOBAL(raw->cpu_entry.cpu, raw->tid_entry.pid, raw->raw.data, raw->raw.size);
-    return tp_list_ftrace_filter(dev, info->tp_list, glo);
+    return tp_list_ftrace_filter(dev, info->tp_list, event, glo);
 }
 
 static void expr_sample(struct prof_dev *dev, union perf_event *event, int cpu, int tid)

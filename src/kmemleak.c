@@ -685,9 +685,9 @@ static long kmemleak_ftrace_filter(struct prof_dev *dev, union perf_event *event
             return 1;
         return tp_prog_run(tp, tp->ftrace_filter, glo);
     }
-    err = tp_list_ftrace_filter(dev, ctx->tp_alloc, glo);
+    err = tp_list_ftrace_filter(dev, ctx->tp_alloc, event, glo);
     if (err < 0)
-        err = tp_list_ftrace_filter(dev, ctx->tp_free, glo);
+        err = tp_list_ftrace_filter(dev, ctx->tp_free, event, glo);
     return err;
 }
 
