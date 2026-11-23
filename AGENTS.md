@@ -64,10 +64,12 @@ perf-prof/
 ├── docs/                 # 项目文档
 ├── tools/                # 独立分析工具（脚本 + python 模块 + 设计文档）
 ├── packages/             # 打包脚本、standalone python 下载脚本
-└── skills/               # AI 辅助分析技能包（skills/perf-prof/）
+└── skills/               # AI 技能包：perf-prof/（问题分析）、refactor-design/（本项目重构流程）
 ```
 
 ### `src/` — 核心框架 + 分析器
+
+下表按文件定位；按能力查可复用的模块及其使用注意事项见 [docs/modules.md](docs/modules.md)。
 
 **核心框架文件（所有分析器都会用到）：**
 
@@ -369,6 +371,10 @@ pytest --runtime=20 --memleak-check=2000
 ## 开发指南
 
 ### 开发新分析器
+
+实现任何新功能前先查 [docs/modules.md](docs/modules.md)：已有的能力直接复用，缺的扩展模块，
+不要在分析器里另写一份。新增公共模块、或公共头文件的接口变化时，同步该文档。
+
 1. 创建分析器源文件（如 `src/new_profiler.c`）
 2. 实现 `profiler` 结构体定义的 `init`、`deinit`、`interval`、`read`、`sample` 等回调
 3. 定义分析器的 `name`、`desc` 描述、`argc` 支持的选项
@@ -401,30 +407,83 @@ pytest --runtime=20 --memleak-check=2000
 - `docs/plans/` 目前是 untracked 目录，plan 文件默认不入库；只有用户
   明确要求时才 `git add`。
 
+### 模块边界设计准则
+
+抽取公共模块、重构分层时，**先按这些准则审接口稿，再写实现**。流程见
+[skills/refactor-design/SKILL.md](skills/refactor-design/SKILL.md)。
+示例取自 `src/filter/event_filter.c`（event_filter / pid_filter，被 task-state、rundelay 共用）。
+
+1. **结构体不可见**：头文件只放不透明类型 + 接口，调用者不读任何内部字段。
+   反例：调用者直接读 `pf->ef.filter`、`pf->dropped` 决定下一步。
+2. **依赖只朝下**：底层模块不认识上层类型，上层的数据由上层的适配函数喂进来。
+   例：`event_filter` 不见 evsel、prof_dev、raw、`perf_thread_map`；初始线程由
+   `pid_filter_add_threads()` 加入。
+3. **向上依赖用回调反转**：模块需要上层执行动作（替换 evsel、开关 ftrace_filter）就是向上依赖，
+   通过 `ops->xxx()` 回调反转，接口只依赖回调签名；回调的返回值决定模块自己的状态是否生效。
+   不要把向上依赖拆成调用者必须遵守的两阶段协议（build → 调用者执行 → commit）。
+   反例：`event_filter_build()` 产出 pending、调用者替换 evsel 后再 `event_filter_commit()`；
+   正例：`pid_filter_ops.set()`。
+4. **状态归谁，时机归谁**：哪个模块持有决定"何时做"的状态，就由它自己决定何时做，
+   不把判断甩给调用者；要做的动作若在上层，按第 3 条回调。
+   反例：profiler 轮询 `pid_filter_due()` 再去重建；正例：`pid_filter` 自带定时器、到期调 `ops->set()`。
+5. **接口按生命周期排列**：new → 加入初始值 → start → 运行期增删/查询 → free，并且必须回答
+   "初始值从哪来、第一次的结果怎么拿到"。例：`pid_filter_new()` → `pid_filter_add_threads()` →
+   `pid_filter_start()`（`ops->set(initial)`）→ `pid_filter_add/del/match()` → `pid_filter_free()`。
+6. **含义不同的状态分开命名**：同一类数据承担两种含义时拆成两个，各自写明何时变化、谁查询。
+   例：跟踪集合（match 用，增删立即生效）与内核集合（内核过滤器的副本，`ops->set()` 成功才变）。
+7. **通知用边沿触发的回调，不提供查询函数**：也是向上依赖（第 3 条），状态变化时回调一次，
+   调用者自己记数，而不是每次去查。例：`ops->ftrace_filter(need)`。
+8. **调用方出现两份相似代码，说明边界画错了**：把重复部分下沉到模块。
+   反例：task-state、rundelay 各写一份 `*_follow_threads()`。
+9. **通用层不带策略**：通用层只做机制，与值的类型相关的策略（时间、阈值）放在派生层。
+   例：`event_filter` 没有时间，`pid_filter` 才有增删延迟与丢弃计数。
+10. **共享数据由模块持有、带引用计数**：多个实例共用的数据放进模块内部共享，调用方不另存副本。
+    例：`value_set` 取代 profiler 自己的 `tid_set`。
+11. **接口里不出现具体使用者的概念**：角色、follow 下标、sched 字段名等留在使用者内部；
+    至少一个"未来使用者"能不改接口地接上，才算给未来留了可能性。
+
+新的返工如果暴露了这里没有的判断，提炼成一条追加到本节（附正例/反例）。
+
 ## 常见陷阱与经验教训
 
 本节记录改动 perf-prof 时容易踩到的坑。
 
-### 内核演进导致 tracepoint 消失或字段增删
+### 内核依赖：代码注释 + 登记
 
-内核升级会让 tracepoint 被合并/删除、字段被移除或描述改变。新内核上"找不到事件 / 未定义变量"先怀疑内核变更，而不是 perf-prof 的 bug。
+perf-prof 使用内核的功能（perf_event、tracepoint、ptrace、eBPF……），于是依赖了这些功能的实现：
+功能的实现原理（ring buffer 与 poll、ptrace 的 stop 状态、verifier 与 JIT），某个具体的取值或限制
+（过滤器不超过一页、抢占时 prev_state 的取值），或 tracepoint 的格式（事件被合并/删除、字段增删）。
+代码对这些实现的每一处依赖，称为一条内核约束（Kernel constraint）。
 
-必须查到对应的内核 commit 与引入版本，写进提交说明，格式统一为：
+代码依赖了某条内核约束，**必须做两件事**：
 
-```
-<12位SHA> ("<内核 commit subject>"), in v<版本>, ...
-```
+1. **在依赖处注释**，以 `Kernel constraint:` 开头（便于 `grep -rn "Kernel constraint"`），写清：
+   约束本身、内核出处（文件 / 函数）、perf-prof 依赖它做了什么、不成立时的后果；
+   约束由某个内核 commit 引入或改变的，写出 commit 与版本：
 
-若改动落在 `src/` 源码，还要在相关代码的注释里标注同样的信息，说明为何做兼容处理：
+   ```c
+   /*
+    * Kernel constraint: <约束>, <内核函数>() in <内核文件>. Since <12位SHA>
+    * ("<内核 commit subject>"), in v<版本>, <内核的行为变化>. <perf-prof 依赖它做了什么，不成立会怎样>.
+    */
+   ```
 
-```c
-/*
- * <为什么这样处理>: since <12位SHA> ("<内核 commit subject>"), in v<版本>,
- * <内核的行为变化及其对本处代码的影响>。
- */
-```
+   约束是一整个内核功能（如 ptrace 跟踪新线程）时，注释写清依赖的那部分原理，不必是某个 commit；
+   早于 v3.10（perf-prof 支持的最旧内核）就存在的写 `already in v3.10`。
+   commit 与版本必须到内核源码（`git describe --contains <SHA>`）核实，不要凭记忆填写；
+   提交说明里同样列出，格式为 `<12位SHA> ("<内核 commit subject>"), in v<版本>`。
+2. **登记到 [docs/kernel_dependencies.md](docs/kernel_dependencies.md)**：按 perf-prof 使用的内核功能
+   分节，每节写用途（perf-prof 用它做什么）、原理（相关的内核实现）、依赖（约束与依赖它的代码位置）。
+   使用新的内核功能时先新增一节。新增、修改、删除依赖时同步该文档（随文档提交）。
 
-兼容优先运行时探测（事件/字段是否存在），不要比较内核版本号——改动可能被发行版 backport 或回退。
+**兼容优先运行时探测，不比较内核版本号**：事件/字段是否存在用 `tep__event_has_field()` 等探测，
+取值从 format 读出（如 `tep__sched_switch_preempt_state()`）——改动可能被发行版 backport 或回退。
+无法探测、只能比较 `KERNEL_VERSION` 的，注释里说明为什么探测不了。
+
+新内核上"找不到事件 / 未定义变量"、旧内核上行为异常，先怀疑内核变更，而不是 perf-prof 的 bug：
+查到对应的内核 commit，按上面两条处理。
+
+设计阶段（plan）就要列出方案依赖的内核约束，并标明是否已在 v3.10 及最新内核源码上核实。
 
 ### 文档同步范围
 - 事件语法或选项字符串一旦变更，**必须同步更新的地方**：
@@ -438,32 +497,13 @@ pytest --runtime=20 --memleak-check=2000
 
 ### AI 协作提交标签政策
 
-**默认使用 `git commit -s`** 自动追加 `Signed-off-by:`；`Co-Authored-By:` / `Reviewed-by:` 仍需手工写入。
-
-三个标签的使用规则：
-
-- `Co-Authored-By:` — 只用于 AI（AI 参与了代码编写，无论比例多少）
-- `Signed-off-by:` — 只用于人类（对提交内容负最终责任），由 `git commit -s` 自动生成
-- `Reviewed-by:` — 人类和 AI 都可用；AI 时格式与 `Co-Authored-By:` 一致
-
-**三种场景：**
+用 `git commit -s` 提交，自动追加人类的 `Signed-off-by:`；AI 参与了编写（无论比例多少）时，
+手工追加 `Co-Authored-By:`，模型名称跟随实际使用的模型：
 
 ```
-# 场景一：人类写代码，AI review
-Reviewed-by: Claude Sonnet 4.6 <noreply@anthropic.com>
-Signed-off-by: 你的姓名 <邮箱>
-
-# 场景二：人类 + AI 共同写代码
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
-Signed-off-by: 你的姓名 <邮箱>
-
-# 场景三：AI 写代码，人类 review 并给出修改建议
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
-Reviewed-by: 你的姓名 <邮箱>
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 Signed-off-by: 你的姓名 <邮箱>
 ```
-
-模型名称跟随实际使用的模型，如 `Claude Opus 4.7 (1M context)`、`Claude Sonnet 4.6` 等。
 
 ### 提交拆分
 按"变更种类"分成三类独立提交，顺序上通常是 **源码 → 测试 → 文档**：
@@ -472,6 +512,8 @@ Signed-off-by: 你的姓名 <邮箱>
    - `src/monitor.c` 的选项帮助字符串更新（帮助与代码语义强绑定，不可分开提交）
    - `src/Build` 里的 .o 增删
    - 若涉及构建时配置，同步 `build/` 与 `Makefile.config`
+   - **控制粒度**：一个大的实现拆成多个小提交，每个只做一件事（如先抽取公共模块、再迁移使用者、
+     最后加新功能），并且各自可编译、行为正确，便于 review 与 bisect
 
 2. **测试提交** — `tests/**` 独立成一个 commit：
    - 新增 `tests/test_*.py`
@@ -497,12 +539,6 @@ Signed-off-by: 你的姓名 <邮箱>
 - 用户在 review 时会要求按上面三类拆开，回炉重排比一开始就拆干净成本高。
 - 一个功能可能涉及多次源码/测试/文档提交轮换（本会话 `db231e3 → 475b4a4 → b8a8977 → e07e3e7 → ec4ae9f` 就是范例）——按功能推进的自然节奏来，不是硬性一次三 commit 就结束。
 
-### 未跟踪文件
-- `docs/thread-tracking-design.md`、`docs/plans/*.md` 目前是 untracked（不在 git 版本库里）。改动它们不需要 `git add`，除非用户明确要求入库。
-- `tools/` 下有大量未跟踪的本地实验脚本。写文档、答复用户、列举已有功能时以 `git ls-files tools/` 为准，不要把未跟踪脚本算进来。
-- `git add -A` 会一起吞掉临时构建产物（`.o.cmd`、`*.o`、`perf-prof` 二进制）和 `tools/` 的未跟踪脚本，务必用具体路径 `git add file1 file2 ...`。
-
-
 ## 相关文档
 
 - [docs/tool_usage.md](docs/tool_usage.md) — perf-prof 工具使用指南（帮助、选项、功能分类、事件格式、过滤器、表达式、分析器概览、工作流程）
@@ -510,6 +546,8 @@ Signed-off-by: 你的姓名 <邮箱>
 - [docs/expr.md](docs/expr.md) — 表达式系统
 - [docs/Event_filtering.md](docs/Event_filtering.md) — trace event 过滤器语法
 - [docs/bpf_event_filter.md](docs/bpf_event_filter.md) — BPF 事件源的内核态过滤（表达式 → eBPF 指令）
+- [docs/modules.md](docs/modules.md) — perf-prof 的内部模块：能力、源码位置、使用注意事项
+- [docs/kernel_dependencies.md](docs/kernel_dependencies.md) — perf-prof 使用的内核功能、实现原理及代码对其实现的依赖
 - [docs/profilers/](docs/profilers/) — 各分析器详细说明
 - [skills/perf-prof/SKILL.md](skills/perf-prof/SKILL.md) — 面向问题分析的工作流程
 
