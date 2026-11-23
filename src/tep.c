@@ -2007,9 +2007,8 @@ struct tp_matcher *tp_matcher_find(struct tp *tp, const char *sys, const char *n
     /*
      * default tp_matcher
      *
-     * Get the 'cpu' and 'pid' fields from tracepoint(@raw, @size) and
-     * determine whether they are the same. The cpu and pid fields will
-     * be compiled as an expression.
+     * The 'cpu' and 'pid' fields of the tracepoint are compiled as
+     * expressions, and compared with the cpu and tid to match.
      */
     event = tep_find_event_by_name(tep, sys, name);
     if (!event) goto out;
@@ -2030,7 +2029,7 @@ out:
     return matcher;
 }
 
-static bool default_samecpu(struct tp *tp, void *raw, int size, int cpu)
+static bool default_refer_cpu(struct tp *tp, void *raw, int size, int cpu)
 {
     if (tp->tp_cpu_prog) {
         long result = tp_prog_run(tp, tp->tp_cpu_prog, GLOBAL(0, 0, raw, size));
@@ -2039,11 +2038,11 @@ static bool default_samecpu(struct tp *tp, void *raw, int size, int cpu)
         return false;
 }
 
-static bool default_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool default_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
     if (tp->tp_pid_prog) {
         long result = tp_prog_run(tp, tp->tp_pid_prog, GLOBAL(0, 0, raw, size));
-        return result == pid;
+        return result == tid;
     } else
         return false;
 }
@@ -2051,14 +2050,14 @@ static bool default_samepid(struct tp *tp, void *raw, int size, int pid)
 static struct tp_matcher default_tp_matcher = {
     .sys = "default",
     .name = "default",
-    .samecpu = default_samecpu,
-    .samepid = default_samepid,
-    .target_cpu = NULL,
-    .oncpu = NULL,
+    .refer_cpu = default_refer_cpu,
+    .refer_tid = default_refer_tid,
+    .task_cpu = NULL,
+    .switch_to = NULL,
 };
 
 
-static bool __sched_wakeup_samecpu(struct tp *tp, void *raw, int size, int cpu)
+static bool __sched_wakeup_refer_cpu(struct tp *tp, void *raw, int size, int cpu)
 {
     if (size == TP_RAW_SIZE(struct sched_wakeup)) {
         return ((struct sched_wakeup *)raw)->target_cpu == cpu;
@@ -2068,20 +2067,20 @@ static bool __sched_wakeup_samecpu(struct tp *tp, void *raw, int size, int cpu)
         return false;
 }
 
-static bool __sched_wakeup_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_wakeup_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_wakeup *)raw)->pid;
+    return tid == ((struct sched_wakeup *)raw)->pid;
 }
 
-static bool __sched_wakeup_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
+static bool __sched_wakeup_task_cpu(struct tp *tp, void *raw, int size, int cpu, int tid, int *new_cpu, const char **reason)
 {
-    if (pid == ((struct sched_wakeup *)raw)->pid) {
+    if (tid == ((struct sched_wakeup *)raw)->pid) {
         if (size == TP_RAW_SIZE(struct sched_wakeup)) {
-            *target_cpu = ((struct sched_wakeup *)raw)->target_cpu;
+            *new_cpu = ((struct sched_wakeup *)raw)->target_cpu;
             *reason = "[wakeup]";
             return true;
         } else if (size == TP_RAW_SIZE(struct sched_wakeup_no_success)) {
-            *target_cpu = ((struct sched_wakeup_no_success *)raw)->target_cpu;
+            *new_cpu = ((struct sched_wakeup_no_success *)raw)->target_cpu;
             *reason = "[wakeup]";
             return true;
         }
@@ -2089,10 +2088,10 @@ static bool __sched_wakeup_target_cpu(struct tp *tp, void *raw, int size, int cp
     return false;
 }
 
-static bool __sched_switch_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_switch_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_switch *)raw)->prev_pid ||
-           pid == ((struct sched_switch *)raw)->next_pid;
+    return tid == ((struct sched_switch *)raw)->prev_pid ||
+           tid == ((struct sched_switch *)raw)->next_pid;
 }
 
 /*
@@ -2203,21 +2202,21 @@ long tep__sched_switch_preempt_state(void)
     return preempt_state;
 }
 
-static bool __sched_switch_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
+static bool __sched_switch_task_cpu(struct tp *tp, void *raw, int size, int cpu, int tid, int *new_cpu, const char **reason)
 {
     struct sched_switch *sched_switch = raw;
 
-    if (pid == sched_switch->next_pid) {
-        *target_cpu = cpu;
+    if (tid == sched_switch->next_pid) {
+        *new_cpu = cpu;
         *reason = "[running]";
         return true;
-    } else if (pid == sched_switch->prev_pid) {
+    } else if (tid == sched_switch->prev_pid) {
         if (sched_switch->prev_state == 0 ||
             sched_switch->prev_state == tep__sched_switch_preempt_state()) {
-            *target_cpu = cpu;
+            *new_cpu = cpu;
             *reason = "[preempt]";
         } else {
-            *target_cpu = -1;
+            *new_cpu = -1;
             *reason = sched_switch->prev_state == 1 ? "[sleeping]" : "[waiting]";
         }
         return true;
@@ -2225,65 +2224,65 @@ static bool __sched_switch_target_cpu(struct tp *tp, void *raw, int size, int cp
     return false;
 }
 
-static bool __sched_switch_oncpu(struct tp *tp, void *raw, int size, int *pid, const char **prev_comm)
+static bool __sched_switch_to(struct tp *tp, void *raw, int size, int *next_tid, const char **prev_comm)
 {
     struct sched_switch *sched_switch = raw;
-    *pid = sched_switch->next_pid;
+    *next_tid = sched_switch->next_pid;
     *prev_comm = sched_switch->prev_comm;
     return true;
 }
 
-static bool __sched_migrate_task_samecpu(struct tp *tp, void *raw, int size, int cpu)
+static bool __sched_migrate_task_refer_cpu(struct tp *tp, void *raw, int size, int cpu)
 {
     return cpu == ((struct sched_migrate_task *)raw)->orig_cpu ||
            cpu == ((struct sched_migrate_task *)raw)->dest_cpu;
 }
 
-static bool __sched_migrate_task_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_migrate_task_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_migrate_task *)raw)->pid;
+    return tid == ((struct sched_migrate_task *)raw)->pid;
 }
 
-static bool __sched_migrate_task_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
+static bool __sched_migrate_task_task_cpu(struct tp *tp, void *raw, int size, int cpu, int tid, int *new_cpu, const char **reason)
 {
-    if (pid == ((struct sched_migrate_task *)raw)->pid) {
-        *target_cpu = ((struct sched_migrate_task *)raw)->dest_cpu;
+    if (tid == ((struct sched_migrate_task *)raw)->pid) {
+        *new_cpu = ((struct sched_migrate_task *)raw)->dest_cpu;
         *reason = "[migrate]";
         return true;
     }
     return false;
 }
 
-static bool __sched_stat_runtime_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_stat_runtime_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_stat_runtime *)raw)->pid;
+    return tid == ((struct sched_stat_runtime *)raw)->pid;
 }
 
-static bool __sched_process_free_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_process_free_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_process_free *)raw)->pid;
+    return tid == ((struct sched_process_free *)raw)->pid;
 }
 
-static bool __sched_process_fork_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_process_fork_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_process_fork *)raw)->parent_pid ||
-           pid == ((struct sched_process_fork *)raw)->child_pid;
+    return tid == ((struct sched_process_fork *)raw)->parent_pid ||
+           tid == ((struct sched_process_fork *)raw)->child_pid;
 }
 
-static bool __sched_process_exec_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __sched_process_exec_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return pid == ((struct sched_process_exec *)raw)->pid;
+    return tid == ((struct sched_process_exec *)raw)->pid;
 }
 
 
-TP_MATCHER_REGISTER5("sched", "sched_wakeup", __sched_wakeup_samecpu, __sched_wakeup_samepid, __sched_wakeup_target_cpu);
-TP_MATCHER_REGISTER5("sched", "sched_waking", __sched_wakeup_samecpu, __sched_wakeup_samepid, __sched_wakeup_target_cpu);
-TP_MATCHER_REGISTER5("sched", "sched_wakeup_new", __sched_wakeup_samecpu, __sched_wakeup_samepid, __sched_wakeup_target_cpu);
-TP_MATCHER_REGISTER6("sched", "sched_switch", NULL, __sched_switch_samepid, __sched_switch_target_cpu, __sched_switch_oncpu);
-TP_MATCHER_REGISTER5("sched", "sched_migrate_task", __sched_migrate_task_samecpu, __sched_migrate_task_samepid, __sched_migrate_task_target_cpu);
-TP_MATCHER_REGISTER("sched", "sched_stat_runtime", NULL, __sched_stat_runtime_samepid);
-TP_MATCHER_REGISTER("sched", "sched_process_free", NULL, __sched_process_free_samepid);
-TP_MATCHER_REGISTER("sched", "sched_process_exit", NULL, __sched_process_free_samepid);
-TP_MATCHER_REGISTER("sched", "sched_process_fork", NULL, __sched_process_fork_samepid);
-TP_MATCHER_REGISTER("sched", "sched_process_exec", NULL, __sched_process_exec_samepid);
+TP_MATCHER_REGISTER5("sched", "sched_wakeup", __sched_wakeup_refer_cpu, __sched_wakeup_refer_tid, __sched_wakeup_task_cpu);
+TP_MATCHER_REGISTER5("sched", "sched_waking", __sched_wakeup_refer_cpu, __sched_wakeup_refer_tid, __sched_wakeup_task_cpu);
+TP_MATCHER_REGISTER5("sched", "sched_wakeup_new", __sched_wakeup_refer_cpu, __sched_wakeup_refer_tid, __sched_wakeup_task_cpu);
+TP_MATCHER_REGISTER6("sched", "sched_switch", NULL, __sched_switch_refer_tid, __sched_switch_task_cpu, __sched_switch_to);
+TP_MATCHER_REGISTER5("sched", "sched_migrate_task", __sched_migrate_task_refer_cpu, __sched_migrate_task_refer_tid, __sched_migrate_task_task_cpu);
+TP_MATCHER_REGISTER("sched", "sched_stat_runtime", NULL, __sched_stat_runtime_refer_tid);
+TP_MATCHER_REGISTER("sched", "sched_process_free", NULL, __sched_process_free_refer_tid);
+TP_MATCHER_REGISTER("sched", "sched_process_exit", NULL, __sched_process_free_refer_tid);
+TP_MATCHER_REGISTER("sched", "sched_process_fork", NULL, __sched_process_fork_refer_tid);
+TP_MATCHER_REGISTER("sched", "sched_process_exec", NULL, __sched_process_exec_refer_tid);
 

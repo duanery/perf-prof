@@ -1359,25 +1359,25 @@ static void task_state_matcher(struct tp *tp, void *raw, int size, struct matche
     }
 }
 
-static bool __task_state_samecpu(struct tp *tp, void *raw, int size, int cpu)
+static bool __task_state_refer_cpu(struct tp *tp, void *raw, int size, int cpu)
 {
     struct matcher_result result = {};
     task_state_matcher(tp, raw, size, &result);
-    return tp_matcher_samecpu(result.matcher, tp, result.true_raw, result.true_size, cpu);
+    return tp_matcher_refer_cpu(result.matcher, tp, result.true_raw, result.true_size, cpu);
 }
 
-static bool __task_state_samepid(struct tp *tp, void *raw, int size, int pid)
+static bool __task_state_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
     struct matcher_result result = {};
     task_state_matcher(tp, raw, size, &result);
-    return tp_matcher_samepid(result.matcher, tp, result.true_raw, result.true_size, pid);
+    return tp_matcher_refer_tid(result.matcher, tp, result.true_raw, result.true_size, tid);
 }
 
-static bool __task_state_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
+static bool __task_state_task_cpu(struct tp *tp, void *raw, int size, int cpu, int tid, int *new_cpu, const char **reason)
 {
     struct matcher_result result = {};
     task_state_matcher(tp, raw, size, &result);
-    return tp_matcher_target_cpu(result.matcher, tp, result.true_raw, result.true_size, cpu, pid, target_cpu, reason);
+    return tp_matcher_task_cpu(result.matcher, tp, result.true_raw, result.true_size, cpu, tid, new_cpu, reason);
 }
 
-TP_MATCHER_REGISTER5(NULL, "task-state", __task_state_samecpu, __task_state_samepid, __task_state_target_cpu);
+TP_MATCHER_REGISTER5(NULL, "task-state", __task_state_refer_cpu, __task_state_refer_tid, __task_state_task_cpu);

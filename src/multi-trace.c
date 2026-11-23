@@ -1174,7 +1174,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
             int track_tid = ctx->comm ? (int)info->key : e1->tid_entry.tid;
             if (track_tid > 0) {
                 iter->debug_msg = "cpu tracking";
-                if (tp_target_cpu(curr->tp, raw, size, e->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason)) {
+                if (tp_task_cpu(curr->tp, raw, size, e->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason)) {
                     if (iter->recent_cpu == -1)
                         iter->debug_msg = "cpu tracking end";
                     goto TRUE;
@@ -1188,13 +1188,13 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
 
             iter->debug_msg = "samecpu-track";
             if (e->cpu_entry.cpu == iter->recent_cpu ||
-                tp_samecpu(curr->tp, raw, size, iter->recent_cpu))
+                tp_refer_cpu(curr->tp, raw, size, iter->recent_cpu))
                 goto TRUE;
 
             if (cmp_e1 && !ctx->comm) {
                 iter->debug_msg = "samecpu-1";
                 if (e->cpu_entry.cpu == e1->cpu_entry.cpu ||
-                    tp_samecpu(curr->tp, raw, size, e1->cpu_entry.cpu))
+                    tp_refer_cpu(curr->tp, raw, size, e1->cpu_entry.cpu))
                     goto TRUE;
             }
         }
@@ -1203,7 +1203,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
                 iter->debug_msg = "samecpu-2";
                 if (e->cpu_entry.cpu == e2->cpu_entry.cpu ||
                    (e1->cpu_entry.cpu != e2->cpu_entry.cpu &&
-                        tp_samecpu(curr->tp, raw, size, e2->cpu_entry.cpu)))
+                        tp_refer_cpu(curr->tp, raw, size, e2->cpu_entry.cpu)))
                     goto TRUE;
             }
         }
@@ -1216,7 +1216,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
             iter->debug_msg = "samepid-1";
             if (pid > 0) // exclude 0 and e1->tid_entry.pid maybe -1
             if (e->tid_entry.pid == pid ||
-                tp_samepid(curr->tp, raw, size, pid))
+                tp_refer_tid(curr->tp, raw, size, pid))
                 goto TRUE;
         }
         if (cmp_e2 && (int)e2->tid_entry.pid > 0) {
@@ -1224,7 +1224,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
             if (!ctx->comm) {
                 if (e->tid_entry.pid == e2->tid_entry.pid ||
                    (e1->tid_entry.pid != e2->tid_entry.pid &&
-                        tp_samepid(curr->tp, raw, size, e2->tid_entry.pid)))
+                        tp_refer_tid(curr->tp, raw, size, e2->tid_entry.pid)))
                     goto TRUE;
             }
         }
@@ -1237,7 +1237,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
             iter->debug_msg = "sametid-1";
             if (tid > 0) // exclude 0 and e1->tid_entry.tid maybe -1
             if (e->tid_entry.tid == tid ||
-                tp_samepid(curr->tp, raw, size, tid))
+                tp_refer_tid(curr->tp, raw, size, tid))
                 goto TRUE;
         }
         if (cmp_e2 && (int)e2->tid_entry.tid > 0) {
@@ -1245,7 +1245,7 @@ bool event_need_to_print(union perf_event *event1, union perf_event *event2, str
             if (!ctx->comm) {
                 if (e->tid_entry.tid == e2->tid_entry.tid ||
                    (e1->tid_entry.tid != e2->tid_entry.tid &&
-                        tp_samepid(curr->tp, raw, size, e2->tid_entry.tid)))
+                        tp_refer_tid(curr->tp, raw, size, e2->tid_entry.tid)))
                     goto TRUE;
             }
         }
@@ -1271,7 +1271,7 @@ TRUE:
         iter->running_time = 0;
         iter->comm = NULL;
         // Only the sched_switch event can return 1.
-        if (tp_oncpu(curr->tp, raw, size, &next_pid, &prev_comm)) {
+        if (tp_switch_to(curr->tp, raw, size, &next_pid, &prev_comm)) {
             /* cpu tracking
              * iter->recent_cpu : indicates the CPU that `track_tid` is running on.
              * iter->curr_cpu[2]: records the pid and start time running on

@@ -353,14 +353,14 @@ static void delay_two(struct two_event *two, union perf_event *event1, union per
                     track_tid = opts->comm ? (int)key : e1->tid_entry.tid;
                     if (track_tid > 0) {
                         multi_trace_raw_size(event1, &raw, &size, two->tp1);
-                        tp_target_cpu(two->tp1, raw, size, e1->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
+                        tp_task_cpu(two->tp1, raw, size, e1->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
                     }
                     // tracking running time.
                     iter->curr_cpu[0] = e1->cpu_entry.cpu;
                     iter->curr_cpu[1] = e2->cpu_entry.cpu;
                     iter->curr_cpu[2] = iter->recent_cpu;
                     iter->curr_time[0] = iter->time;
-                    if (!tp_oncpu(two->tp1, raw, size, &iter->curr_pid[0], &dummy))
+                    if (!tp_switch_to(two->tp1, raw, size, &iter->curr_pid[0], &dummy))
                         iter->curr_pid[0] = e1->tid_entry.tid;
                     if (iter->curr_cpu[2] == iter->curr_cpu[0]) {
                         iter->curr_pid[2] = iter->curr_pid[0];
@@ -436,7 +436,7 @@ static void delay_two(struct two_event *two, union perf_event *event1, union per
                     track_tid = opts->comm ? (int)key : e1->tid_entry.tid;
                     if (track_tid > 0) {
                         multi_trace_raw_size(event2, &raw, &size, two->tp2);
-                        tp_target_cpu(two->tp2, raw, size, e2->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
+                        tp_task_cpu(two->tp2, raw, size, e2->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
                     }
                 }
 
@@ -516,7 +516,7 @@ static remaining_return delay_remaining(struct two_event *two, union perf_event 
                 track_tid = opts->comm ? (int)info->key : e1->tid_entry.tid;
                 if (track_tid > 0) {
                     multi_trace_raw_size(event1, &raw, &size, two->tp1);
-                    tp_target_cpu(two->tp1, raw, size, e1->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
+                    tp_task_cpu(two->tp1, raw, size, e1->cpu_entry.cpu, track_tid, &iter->recent_cpu, &iter->reason);
                 }
             }
 

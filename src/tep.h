@@ -260,40 +260,59 @@ long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list,
 
 
 /*
- * Each tp is used to determine whether it is related to the specified cpu/pid.
+ * tp_matcher: select the events associated with a given cpu or tid.
  *
- * If tp is a forwarding source device, @raw, @size specify the `perf_record_dev'
- * structure and size, and the forwarding device determines whether @raw is related
- * to the specified cpu/pid.
- * If not, tp is used for kernel events, @raw, @size specifies the tracepoint
- * structure and size. Specify PERF_SAMPLE_RAW to sample the tracepoint structure.
+ * An event is associated with a cpu by occurring on it, and with a tid by being
+ * sampled in it; the caller checks those from the sample header. The matcher
+ * checks the rest, which only the event itself knows: the cpus and tids that
+ * its fields refer to, e.g. the target_cpu and the wakee pid of sched_wakeup.
  *
- * Only tp itself knows whether there are fields in its structure that are the
- * same as the specified cpu/pid.
+ * Each tp gets the matcher registered by its sys:name, see tp_matcher_find().
+ * A tracepoint without one falls back to the default matcher, which reads the
+ * `cpu' and `pid' fields by expression. sys is NULL for a profiler, the events
+ * of which are forwarded from a source device.
+ *
+ * @raw, @size is the tracepoint raw data (PERF_SAMPLE_RAW) of a kernel event,
+ * or the `perf_record_dev' of a forwarded event, which the source profiler
+ * unwraps to match the original event.
+ *
+ * A tid is the kernel pid, as is the `pid' field of the sched tracepoints.
+ * A NULL callback returns false.
  */
 struct tp_matcher {
     struct list_head link;
     const char *sys;
     const char *name;
-    bool (*samecpu)(struct tp *tp, void *raw, int size, int cpu);
-    bool (*samepid)(struct tp *tp, void *raw, int size, int pid);
-    bool (*target_cpu)(struct tp *tp, void *raw, int size, int cpu, int pid,
-                       int *target_cpu, const char **reason);
-    bool (*oncpu)(struct tp *tp, void *raw, int size,
-                        int *pid, const char **prev_comm);
+    // Whether the fields of the event refer to @cpu.
+    bool (*refer_cpu)(struct tp *tp, void *raw, int size, int cpu);
+    // Whether the fields of the event refer to @tid.
+    bool (*refer_tid)(struct tp *tp, void *raw, int size, int tid);
+    /*
+     * Track the cpu of task @tid. If the event, occurring on @cpu, moves @tid,
+     * return true, the cpu it is on afterwards in @new_cpu, -1 if it leaves the
+     * runqueue, and the @reason, e.g. "[wakeup]", "[migrate]", "[sleeping]".
+     */
+    bool (*task_cpu)(struct tp *tp, void *raw, int size, int cpu, int tid,
+                     int *new_cpu, const char **reason);
+    /*
+     * A context switch on the cpu of the event: return true, the task switched
+     * in in @next_tid and the comm of the task switched out in @prev_comm.
+     */
+    bool (*switch_to)(struct tp *tp, void *raw, int size,
+                      int *next_tid, const char **prev_comm);
 };
 
-#define __TP_MATCHER_REGISTER(SYS, NAME, SAMECPU, SAMEPID, TARGET_CPU, ONCPU) \
+#define __TP_MATCHER_REGISTER(SYS, NAME, REFER_CPU, REFER_TID, TASK_CPU, SWITCH_TO) \
 __ctor \
 static void __PASTE(tp_matcher_register_, __LINE__) (void) \
 { \
     static struct tp_matcher tp_matcher = { \
         .sys = SYS, \
         .name = NAME, \
-        .samecpu = SAMECPU, \
-        .samepid = SAMEPID, \
-        .target_cpu = TARGET_CPU, \
-        .oncpu = ONCPU, \
+        .refer_cpu = REFER_CPU, \
+        .refer_tid = REFER_TID, \
+        .task_cpu = TASK_CPU, \
+        .switch_to = SWITCH_TO, \
     }; \
     tp_matcher_register(&tp_matcher); \
 }
@@ -307,52 +326,50 @@ void tp_matcher_register(struct tp_matcher *matcher);
 struct tp_matcher *tp_matcher_find(struct tp *tp, const char *sys, const char *name);
 
 
-static inline bool tp_matcher_samecpu(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int cpu)
+static inline bool tp_matcher_refer_cpu(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int cpu)
 {
-    return matcher && matcher->samecpu ?
-           matcher->samecpu(tp, raw, size, cpu) : false;
+    return matcher && matcher->refer_cpu ?
+           matcher->refer_cpu(tp, raw, size, cpu) : false;
 }
 
-static inline bool tp_matcher_samepid(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int pid)
+static inline bool tp_matcher_refer_tid(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int tid)
 {
-    return matcher && matcher->samepid ?
-           matcher->samepid(tp, raw, size, pid) : false;
+    return matcher && matcher->refer_tid ?
+           matcher->refer_tid(tp, raw, size, tid) : false;
 }
 
-static inline bool tp_matcher_target_cpu(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int cpu, int pid,
-                                                 int *target_cpu, const char **reason)
+static inline bool tp_matcher_task_cpu(struct tp_matcher *matcher, struct tp *tp, void *raw, int size, int cpu, int tid,
+                                       int *new_cpu, const char **reason)
 {
-    return matcher && matcher->target_cpu ?
-           matcher->target_cpu(tp, raw, size, cpu, pid, target_cpu, reason) : false;
+    return matcher && matcher->task_cpu ?
+           matcher->task_cpu(tp, raw, size, cpu, tid, new_cpu, reason) : false;
 }
 
-static inline bool tp_matcher_oncpu(struct tp_matcher *matcher, struct tp *tp, void *raw, int size,
-                                                 int *pid, const char **prev_comm)
+static inline bool tp_matcher_switch_to(struct tp_matcher *matcher, struct tp *tp, void *raw, int size,
+                                        int *next_tid, const char **prev_comm)
 {
-    return matcher && matcher->oncpu ?
-           matcher->oncpu(tp, raw, size, pid, prev_comm) : false;
+    return matcher && matcher->switch_to ?
+           matcher->switch_to(tp, raw, size, next_tid, prev_comm) : false;
 }
 
-static inline bool tp_samecpu(struct tp *tp, void *raw, int size, int cpu)
+static inline bool tp_refer_cpu(struct tp *tp, void *raw, int size, int cpu)
 {
-    return tp_matcher_samecpu(tp->matcher, tp, raw, size, cpu);
+    return tp_matcher_refer_cpu(tp->matcher, tp, raw, size, cpu);
 }
 
-static inline bool tp_samepid(struct tp *tp, void *raw, int size, int pid)
+static inline bool tp_refer_tid(struct tp *tp, void *raw, int size, int tid)
 {
-    return tp_matcher_samepid(tp->matcher, tp, raw, size, pid);
+    return tp_matcher_refer_tid(tp->matcher, tp, raw, size, tid);
 }
 
-// From the tracepoint(@raw, @size, @cpu), get the @target_cpu and @reason where the @pid may survive.
-static inline bool tp_target_cpu(struct tp *tp, void *raw, int size, int cpu, int pid, int *target_cpu, const char **reason)
+static inline bool tp_task_cpu(struct tp *tp, void *raw, int size, int cpu, int tid, int *new_cpu, const char **reason)
 {
-    return tp_matcher_target_cpu(tp->matcher, tp, raw, size, cpu, pid, target_cpu, reason);
+    return tp_matcher_task_cpu(tp->matcher, tp, raw, size, cpu, tid, new_cpu, reason);
 }
 
-// From the tracepoint(@raw, @size), get the current @pid and the previous @prev_comm.
-static inline bool tp_oncpu(struct tp *tp, void *raw, int size, int *pid, const char **prev_comm)
+static inline bool tp_switch_to(struct tp *tp, void *raw, int size, int *next_tid, const char **prev_comm)
 {
-    return tp_matcher_oncpu(tp->matcher, tp, raw, size, pid, prev_comm);
+    return tp_matcher_switch_to(tp->matcher, tp, raw, size, next_tid, prev_comm);
 }
 
 #endif
