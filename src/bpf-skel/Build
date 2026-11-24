@@ -1,1 +1,2 @@
 perf-prof-$(CONFIG_LIBBPF) += kvm_exit.event.o
+perf-prof-$(CONFIG_LIBBPF) += sched_rundelay.event.o
