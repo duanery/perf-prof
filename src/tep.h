@@ -29,6 +29,10 @@ char *next_sep(char *s, int c);
 
 struct prof_dev;
 struct tp_matcher;
+struct perf_cpu_map;
+struct bpf_event_source;
+struct bpf_event;
+struct bpf_event_scope;
 
 struct tp {
     struct prof_dev *dev;
@@ -123,6 +127,10 @@ struct tp {
     // default tp_matcher
     struct expr_prog *tp_cpu_prog;
     struct expr_prog *tp_pid_prog;
+
+    // bpf:xxx, see bpf_event.h
+    struct bpf_event_source *bpf_src;
+    struct bpf_event *bpf;  // created by tp_evsel_new(), freed by tp_list_free()
 };
 
 struct tp_list {
@@ -139,6 +147,7 @@ struct tp_list {
     int nr_push_to;
     int nr_pull_from;
     int nr_exec_prog;
+    int nr_bpf;
     struct tp tp[0];
 };
 
@@ -205,6 +214,7 @@ enum {
     KRETPROBE,
     UPROBE,
     URETPROBE,
+    BPF_EVENT_BASE,     // bpf:xxx, one id per BPF event source, see tp_bpf_id()
 };
 extern int kprobe_type;
 extern int uprobe_type;
@@ -212,6 +222,11 @@ extern int uprobe_type;
 static inline bool tp_is_dev(struct tp *tp)
 {
     return tp->id < 0;
+}
+
+static inline bool tp_is_bpf(struct tp *tp)
+{
+    return tp->id >= BPF_EVENT_BASE;
 }
 
 #define for_each_tp(_list, _tp, i) \
@@ -255,6 +270,18 @@ void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, int tid, void
 struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl);
 struct tp *tp_from_evsel(struct perf_evsel *evsel, struct tp_list *tp_list);
 int tp_list_apply_filter(struct prof_dev *dev, struct tp_list *tp_list);
+/*
+ * Start the BPF event of @tp, once its evsel is open, with tp->filter; a
+ * filter that cannot run in the kernel falls back to userspace when the
+ * profiler can filter there. 0 for a NULL or non-BPF @tp.
+ */
+int tp_bpf_start(struct tp *tp);
+/*
+ * What a BPF event of @dev traces: the cpus (@cpus, or the dev's) when bound
+ * to cpus, else the processes of the dev's threads, put in @tgids, which has
+ * room for one per thread. -EOPNOTSUPP for cgroups.
+ */
+int tp_bpf_scope(struct prof_dev *dev, struct perf_cpu_map *cpus, struct bpf_event_scope *scope, int *tgids);
 long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list,
                            union perf_event *event, struct expr_global *global);
 

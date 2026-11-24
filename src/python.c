@@ -2687,6 +2687,10 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->tp_list = tp_list_new(dev, env->event);
     if (!ctx->tp_list)
         goto failed;
+    if (ctx->tp_list->nr_bpf) {
+        fprintf(stderr, "%s: BPF events are not supported yet\n", dev->prof->name);
+        goto failed;
+    }
 
     /* Initialize callchain support if enabled */
     if (env->callchain || ctx->tp_list->nr_need_stack) {

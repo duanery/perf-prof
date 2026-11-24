@@ -146,6 +146,10 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->tp_list = tp_list_new(dev, env->event);
     if (!ctx->tp_list)
         goto failed;
+    if (ctx->tp_list->nr_bpf) {
+        fprintf(stderr, "%s: BPF events are not supported yet\n", dev->prof->name);
+        goto failed;
+    }
 
     ctx->sql = open_db(env->output2);
     if (!ctx->sql)

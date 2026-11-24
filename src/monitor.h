@@ -66,6 +66,8 @@ int get_tsc_khz(void);
 #define KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
 #endif
 int kernel_release(void);
+/* The process (Tgid) of thread @tid, from /proc; -1 if gone. */
+int get_tgid(int tid);
 
 
 #define X86_VENDOR_INTEL    0
@@ -836,8 +838,8 @@ struct prof_dev *trace_dev_open(const char *event, struct perf_cpu_map *cpu_map,
 
 
 //list.c
-typedef void (*tracepoint_cb)(char **evt_list, int evt_num, void *opaque);
-void print_tracepoint_events(tracepoint_cb cb, void *opaque);
+typedef void (*list_events_cb)(char **evt_list, int evt_num, void *opaque);
+void list_events(list_events_cb cb, void *opaque);
 
 //perfeval.c
 int perfeval_init(struct prof_dev *dev);

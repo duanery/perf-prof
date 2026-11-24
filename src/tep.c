@@ -16,6 +16,7 @@
 #include <api/fs/fs.h>
 #include <trace_helpers.h>
 #include <event-parse-local.h>
+#include <bpf_event.h>
 #include "perf_regs_mask.h"
 
 #define PLUGINS_DIR "/usr/lib64/perf-prof/traceevent/plugins"
@@ -28,6 +29,36 @@ int kprobe_type = 0;
 int uprobe_type = 0;
 static char *kprobe_retprobe = NULL;
 static char *uprobe_retprobe = NULL;
+
+/*
+ * The tp->id of a BPF event source: BPF_EVENT_BASE + its index in this table,
+ * appended the first time a source is used. The ids are not stable across
+ * processes, which is why push= and pull= refuse BPF events.
+ */
+static struct bpf_event_source **bpf_ids;
+static int nr_bpf_ids;
+
+static int tp_bpf_id(struct bpf_event_source *src)
+{
+    struct bpf_event_source **ids;
+    int i;
+
+    for (i = 0; i < nr_bpf_ids; i++)
+        if (bpf_ids[i] == src)
+            return BPF_EVENT_BASE + i;
+    ids = realloc(bpf_ids, (nr_bpf_ids + 1) * sizeof(*ids));
+    if (!ids)
+        return -1;
+    bpf_ids = ids;
+    bpf_ids[nr_bpf_ids] = src;
+    return BPF_EVENT_BASE + nr_bpf_ids++;
+}
+
+static struct bpf_event_source *tp_bpf_source(int id)
+{
+    id -= BPF_EVENT_BASE;
+    return id >= 0 && id < nr_bpf_ids ? bpf_ids[id] : NULL;
+}
 
 /*
  * Kernel constraint: the reserved field names of the kprobe/uprobe events,
@@ -430,7 +461,10 @@ int tep__event_size(int id)
     struct tep_format_field **fields;
     int size = -1;
 
-    if (id == KPROBE || id == UPROBE)
+    if (id >= BPF_EVENT_BASE) {
+        struct bpf_event_source *src = tp_bpf_source(id);
+        return src ? bpf_event_source_size(src) : -1;
+    } else if (id == KPROBE || id == UPROBE)
         return sizeof(struct kprobe_trace_entry_head);
     else if (id == KRETPROBE || id == URETPROBE)
         return sizeof(struct kretprobe_trace_entry_head);
@@ -501,6 +535,10 @@ event_fields *tep__event_fields(int id)
     char *extra = NULL;
     int i = 0, f = 0;
 
+    if (id >= BPF_EVENT_BASE) {
+        struct bpf_event_source *src = tp_bpf_source(id);
+        return src ? bpf_event_source_fields(src) : NULL;
+    }
     if (id > TRACE_EVENT_TYPE_MAX)
         return kprobe_uprobe_event_fields(id);
 
@@ -632,6 +670,7 @@ enum event_head_kind {
     EVT_HEAD_KRETPROBE,    /* kretprobe:[module:]fn    | kretprobe:0xADDR */
     EVT_HEAD_UPROBE,       /* uprobe:binary:fn[+off]   | uprobe:binary:offset */
     EVT_HEAD_URETPROBE,    /* uretprobe:binary:fn      | uretprobe:binary:offset */
+    EVT_HEAD_BPF,          /* bpf:name, a BPF event source */
 };
 
 struct event_head {
@@ -725,6 +764,29 @@ static int parse_event_head(char *s, struct event_head *out)
         return 0;
     }
 
+    /*
+     * A BPF event source comes before the profilers: `-e bpf:kvm_exit' is the
+     * source, while the command `perf-prof bpf:kvm_exit' is still the profiler.
+     * It also hides a tracepoint of the same name; tracefs had a `bpf' system
+     * since a67edbf4fb6d ("bpf: add initial bpf tracepoints"), in v4.11, until
+     * 4d220ed0f814 ("bpf: remove tracepoints from bpf core"), in v4.18.
+     */
+    if (head_starts_with(s, "bpf:", &rest)) {
+        bool found;
+
+        slash_naive = next_sep(rest, '/');
+        if (slash_naive) *slash_naive = '\0';
+        found = !!bpf_event_source_find(rest);
+        if (slash_naive) *slash_naive = '/';
+        if (found) {
+            out->kind = EVT_HEAD_BPF;
+            out->sys = s;
+            out->body = rest;
+            out->head_end = slash_naive;
+            return 0;
+        }
+    }
+
     /* Non-probe. Determine tracepoint vs profiler.
      *
      * A profiler name may itself contain ':' (e.g. "bpf:kvm_exit" is a single
@@ -811,6 +873,7 @@ static int tp_kprobe_uprobe(struct tp *tp, enum event_head_kind kind, char *body
     case EVT_HEAD_URETPROBE: id = uprobe_type ? URETPROBE : -1; is_ret = true;  is_uprobe = true;  break;
     case EVT_HEAD_TRACEPOINT:
     case EVT_HEAD_PROFILER:
+    case EVT_HEAD_BPF:
     default: return -1;
     }
     if (id < 0)
@@ -1038,7 +1101,7 @@ static char *expand_wildcard_events(const char *pattern, const char *slash)
         .result = NULL,
     };
 
-    print_tracepoint_events(wildcard_match_cb, &ctx);
+    list_events(wildcard_match_cb, &ctx);
     if (ctx.result == NULL)
         fprintf(stderr, "No events matching pattern '%s'\n", pattern);
     return ctx.result;
@@ -1274,6 +1337,16 @@ struct tp_list *tp_list_new(struct prof_dev *dev, char *event_str)
             filter = rm_quotes(filter, '\0');
             break;
 
+        case EVT_HEAD_BPF:
+            sys = head.sys;
+            name = head.body;
+            tp->bpf_src = bpf_event_source_find(name);
+            id = tp_bpf_id(tp->bpf_src);
+            if (id < 0)
+                goto err_out;
+            filter = rm_quotes(filter, '\0');
+            break;
+
         default:
             goto err_out;
         }
@@ -1378,6 +1451,10 @@ struct tp_list *tp_list_new(struct prof_dev *dev, char *event_str)
                     tp->untraced = true;
                 } else if (strcmp(attr, "trigger") == 0) {
                     tp->trigger = true;
+                } else if ((strcmp(attr, "push") == 0 || strcmp(attr, "pull") == 0) &&
+                           id >= BPF_EVENT_BASE) {
+                    fprintf(stderr, "%s:%s: %s= is not supported by BPF events\n", sys, name, attr);
+                    goto err_out;
                 } else if (strcmp(attr, "push") == 0) {
                     if (id >= 0 && tp_broadcast_new(tp, value) < 0) goto err_out;
                 } else if (strcmp(attr, "pull") == 0) {
@@ -1462,6 +1539,7 @@ struct tp_list *tp_list_new(struct prof_dev *dev, char *event_str)
         tp_list->nr_push_to += !!tp->broadcast;
         tp_list->nr_pull_from += !!tp->receive;
         tp_list->nr_exec_prog += !!tp->exec_prog;
+        tp_list->nr_bpf += tp_is_bpf(tp);
 
         if (fields)
             free(fields);
@@ -1533,10 +1611,12 @@ void tp_list_free(struct tp_list *tp_list)
         if (tp->exec_prog)
             expr_destroy(tp->exec_prog);
         if (tp->cpus) {
-            if (!tp_is_dev(tp) && tp->evsel)
+            // The cpus of a BPF evsel are its instance's, see tp_evsel_new().
+            if (!tp_is_dev(tp) && !tp_is_bpf(tp) && tp->evsel)
                 perf_evsel__set_own_cpus(tp->evsel, NULL);
             perf_cpu_map__put(tp->cpus);
         }
+        bpf_event_free(tp->bpf);
         if (tp->tp_cpu_prog)
             expr_destroy(tp->tp_cpu_prog);
         if (tp->tp_pid_prog)
@@ -1721,15 +1801,18 @@ void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, int tid, void
         char *name = tp->id <= TRACE_EVENT_TYPE_MAX ? tp->name : (tp->alias ? : tp->name);
 
         printf("%16s %6u ", comm ? : "<...>", tid);
-        trace_print_lat_fmt(entry);
+        // The raw data of a BPF event has no trace_entry with the flags: empty, as "....".
+        if (tp_is_bpf(tp))
+            printf("....");
+        else
+            trace_print_lat_fmt(entry);
 
         if (likely(cpu >= 0))
              printf(" [%03d]", cpu);
         else printf(" [---]");
 
         ts = (ts + 500) / 1000; // us
-        printf(" %llu.%06llu: %s:%s:%s", ts/USEC_PER_SEC, ts%USEC_PER_SEC,
-               tp->sys, name, tp->id <= URETPROBE ? "" : "\n");
+        printf(" %llu.%06llu: %s:%s:", ts/USEC_PER_SEC, ts%USEC_PER_SEC, tp->sys, name);
 
         if (tp->id <= TRACE_EVENT_TYPE_MAX) {
             struct tep_record record = {.size = size, .data = data};
@@ -1749,6 +1832,8 @@ void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, int tid, void
             } else
                 printf("\n");
             tep__unref();
+        } else if (tp_is_bpf(tp)) {
+            bpf_event_source_print(tp->bpf_src, data, size);
         } else {
             if (tp->id == KPROBE) {
                 struct kprobe_trace_entry_head *field = data;
@@ -1795,6 +1880,16 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
     if (tp->id <= TRACE_EVENT_TYPE_MAX) {
         attr->type = PERF_TYPE_TRACEPOINT;
         attr->config = tp->id;
+    } else if (tp_is_bpf(tp)) {
+        // A BPF_OUTPUT sample has no common_type: find its tp by the evsel.
+        // A counting attr is refused by bpf_event_new().
+        if (attr->sample_period != 0 &&
+            !(attr->sample_type & (PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_ID |
+                                   PERF_SAMPLE_STREAM_ID))) {
+            fprintf(stderr, "bpf: PERF_SAMPLE_ID is required.\n");
+            return NULL;
+        }
+        // bpf_event_new() sets type and config.
     } else {
         if (attr->sample_period != 0 &&
             !(attr->sample_type & (PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_ID |
@@ -1854,7 +1949,31 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
         attr->wakeup_events = tp->batch;
     }
 
-    evsel = perf_evsel__new(attr);
+    if (tp_is_bpf(tp)) {
+        struct bpf_event_scope scope;
+        int tgids[perf_thread_map__nr(tp->dev->threads)];
+        struct env *env = tp->dev->env;
+        static bool warned = false;
+
+        /*
+         * Kernel constraint: a BPF program runs for every task on every cpu
+         * its hook fires on, whatever the perf event it outputs through
+         * excludes; already so in a43eec304259 ("bpf: introduce
+         * bpf_perf_event_output() helper"), in v4.4.
+         */
+        if (!warned && (env->exclude_user || env->exclude_kernel ||
+                        env->exclude_guest || env->exclude_host)) {
+            fprintf(stderr, "bpf events: --exclude-* do not apply to them\n");
+            warned = true;
+        }
+
+        // tp->cpus is in the scope: the evsel has the cpus of the instance.
+        if (tp_bpf_scope(tp->dev, tp->cpus, &scope, tgids) < 0)
+            return NULL;
+        tp->bpf = bpf_event_new(tp->bpf_src, &scope, attr);
+        evsel = tp->bpf ? bpf_event_evsel(tp->bpf) : NULL;
+    } else
+        evsel = perf_evsel__new(attr);
     if (!evsel) {
         return NULL;
     }
@@ -1871,7 +1990,7 @@ struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl)
 
     if (!tp_kernel(tp))
         perf_evsel__keep_disable(evsel, true);
-    if (tp->cpus)
+    if (tp->cpus && !tp_is_bpf(tp))
         perf_evsel__set_own_cpus(evsel, tp->cpus);
 
     perf_evsel_link_tp(evsel, tp);
@@ -1896,33 +2015,37 @@ struct tp *tp_from_evsel(struct perf_evsel *evsel, struct tp_list *tp_list)
     return NULL;
 }
 
+/* Run tp->filter, compiled to @prog, in userspace by the profiler's ftrace_filter callback. */
+static void tp_filter_userspace(struct prof_dev *dev, struct tp *tp, struct expr_prog *prog)
+{
+    tp->ftrace_filter = prog;
+    printf("%s:%s filters '%s' in userspace\n", tp->sys, tp->name, tp->filter);
+    if (dev)
+        dev->ftrace_filter = 1;
+}
+
 int tp_list_apply_filter(struct prof_dev *dev, struct tp_list *tp_list)
 {
+    struct expr_prog *prog;
     struct tp *tp;
-    event_fields *fields;
     int i, err;
     int fallback = 0;
 
     for_each_real_tp(tp_list, tp, i) {
+        // Started with its filter by tp_bpf_start().
+        if (tp_is_bpf(tp))
+            continue;
         if (tp->filter && tp->filter[0] && tp->evsel) {
             err = perf_evsel__apply_filter(tp->evsel, tp->filter);
             if (err < 0) {
                 err = -errno;
                 if (dev && !dev->prof->ftrace_filter)
                     goto err_return;
-
-                fields = tep__event_fields(tp->id);
-                if (fields) {
-                    tp->ftrace_filter = expr_compile(tp->filter, fields);
-                    free(fields);
-                }
-                if (!tp->ftrace_filter)
+                prog = tp_new_prog(tp, tp->filter);
+                if (!prog)
                     goto err_return;
-
-                printf("%s:%s filters '%s' in userspace\n", tp->sys, tp->name, tp->filter);
+                tp_filter_userspace(dev, tp, prog);
                 fallback++;
-                if (dev)
-                    dev->ftrace_filter = 1;
             }
         }
     }
@@ -1931,6 +2054,76 @@ int tp_list_apply_filter(struct prof_dev *dev, struct tp_list *tp_list)
 err_return:
     fprintf(stderr, "%s:%s filter '%s' failed, %d\n", tp->sys, tp->name, tp->filter, err);
     return err;
+}
+
+int tp_bpf_start(struct tp *tp)
+{
+    struct expr_prog *prog = NULL;
+    struct prof_dev *dev;
+    int err;
+
+    if (!tp || !tp_is_bpf(tp) || !tp->bpf)
+        return 0;
+    dev = tp->dev;
+
+    /*
+     * Compiled in userspace first: a bad expression is reported once, here,
+     * and the kernel can only fail for what its BPF backend lacks. Kept for
+     * the fallback.
+     */
+    if (tp->filter && dev->prof->ftrace_filter) {
+        prog = tp_new_prog(tp, tp->filter);
+        if (!prog)
+            return -1;
+    }
+    err = bpf_event_start(tp->bpf, tp->filter, prog ? BPF_EVENT_USERSPACE_OK : 0, dev->env->verbose);
+    if (err == 1) {
+        tp_filter_userspace(dev, tp, prog);
+        prog = NULL;
+        err = 0;
+    }
+    if (prog)
+        expr_destroy(prog);
+    if (err < 0)
+        fprintf(stderr, "%s:%s failed to start\n", tp->sys, tp->name);
+    return err;
+}
+
+int tp_bpf_scope(struct prof_dev *dev, struct perf_cpu_map *cpus, struct bpf_event_scope *scope, int *tgids)
+{
+    int idx, tid, tgid, i, n = 0;
+
+    if (dev->env->cgroups) {
+        fprintf(stderr, "bpf events: --cgroups is not supported\n");
+        return -EOPNOTSUPP;
+    }
+    if (prof_dev_oncpu(dev)) {
+        memset(scope, 0, sizeof(*scope));
+        scope->type = BPF_EVENT_SCOPE_CPU;
+        scope->cpus = cpus ? : dev->cpus;
+        return 0;
+    }
+
+    // -p gives processes; a thread of -t stands for its process.
+    perf_thread_map__for_each_thread(tid, idx, dev->threads) {
+        tgid = tid > 0 ? get_tgid(tid) : -1;
+        if (tgid <= 0)
+            continue;
+        for (i = 0; i < n; i++)
+            if (tgids[i] == tgid)
+                break;
+        if (i == n)
+            tgids[n++] = tgid;
+    }
+    if (!n) {
+        fprintf(stderr, "bpf events: no process to trace\n");
+        return -ESRCH;
+    }
+    memset(scope, 0, sizeof(*scope));
+    scope->type = BPF_EVENT_SCOPE_PROCESS;
+    scope->tgids = tgids;
+    scope->nr_tgids = n;
+    return 0;
 }
 
 /*
@@ -1954,11 +2147,17 @@ long tp_list_ftrace_filter(struct prof_dev *dev, struct tp_list *tp_list,
     if (!global || !global->data)
         return -1;
 
-    common_type = *(unsigned short *)global->data;
-
-    for_each_real_tp(tp_list, tp, i) {
-        if (tp->id == common_type)
-            goto found;
+    /*
+     * The raw data of a BPF event has no common_type, nor can it be told
+     * apart from a tracepoint's before its tp is known: with BPF events in
+     * the list, find the tp by the evsel only.
+     */
+    if (!tp_list->nr_bpf) {
+        common_type = *(unsigned short *)global->data;
+        for_each_real_tp(tp_list, tp, i) {
+            if (tp->id == common_type)
+                goto found;
+        }
     }
 
     evsel = perf_event_evsel(dev, event);
@@ -1981,10 +2180,17 @@ void tp_matcher_register(struct tp_matcher *matcher)
     list_add_tail(&matcher->link, &tp_matcher_list);
 }
 
+static bool event_fields_find(event_fields *fields, const char *name)
+{
+    for (; fields->name; fields++)
+        if (strcmp(fields->name, name) == 0)
+            return true;
+    return false;
+}
+
 struct tp_matcher *tp_matcher_find(struct tp *tp, const char *sys, const char *name)
 {
     struct tp_matcher *matcher;
-    struct tep_event *event = NULL;
     event_fields *fields = NULL;
 
     if (!name)
@@ -2000,32 +2206,23 @@ struct tp_matcher *tp_matcher_find(struct tp *tp, const char *sys, const char *n
     if (!tp || tp_is_dev(tp))
         return NULL;
 
-    matcher = NULL;
-    tep__ref_light();
-
     /*
      * default tp_matcher
      *
-     * The 'cpu' and 'pid' fields of the tracepoint are compiled as
-     * expressions, and compared with the cpu and tid to match.
+     * The 'cpu' and 'pid' fields of the event, a tracepoint or a BPF event,
+     * are compiled as expressions, and compared with the cpu and tid to match.
      */
-    event = tep_find_event_by_name(tep, sys, name);
-    if (!event) goto out;
-    fields = tep__event_fields(event->id);
-    if (!fields) goto out;
+    fields = tep__event_fields(tp->id);
+    if (!fields)
+        return NULL;
 
-    if (!tp->tp_cpu_prog && tep_find_any_field(event, "cpu"))
+    if (!tp->tp_cpu_prog && event_fields_find(fields, "cpu"))
         tp->tp_cpu_prog = expr_compile((char *)"cpu", fields);
-    if (!tp->tp_pid_prog && tep_find_any_field(event, "pid"))
+    if (!tp->tp_pid_prog && event_fields_find(fields, "pid"))
         tp->tp_pid_prog = expr_compile((char *)"pid", fields);
 
-    if (tp->tp_cpu_prog || tp->tp_pid_prog)
-        matcher = &default_tp_matcher;
-
-out:
-    if (fields) free(fields);
-    tep__unref();
-    return matcher;
+    free(fields);
+    return (tp->tp_cpu_prog || tp->tp_pid_prog) ? &default_tp_matcher : NULL;
 }
 
 static bool default_refer_cpu(struct tp *tp, void *raw, int size, int cpu)

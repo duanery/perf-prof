@@ -153,6 +153,20 @@ static int perf_sample_max_size(struct perf_evsel *evsel)
             if (type == uprobe_type)
                 type = (attr->config & 1/*PERF_PROBE_CONFIG_IS_RETPROBE*/) ? URETPROBE : UPROBE;
             raw_size = tep__event_size(type);
+        } else if (type == PERF_TYPE_SOFTWARE && attr->config == PERF_COUNT_SW_BPF_OUTPUT) {
+            /*
+             * A BPF event; not one of a profiler's own BPF_OUTPUT evsels,
+             * which have no tp.
+             *
+             * Kernel constraint: the raw data of a sample is padded to
+             * round_up(size + sizeof(u32), sizeof(u64)) - sizeof(u32),
+             * perf_prepare_sample() in kernel/events/core.c, since
+             * fa128e6a148a ("perf: pad raw data samples automatically"), in
+             * v4.4. So the size of the BPF event struct sizes the record.
+             */
+            struct tp *tp = perf_evsel_tp(evsel);
+            if (tp && tp_is_bpf(tp))
+                raw_size = tep__event_size(tp->id);
         }
         if (raw_size < 0) {
             fprintf(stderr, "%s: Unknown raw_size(type %d)\n", __func__, type);

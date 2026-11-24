@@ -168,28 +168,6 @@ static void monitor_ctx_exit(struct prof_dev *dev)
     free(ctx);
 }
 
-static int get_tgid(int tid)
-{
-    char path[256], line[256];
-    FILE *fp;
-    int pid = 0;
-
-    // Read /proc/pid/status, get Tgid.
-    snprintf(path, sizeof(path), "/proc/%d/status", tid);
-    fp = fopen(path, "r");
-    if (!fp)
-        return -1;
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "Tgid: %d", &pid) == 1)
-            break;
-        pid = 0;
-    }
-    fclose(fp);
-
-    return pid;
-}
-
 static int bpf_kvm_exit_init(struct prof_dev *dev)
 {
     struct perf_evlist *evlist = dev->evlist;

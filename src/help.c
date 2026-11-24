@@ -3,6 +3,7 @@
 #include <string.h>
 #include <api/fs/fs.h>
 #include <monitor.h>
+#include <bpf_event.h>
 
 
 void common_help(struct help_ctx *ctx, bool enabled, bool cpus, bool pids, bool interval, bool order, bool pages, bool verbose)
@@ -92,7 +93,9 @@ static void print_events_format(struct help_ctx *ctx)
         for_each_real_tp(ctx->tp_list[i], tp, j) {
             printf("%s:%s\n", tp->sys, tp->name);
             snprintf(path, sizeof(path), "kernel/debug/tracing/events/%s/%s/format", tp->sys, tp->name);
-            if (sysfs__read_str(path, &format, &size) == 0) {
+            if (tp_is_bpf(tp))
+                bpf_event_source_help(tp->bpf_src);
+            else if (sysfs__read_str(path, &format, &size) == 0) {
                 ret = write(STDOUT_FILENO, format, size);
                 free(format);
                 if (ret == -1)

@@ -408,7 +408,7 @@ static int compgen_arg(const struct option *opt, const char *arg, int comp_type)
                 .skiplen = skiplen,
                 .comp_type = comp_type,
             };
-            print_tracepoint_events(compgen_events, (void *)&op);
+            list_events(compgen_events, (void *)&op);
         }
         if (prefix) free(prefix);
         break;
@@ -492,7 +492,7 @@ struct option main_options[] = {
 
 
     OPT_GROUP("PROFILER OPTION:"),
-    OPT_PARSE_NONEG ('e', "event", NULL,    "EVENT,...",        "Event selector. use '"PROGRAME" list' to list available tp events.\n"
+    OPT_PARSE_NONEG ('e', "event", NULL,    "EVENT,...",        "Event selector. use '"PROGRAME" list' to list available tp and bpf events.\n"
                                                                 "  EVENT,EVENT,...\n"
                                                                 "  EVENT: sys:name[/filter/ATTR/ATTR/.../]\n"
                                                                 "         profiler[/option/ATTR/ATTR/.../]\n"
@@ -504,7 +504,9 @@ struct option main_options[] = {
                                                                 "         uprobe:BINARY:offset[/filter/ATTR/ATTR/.../]\n"
                                                                 "         uretprobe:BINARY:fn[/filter/ATTR/ATTR/.../]\n"
                                                                 "         uretprobe:BINARY:offset[/filter/ATTR/ATTR/.../]\n"
+                                                                "         bpf:name[/EXPR/ATTR/ATTR/.../]\n"
                                                                 "  filter: trace events filter\n"
+                                                                "  EXPR of bpf:name: filter in the kernel, a C expression of its fields\n"
                                                                 "  ATTR:\n"
                                                                 "      stack: sample_type PERF_SAMPLE_CALLCHAIN\n"
                                                                 "      max-stack=int : sample_max_stack\n"
@@ -1575,6 +1577,25 @@ int kernel_release(void)
     return -1;
 }
 
+int get_tgid(int tid)
+{
+    char path[64], line[256];
+    FILE *fp;
+    int tgid = -1;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", tid);
+    fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "Tgid: %d", &tgid) == 1)
+            break;
+        tgid = -1;
+    }
+    fclose(fp);
+    return tgid;
+}
+
 /*
  * BPF JIT Symbols Management Function
  *
@@ -2421,8 +2442,13 @@ int prof_dev_replace_filter(struct prof_dev *dev, struct perf_evsel **evsel, con
 {
     struct perf_evsel *old = *evsel;
     struct perf_event_attr attr = *perf_evsel__attr(old);
+    struct tp *tp = perf_evsel_tp(old);
     struct perf_evsel *new;
     int err;
+
+    // The filter of a BPF event is in its BPF object, not on the evsel.
+    if (tp && tp_is_bpf(tp))
+        return -EINVAL;
 
     attr.disabled = 1;
     new = perf_evsel__new(&attr);
@@ -2692,6 +2718,23 @@ static void interval_handle(struct timer *timer)
     prof_dev_put(dev);
 }
 
+/*
+ * Start the BPF events of @dev, its tps of bpf:xxx, once the evlist is open:
+ * their BPF_OUTPUT evsels must have fds to output to. Before prof->filter,
+ * which may depend on how they started (the filter in the kernel or not).
+ * The evsels without a tp, which a profiler opens itself, are left alone.
+ */
+static int prof_dev_bpf_start(struct prof_dev *dev)
+{
+    struct perf_evsel *evsel;
+
+    perf_evlist__for_each_evsel(dev->evlist, evsel) {
+        if (tp_bpf_start(perf_evsel_tp(evsel)) < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static
 struct prof_dev *prof_dev_open_internal(profiler *prof, struct env *env,
                  struct perf_cpu_map *cpu_map, struct perf_thread_map *thread_map,
@@ -2831,6 +2874,9 @@ reinit:
             fprintf(stderr, "failed to open evlist, %d (%s)\n", err, strerror(-err));
         goto out_deinit;
     }
+
+    if (prof_dev_bpf_start(dev) < 0)
+        goto out_close;
 
     if (prof->filter && prof->filter(dev) < 0) {
         fprintf(stderr, "monitor(%s) filter failed\n", prof->name);
