@@ -171,14 +171,14 @@ def test_old_uprobe_at_syntax_rejected():
     _expect_parse_reject(prof, ['uprobe', 'not found', 'malformed', 'not accessible'])
 
 
-# --- profiler-name-with-colon regression -------------------------------------
+# --- "bpf:" prefix regression --------------------------------------------------
 
-def test_bpf_kvm_exit_profiler_still_works():
-    # bpf:kvm_exit is a single profiler name (registered via MONITOR_REGISTER
-    # with .name="bpf:kvm_exit") — the ':' is part of the profiler name, not
-    # a sys:name separator. Ensure the parser classifies it as PROFILER, not
-    # TRACEPOINT / kprobe / uprobe.
-    prof = PerfProf(['trace', '-e', 'bpf:kvm_exit', '-N', '1'])
+def test_bpf_kvm_exit_is_event_source():
+    # bpf:kvm_exit is both the profiler "perf-prof bpf:kvm_exit" and a BPF event
+    # source for -e. For -e the parser must classify it as a BPF event, not
+    # TRACEPOINT / kprobe / uprobe, so the /EXPR/ part is a filter expression
+    # on struct kvm_vcpu_event and not the profiler's option string.
+    prof = PerfProf(['trace', '-e', 'bpf:kvm_exit/exit_reason==12/', '-N', '1'])
     for std, line in prof.run(3, 0):
         if std == PerfProf.STDERR:
             low = line.lower()
