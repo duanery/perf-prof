@@ -297,6 +297,17 @@ perf-prof kvm-exit -p $(pidof qemu-system-x86_64) -i 1000
 | 32 | IABT_LOW | 指令中止(低异常级别) |
 | 36 | DABT_CURRENT | 数据中止(当前异常级别) |
 
+## 作为事件源
+
+`bpf:kvm_exit` 同时是 `-e` 的 BPF 事件源，可与其他事件一起 `trace` / `--order`；`/EXPR/` 是 `struct kvm_vcpu_event` 字段的内核态过滤表达式：
+
+```bash
+perf-prof trace -e 'bpf:kvm_exit/exit_reason==12 && exit_latency>1000000/' -C 1-4
+perf-prof trace -e bpf:kvm_exit help          # 字段与说明
+```
+
+事件按 `lat ... runq_delay ... offcpu_wait ... sw ...` 的格式打印；`-p` 时没有 runq_delay / offcpu_wait / sw，打印为 0。`-p` 最多一个进程。
+
 ## 相关资源
 
 - [事件基础文档](../events/)

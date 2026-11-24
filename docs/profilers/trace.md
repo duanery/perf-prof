@@ -50,6 +50,7 @@ PROFILER OPTION:
   - **kretprobe**: `kretprobe[:module]:fn[/filter/ATTR/.../]` 或 `kretprobe:0xADDR[/filter/ATTR/.../]` - 内核函数返回探针
   - **uprobe**: `uprobe:BINARY:fn[+off][/filter/ATTR/.../]` 或 `uprobe:BINARY:offset[/filter/ATTR/.../]` - 用户态函数探针
   - **uretprobe**: `uretprobe:BINARY:fn[/filter/ATTR/.../]` 或 `uretprobe:BINARY:offset[/filter/ATTR/.../]` - 用户态函数返回探针
+  - **bpf**: `bpf:name[/EXPR/ATTR/.../]` - 内置 BPF 程序产生的事件（`perf-prof list bpf`），EXPR 是以事件字段为变量的 C 表达式，在内核态过滤；只能采样，`-p/-t` 最多一个进程，不支持 `--cgroups`、`push=`/`pull=`
   - **通配符**: 支持 `*, ?, []` 通配符匹配多个事件
 
 - `-g, --call-graph` - 启用调用图记录，为所有事件记录调用栈
@@ -73,6 +74,11 @@ perf-prof trace -e 'sched:sched_wak*' -C 0
 
 # kprobe 跟踪内核函数
 perf-prof trace -e 'kprobe:try_to_wake_up' -C 0
+
+# BPF 事件源：调度延迟（唤醒/被抢占到运行），内核态过滤出大于 1ms 的
+perf-prof trace -e 'bpf:sched_rundelay/rundelay>1000000/' -C 0
+# 查看事件的字段与说明
+perf-prof trace -e bpf:sched_rundelay help
 
 # uprobe 跟踪用户态函数
 perf-prof trace -e 'uprobe:/lib64/libc.so.6:printf' -m 64

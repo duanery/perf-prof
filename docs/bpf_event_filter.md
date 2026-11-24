@@ -158,6 +158,9 @@ if (kvm_exit_bpf__load(ctx->obj))
     goto failed;
 ```
 
+> 作为 `-e bpf:xxx` 的事件源时，这段由框架完成（`src/bpf_event.c`：open → 过滤 → `ops->prepare` → load），源只需写 4.1 的 BPF 侧；
+> 过滤失败时事件不带内核过滤器重新启动并退到用户态过滤。见 [modules.md](modules.md) 2.8。
+
 ### 4.3 事件结构体的要求
 
 - 定长 struct，成员是标量（整型或枚举）或标量数组；

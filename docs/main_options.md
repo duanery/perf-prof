@@ -273,7 +273,7 @@ perf-prof 工具提供了丰富的选项参数，用于控制分析器的行为�
   - **类型**: string
   - **可重复**: 对于`multi-trace`、`syscalls`、`kmemprof`、`nested-trace`、`rundelay`为true，其他为false
   - **值描述**: 支持多个事件，逗号分隔，参考"perf-prof 事件格式"
-  - **示例**: ["sched:sched_wakeup", "kprobe:try_to_wake_up", "kprobe:kvm:vcpu_load", "uprobe:/lib64/libc.so.6:printf", "sched:sched_wakeup,sched:sched_switch"]
+  - **示例**: ["sched:sched_wakeup", "kprobe:try_to_wake_up", "kprobe:kvm:vcpu_load", "uprobe:/lib64/libc.so.6:printf", "bpf:sched_rundelay/rundelay>1000000/", "sched:sched_wakeup,sched:sched_switch"]
 
 - `-F, --freq <n>`               指定采样频率
   - **变量名**: `freq`

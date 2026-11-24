@@ -238,10 +238,16 @@ EVENT: sys:name[/filter/ATTR/ATTR/.../]
        uprobe:BINARY:offset[/filter/ATTR/ATTR/.../]
        uretprobe:BINARY:fn[/filter/ATTR/ATTR/.../]
        uretprobe:BINARY:offset[/filter/ATTR/ATTR/.../]
+       bpf:name[/EXPR/ATTR/ATTR/.../]
 
        当 `fn` 在 BINARY 中对应多个偏移（如 glibc 多版本符号、
        同名 static 函数）时，解析器会列出每个候选偏移及其符号
        并拒绝启动。用 `uprobe:BINARY:0x<offset>` 精确指定即可。
+
+       bpf:name 是 perf-prof 内置的 BPF 程序产生的事件（`perf-prof list bpf` 列出，
+       `perf-prof trace -e bpf:name help` 查看字段）。EXPR 是以事件字段为变量的
+       C 表达式，在内核态执行：不满足的事件不会送到用户态。只能采样（不能计数），
+       `-p/-t` 最多跟踪一个进程，不支持 --cgroups。
 ```
 
 #### 过滤器语法（内核态执行）

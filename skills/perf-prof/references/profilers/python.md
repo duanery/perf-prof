@@ -38,6 +38,7 @@ perf-prof python -e EVENT[,EVENT...] [选项] [--] module [args...]
   - **profiler**: `profiler[/option/ATTR/.../]` - 嵌入其他分析器作为事件源
   - **kprobe/kretprobe**: `kprobe[:module]:fn[+off][/filter/ATTR/.../]` 或 `kprobe:0xADDR[/filter/ATTR/.../]`（bpftrace 风格；`kretprobe` 不支持 `+off`）
   - **uprobe/uretprobe**: `uprobe:BINARY:fn[+off][/filter/ATTR/.../]` 或 `uprobe:BINARY:offset[/filter/ATTR/.../]`（bpftrace 风格；`uretprobe` 不支持 `+off`）
+  - **bpf:name**: 暂不支持 BPF 事件源
 - `module`: **[必需]** Python脚本或模块（位置参数）
 - `args...`: 传递给脚本的参数（通过`sys.argv`访问，用`--`分隔）
 

@@ -180,6 +180,7 @@ multi-trace支持自定义tracepoint、kprobe和uprobe事件作为分析源。
   - tracepoint事件：`sys:name`格式
   - kprobe事件：`kprobe[:module]:fn[+off]` 或 `kprobe:0xADDR`（bpftrace 风格）
   - uprobe事件：`uprobe:BINARY:fn[+off]` 或 `uprobe:BINARY:offset`（bpftrace 风格）
+  - BPF事件：`bpf:name[/EXPR/]`，内置 BPF 程序产生的事件（需要 `--order`，如 `bpf:sched_rundelay`）
 - **过滤器**: 每个事件`filter`指定过滤器，支持trace event过滤器语法
 - **事件属性**:
   | 属性 | 格式 | 说明 |

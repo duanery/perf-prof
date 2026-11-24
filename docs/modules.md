@@ -238,6 +238,31 @@ perf-prof 的分析器建立在一组公共模块上：事件的打开与分发�
 - **备注**：python 栈（7.4）依赖先用它添加 python 的 USDT。
 - **内核功能**：uprobe_events。
 
+### 2.8 bpf_event：BPF 事件源（`-e bpf:xxx`）
+
+- **源码**：`src/bpf_event.c`、`src/bpf_event.h`；构建 `build/Makefile.build`（`%.event.o`）、`src/bpf-skel/bpf_event.tmpl.c`、
+  `src/bpf-skel/bpf_event.bpf.h`；事件源：`src/bpf-skel/xxx.bpf.c` + `xxx.h`（事件结构体）+ 可选的 `src/bpf_xxx.c`（用户态 ops）。
+- **能力**：把内置 BPF 程序产生的事件当作 tracepoint 用：`list` / `help` / 补全 / 通配符都能看到；字段与大小从 BTF 读出，
+  `/EXPR/` 是内核态过滤（3.5）；样本经 `PERF_COUNT_SW_BPF_OUTPUT` 进 ring buffer，可与 tracepoint 一起 order、multi-trace、top、num-dist。
+  - 两层接口：**源**（`bpf_event_source_*`：find / fields / size / desc / help / print，只读元信息，随进程存在）；
+    **实例**（`bpf_event_new` / `_start` / `_free`：每个 tp 一个，自己 open、过滤、prepare、load 并 attach 一份 skeleton）。
+  - 写一个新源：`.bpf.c` 里写 `BPF_EVENT_DESC("...")`、名为 `perf_events` 的 `PERF_EVENT_ARRAY` map、`DEFINE_EXPR_FILTER(struct 事件)`，
+    用 `perf_output()` 输出整个结构体；`src/bpf-skel/Build` 加 `xxx.event.o`。skeleton 由模板生成，缺 `bpf_event_desc` 或 `perf_events` 编译失败。
+    需要源自己的配置（跟踪进程、写 rodata）加 `ops->prepare`；结构体里有通用打印表达不了的内容（采样栈等）加 `ops->print`，`BPF_EVENT_OPS(xxx, &ops)` 注册。
+    范例：`bpf_sched_rundelay.c`（单进程）、`bpf_kvm_exit.c`（prepare + print，与 `bpf:kvm_exit` 分析器共用）。
+- **注意事项**：
+  - **只能采样**：计数模式（stat、hrcount、hrtimer 的 `sample_period == 0`）被拒绝；BPF 输出的 period 恒为 0。
+  - **每个实例自己 open 一份 skeleton**：libbpf 不允许同一个 object 再次 load，过滤器与 prepare 又会改 object，不能共用。
+  - **scope**：`-C` 为 cpu scope，`-p/-t` 为进程 scope（`tp_bpf_scope()` 给出去重后的 tgid 列表），要求源有 `ops->prepare`；
+    多个进程时源自行决定（现有两个源都拒绝）。`--cgroups` 被拒绝，`--exclude-*` 提示不生效（BPF 程序对所有任务运行）。
+  - **启动顺序**：`prof_dev_bpf_start()` 在 `perf_evlist__open()` 之后、`prof->filter()` 之前，此时才 load 并把 fd 放进 map；
+    用户态过滤器先编译，BPF 后端失败（如旧内核的有符号除法）时事件不带内核过滤器重新启动，并退到用户态过滤（`tp->ftrace_filter`）。
+  - **样本头的 comm / pid 是运行 BPF 程序的任务**，不一定是事件描述的任务；要给用户看的任务写在结构体里。
+  - 不支持：`push=` / `pull=`、`prof_dev_replace_filter()`、python 与 sql 分析器（它们在 init 里拒绝 `nr_bpf`）。
+  - `tp_print_event()` 对 BPF 事件走源的 `ops->print`，没有则按 BTF 通用打印（标量、枚举名、char 数组为字符串）；它的 `tid` 参数是样本的 tid。
+  - 事件 id 是 tep 之外的伪 id（从 `BPF_EVENT_BASE` 起），用 `tp_is_bpf()` 判断，不要拿去查 tep。
+- **内核功能**：eBPF（4.1）、perf_event。
+
 ---
 
 ## 3 过滤
@@ -299,7 +324,7 @@ perf-prof 的分析器建立在一组公共模块上：事件的打开与分发�
   - **必须在 `bpf_object__open()` 之后、`bpf_object__load()` 之前调用**。
   - BPF 程序用 `DEFINE_EXPR_FILTER()` 定义唯一的占位函数，参数是 struct 指针；字段只支持标量与标量数组，
     数组下标要让 verifier 能确定边界（如 `i & 15`）；不能用 `_cpu` / `_pid`。
-  - 事件结构体要在可写内存（表达式可赋值）。细节见 [bpf_event_filter.md](bpf_event_filter.md)。
+  - 事件结构体要在可写内存（表达式可赋值）。细节见 [bpf_event_filter.md](bpf_event_filter.md)；`-e bpf:xxx` 用它做内核态过滤，见 2.8。
 - **内核功能**：eBPF。
 
 ---

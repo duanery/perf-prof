@@ -298,6 +298,71 @@ __x64_sys_clone / fork / vfork
 - 依赖：`src/expr.c` `is_char_ptr()`
 - 做法与后果：`char comm[16]` 在 format 里标为 `signed:0`，字符串运算符不区分 char 的符号。
 
+### 4.1 BPF 事件源（`bpf:xxx`）
+
+**用途**：`src/bpf_event.c` 把内置 BPF 程序（`src/bpf-skel/*.bpf.c`）产生的事件当作 `-e bpf:xxx` 的事件：
+BPF 程序用 `bpf_perf_event_output()` 把结构体写进 `PERF_EVENT_ARRAY` 里的 perf event，样本进入普通的 ring buffer，
+与 tracepoint 一起 order、过滤、分析。
+
+**原理**：每个 cpu 打开一个 `PERF_COUNT_SW_BPF_OUTPUT` 事件，把它的 fd 放进 map 的第 cpu 项。BPF 程序用
+`BPF_F_CURRENT_CPU` 取当前 cpu 的项输出，样本头（时间、cpu、tid、栈）由内核按该事件的 `sample_type` 在运行
+BPF 程序的上下文里补齐。BPF 程序挂在 hook 上，对所有任务、所有 cpu 运行。
+
+#### BPF_OUTPUT 事件与 bpf_perf_event_output()
+- 内核：`kernel/trace/bpf_trace.c` `__bpf_perf_event_output()`；a43eec304259 ("bpf: introduce bpf_perf_event_output() helper"), in v4.4
+- 依赖：`src/bpf_event.c` `bpf_event_evsel()`、`bpf_event_bind_outputs()`
+- 做法与后果：v4.4 起有这个 helper 与 `PERF_COUNT_SW_BPF_OUTPUT`，旧内核上打开 evsel 失败。当前 cpu 的项为空返回 `-ENOENT`，`event->oncpu != cpu`（含 disabled）返回 `-EOPNOTSUPP`，所以 BPF_OUTPUT 必须按 cpu 打开、绑定到本 cpu 的项，enable 之前的输出被丢弃。输出样本的 period 恒为 0、event 计数不增加，因此 `sample_period == 0`（计数模式）被拒绝，否则读数恒为 0。
+
+#### BPF_F_CURRENT_CPU
+- 内核：`kernel/trace/bpf_trace.c` `__bpf_perf_event_output()`；1e33759c788c ("bpf, trace: add BPF_F_CURRENT_CPU flag for bpf_perf_event_output"), in v4.7
+- 依赖：`src/bpf_event.c` `bpf_event_bind_outputs()`
+- 做法与后果：BPF 程序用当前 cpu 号作 map 的下标，v4.4–v4.6 没有这个 flag，下标越界返回 `-E2BIG`，事件静默丢失（这些版本被全局数据与 subprog 的 v5.2 门槛覆盖）。所以 map 要按 cpu 号写入，cpu 编号不连续时不能用数组下标；`perf_events` 没设 `max_entries` 时 libbpf 按 possible cpu 数补上。
+
+#### 写进 PERF_EVENT_ARRAY 的 perf event 不能 inherit
+- 内核：`kernel/bpf/arraymap.c` `perf_event_fd_array_get_ptr()`；62544ce8e01c ("bpf: fix bpf_perf_event_read() helper"), in v4.4；f91840a32dee ("perf, bpf: Add BPF support to all perf_event types"), in v4.13 起由 `perf_event_read_local()` 返回 `-EOPNOTSUPP`
+- 依赖：`src/bpf_event.c` `bpf_event_evsel()`
+- 做法与后果：BPF_OUTPUT 的 attr 强制 `inherit=0`，否则写入 map 失败。
+
+#### map 项持有 perf event 的引用
+- 内核：`kernel/bpf/arraymap.c` `perf_event_fd_array_release()`；3b1efb196eee ("bpf, maps: flush own entries on perf map release"), in v4.8，之前在 map 释放时删除
+- 依赖：`src/bpf_event.c` `bpf_event_free()`
+- 做法与后果：map 项持有 perf event 文件的引用，关闭 evsel fd 与销毁 BPF 对象谁先谁后都不会出问题，不需要先清空 map。
+
+#### 样本头取自运行 BPF 程序的上下文，raw 由内核补齐
+- 内核：`kernel/events/core.c` `perf_prepare_sample()`；a43eec304259, in v4.4；fa128e6a148a ("perf: pad raw data samples automatically"), in v4.4；raw_tp 的 regs 由 `bpf_perf_event_output_raw_tp()` 取，c4f6699dfcb8 ("bpf: introduce BPF_RAW_TRACEPOINT"), in v4.17
+- 依赖：`src/order.c`（BPF_OUTPUT 的 raw 大小 `round_up(size + 4, 8) - 4`）、各 `.bpf.c` 的输出
+- 做法与后果：事件不带 `trace_entry` 头，时间用 `perf_event_clock()`，与 tracepoint 同一时钟，所以能与 tracepoint 一起 `--order`、multi-trace。样本头里的 comm / pid 是运行 BPF 程序的任务（如 `bpf:sched_rundelay` 在 `sched_switch` 里输出，是被换下的任务），被描述的任务要写在事件结构体里。
+
+#### BPF 程序对所有任务、所有 cpu 运行
+- 内核：BPF 挂接机制，v4.4 已有
+- 依赖：`src/tep.c` `tp_evsel_new()`（`--exclude-*` 提示）、`src/bpf_event.c`（进程 scope 由源的 `ops->prepare` 实现）
+- 做法与后果：BPF 程序不受 perf event 的 pid / cgroup / `exclude_*` 约束。`-p` / `-t` 由源自己过滤（`bpf:sched_rundelay`、`bpf:kvm_exit` 把 tgid 写进 rodata），`--cgroups` 被拒绝，`--exclude-*`（含 `-G`）提示不生效。
+
+#### 全局数据与 bpf-to-bpf 调用
+- 内核：cc8b0b92a169 ("bpf: introduce function calls (function boundaries)"), in v4.16；5722569bb9c3 ("bpf: allow helpers access to map element values"), in v4.11；d8eca5bbb2be ("bpf: implement lookup-free direct value access for maps"), in v5.2；`/sys/kernel/btf/vmlinux`：341dfcf8d78e ("btf: expose BTF info through sysfs"), in v5.4
+- 依赖：`src/bpf_event.c`（`expr_filter()` 是 subprog，事件在 `.bss`）、`src/bpf-skel/*.bpf.c`（CO-RE）
+- 做法与后果：模块本身的门槛是 v5.2；用了 CO-RE 的源还需要内核 BTF，libbpf 也会到 `/boot/vmlinux-*` 等处找，所以不按 `/sys/kernel/btf/vmlinux` 判断。加载失败时提示 "may need a newer kernel or kernel BTF"，不只转述 verifier 日志。
+
+#### bpf_perf_event_output() 每 cpu 嵌套最多 3 层
+- 内核：`kernel/trace/bpf_trace.c` `bpf_trace_sds`；9594dc3c7e71 ("bpf: fix nested bpf tracepoints with per-cpu data"), in v5.2
+- 依赖：各 `.bpf.c`
+- 做法与后果：超出时返回 `-EBUSY`，事件丢失。
+
+#### tracefs 里曾有 bpf 子系统
+- 内核：`include/trace/events/bpf.h`；a67edbf4fb6d ("bpf: add initial bpf tracepoints"), in v4.11；4d220ed0f814 ("bpf: remove tracepoints from bpf core"), in v4.18
+- 依赖：`src/list.c` `list_events()`、`src/tep.c` `parse_event_head()`
+- 做法与后果：v4.11–v4.17 的 tracefs 有真实的 `bpf:` tracepoint，同名以 BPF 事件源为准；`bpf:*` 通配展开的是 tracefs 的事件。
+
+#### `perf_event` 不能跨 cpu 共用输出
+- 内核：`kernel/events/core.c` `perf_event_set_output()`；v3.10 已有
+- 依赖：`src/bpf_event.c` `bpf_event_new()`
+- 做法与后果：`output_event->cpu != event->cpu` 时拒绝，所以进程 scope（evsel 绑定线程、其他 tracepoint 共享 ring）下 BPF_OUTPUT 仍然每 cpu 自建 ring，cpu domain 与 task domain 靠 libperf 共存。
+
+#### sched_switch 的参数与 task_struct::state
+- 内核：c73464b1c843 ("sched/core: Fix trace_sched_switch()"), in v4.4 起 raw_tp 参数是 `(bool preempt, prev, next)`；fa2c3254d7cf ("sched/tracing: Don't re-read p->state when emitting sched_switch event"), in v5.18 追加 `prev_state`；2f064a59a11f ("sched: Change task_struct::state"), in v5.14 起 `state` 改名为 `__state`
+- 依赖：`src/bpf-skel/sched_rundelay.bpf.c`
+- 做法与后果：只读前三个参数；被抢占的 prev 不论状态都还在运行队列上，没被抢占的只有状态为 `TASK_RUNNING` 才是（如 `yield()`）。`state` 与 `__state` 用 CO-RE 的 flavor 读，不比较版本号。
+
 ---
 
 ## 5 进程与 pid

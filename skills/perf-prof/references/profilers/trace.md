@@ -37,6 +37,7 @@ perf-prof trace -e EVENT [--overwrite] [-g [--flame-graph file [-i INT]]]
   - **kretprobe**: `kretprobe[:module]:fn[/filter/ATTR/.../]` 或 `kretprobe:0xADDR[/filter/ATTR/.../]` - 内核函数返回探针
   - **uprobe**: `uprobe:BINARY:fn[+off][/filter/ATTR/.../]` 或 `uprobe:BINARY:offset[/filter/ATTR/.../]` - 用户态函数探针
   - **uretprobe**: `uretprobe:BINARY:fn[/filter/ATTR/.../]` 或 `uretprobe:BINARY:offset[/filter/ATTR/.../]` - 用户态函数返回探针
+  - **bpf**: `bpf:name[/EXPR/ATTR/.../]` - 内置 BPF 程序产生的事件（`perf-prof list bpf`），EXPR 是以事件字段为变量的 C 表达式，在内核态过滤；只能采样，`-p/-t` 最多一个进程，不支持 `--cgroups`、`push=`/`pull=`
   - **通配符**: 支持 `*, ?, []` 通配符匹配多个事件
 - `-g, --call-graph`: 启用调用图记录，为所有事件记录调用栈
 - `--flame-graph <file>`: 指定折叠栈输出文件，生成火焰图格式数据

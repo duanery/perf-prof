@@ -336,6 +336,16 @@ perf-prof top -h
    -e 'uretprobe:/lib64/libc.so.6:0x123abc'
    ```
 
+   **BPF 事件源**：perf-prof 内置的 BPF 程序产生的事件，用法与 tracepoint 相同：
+   ```bash
+   perf-prof list bpf                                  # 列出
+   perf-prof trace -e bpf:sched_rundelay help          # 说明与字段
+   -e 'bpf:sched_rundelay/rundelay>1000000/'           # 调度延迟（唤醒/被抢占到运行）>1ms，内核态过滤
+   -e 'bpf:kvm_exit/exit_reason==12/'                  # KVM 退出延迟
+   ```
+   `/EXPR/` 是以事件字段为变量的 C 表达式；只能采样；`-p/-t` 最多一个进程；不支持 `--cgroups`、`push=`/`pull=`、python/sql。
+   样本头的 comm/pid 是运行 BPF 程序的任务，被描述的任务看事件里的 `comm`/`pid` 字段。
+
 5. **新增动态探针**（当系统事件不满足要求且动态探针无法使用或需要增加参数时）：
 
    通过 `/sys/kernel/debug/tracing/kprobe_events` 和 `/sys/kernel/debug/tracing/uprobe_events` 文件手动新增探针。
@@ -659,6 +669,7 @@ EVENT: sys:name[/filter/ATTR/ATTR/.../]
       uprobe:BINARY:offset[/filter/ATTR/ATTR/.../]
       uretprobe:BINARY:fn[/filter/ATTR/ATTR/.../]
       uretprobe:BINARY:offset[/filter/ATTR/ATTR/.../]
+      bpf:name[/EXPR/ATTR/ATTR/.../]
 filter: trace events filter
 ```
 
