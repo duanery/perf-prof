@@ -98,7 +98,7 @@ struct env env = {0};
 
 static volatile int running = 0;
 
-const char *main_program_version = PROGRAME " 1.11";
+const char *main_program_version = PROGRAME " 1.12";
 
 enum {
     LONG_OPT_start = 500,
