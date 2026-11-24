@@ -30,8 +30,7 @@
  *
  * runq_delay, offcpu_wait and switches are only resolved in system-wide
  * (-C cpus) mode, which is the only mode that attaches to sched_switch. In
- * per-process (-p pid) mode they are always 0, and the event is truncated at
- * offsetof(runq_delay) on output.
+ * per-process (-p pid) mode they are always 0, still output.
  *
  * Entries in the kvm_vcpu map that holds this struct between kvm_exit and
  * kvm_entry are reclaimed in BPF, by the sched_process_free program. Userspace

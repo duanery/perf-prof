@@ -10,6 +10,7 @@
 #include <stack_helpers.h>
 #include <latency_helpers.h>
 #include <bpf_expr_filter.h>
+#include <bpf_event.h>
 #include <bpf-skel/kvm_exit.h>
 #include <bpf-skel/kvm_exit.skel.h>
 #include <internal/evsel.h>
@@ -87,6 +88,69 @@ static int kvm_exit_select_prog(struct kvm_exit_bpf *obj)
 }
 #endif
 
+/*
+ * Configure the BPF object for @scope, before load. Shared by the bpf:kvm_exit
+ * event source (ops->prepare) and by the profiler bpf:kvm_exit.
+ *
+ * SCOPE_CPU pairs kvm_exit with kvm_entry per cpu and follows the vcpu thread
+ * through sched_switch; work_cpus[] spares the pairing on the other cpus.
+ * SCOPE_PROCESS pairs them per thread in the kvm_vcpu map, for the one
+ * process in the rodata: more would take a map.
+ */
+static int kvm_exit_prepare(void *s, const struct bpf_event_scope *scope)
+{
+    struct kvm_exit_bpf *obj = s;
+    int cpu, ins, i;
+
+    if (scope->type == BPF_EVENT_SCOPE_CPU) {
+        perf_cpu_map__for_each_cpu(cpu, ins, scope->cpus)
+            obj->bss->work_cpus[cpu] = 1;
+        for (i = 0; i < ARRAY_SIZE(obj->bss->percpu_event); i++)
+            EXIT_TIME(&obj->bss->percpu_event[i]) = INT64_MAX;
+
+        bpf_program__set_autoload(obj->progs.kvm_exit_pid, 0);
+#if defined(__i386__) || defined(__x86_64__)
+        bpf_program__set_autoload(obj->progs.kvm_exit_pid_legacy, 0);
+#endif
+        bpf_program__set_autoload(obj->progs.kvm_entry_pid, 0);
+    } else {
+        if (scope->nr_tgids > 1)
+            return -EOPNOTSUPP;
+        obj->rodata->filter_pid = scope->tgids[0];
+
+        bpf_program__set_autoload(obj->progs.kvm_exit, 0);
+#if defined(__i386__) || defined(__x86_64__)
+        bpf_program__set_autoload(obj->progs.kvm_exit_legacy, 0);
+#endif
+        bpf_program__set_autoload(obj->progs.kvm_entry, 0);
+        bpf_program__set_autoload(obj->progs.sched_switch, 0);
+    }
+    return kvm_exit_select_prog(obj);
+}
+
+/*
+ * As bpf_kvm_exit_print_event() does: the exit reason by its name. The time
+ * breakdown is only resolved per cpu, and 0 per process.
+ */
+static void kvm_exit_print(const void *data, int size)
+{
+    const struct kvm_vcpu_event *e = data;
+
+    if (size < (int)sizeof(*e)) {
+        printf("\n");
+        return;
+    }
+    printf(" %s lat %lu runq_delay %lu offcpu_wait %lu sw %u\n",
+           find_exit_reason(e->isa, e->exit_reason), e->exit_latency,
+           e->runq_delay, e->offcpu_wait, e->switches);
+}
+
+static const struct bpf_event_ops kvm_exit_ops = {
+    .prepare = kvm_exit_prepare,
+    .print = kvm_exit_print,
+};
+BPF_EVENT_OPS(kvm_exit, &kvm_exit_ops);
+
 static int monitor_ctx_init(struct prof_dev *dev)
 {
     struct env *env = dev->env;
@@ -101,8 +165,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->obj = kvm_exit_bpf__open();
     if (!ctx->obj)
         goto free_ctx;
-    if (kvm_exit_select_prog(ctx->obj) < 0)
-        goto destroy;
 
     ctx->lat_dist = latency_dist_new_quantile(env->perins, true, sizeof(struct extra_rundelay));
     if (!ctx->lat_dist)
@@ -184,13 +246,24 @@ static int bpf_kvm_exit_init(struct prof_dev *dev)
         .watermark     = 1,
         .wakeup_watermark = (dev->pages << 12) / 3,
     };
-    int cpu, ins, i, tid, tgid;
+    struct bpf_event_scope scope;
+    int tgids[perf_thread_map__nr(dev->threads)];
     struct perf_thread_map *tgidmap = NULL;
     struct prof_dev *tgiddev = NULL;
+    int err;
 
     if (monitor_ctx_init(dev) < 0)
         return -1;
     ctx = dev->private;
+
+    if (tp_bpf_scope(dev, NULL, &scope, tgids) < 0)
+        goto failed;
+    err = kvm_exit_prepare(ctx->obj, &scope);
+    if (err < 0) {
+        if (err == -EOPNOTSUPP)
+            fprintf(stderr, "bpf:kvm_exit: can trace only one process\n");
+        goto failed;
+    }
 
     prof_dev_env2attr(dev, &attr);
 
@@ -199,18 +272,7 @@ static int bpf_kvm_exit_init(struct prof_dev *dev)
         goto failed;
     perf_evlist__add(evlist, ctx->evsel);
 
-    if (ctx->oncpu) {
-        perf_cpu_map__for_each_cpu(cpu, ins, dev->cpus)
-            ctx->obj->bss->work_cpus[cpu] = 1;
-        for (i = 0; i < ARRAY_SIZE(ctx->obj->bss->percpu_event); i++)
-            EXIT_TIME(&ctx->obj->bss->percpu_event[i]) = INT64_MAX;
-
-        bpf_program__set_autoload(ctx->obj->progs.kvm_exit_pid, 0);
-#if defined(__i386__) || defined(__x86_64__)
-        bpf_program__set_autoload(ctx->obj->progs.kvm_exit_pid_legacy, 0);
-#endif
-        bpf_program__set_autoload(ctx->obj->progs.kvm_entry_pid, 0);
-    } else {
+    if (!ctx->oncpu) {
         struct perf_cpu_map *cpus = perf_cpu_map__new(NULL);
         struct perf_thread_map *threads = perf_thread_map__new_dummy();
 
@@ -228,19 +290,8 @@ static int bpf_kvm_exit_init(struct prof_dev *dev)
         perf_cpu_map__put(cpus);
         perf_thread_map__put(threads);
 
-        tid = perf_thread_map__pid(ctx->thread_map, 0);
-        tgid = get_tgid(tid);
-        ctx->obj->rodata->filter_pid = tgid;
-
-        bpf_program__set_autoload(ctx->obj->progs.kvm_exit, 0);
-#if defined(__i386__) || defined(__x86_64__)
-        bpf_program__set_autoload(ctx->obj->progs.kvm_exit_legacy, 0);
-#endif
-        bpf_program__set_autoload(ctx->obj->progs.kvm_entry, 0);
-        bpf_program__set_autoload(ctx->obj->progs.sched_switch, 0);
-
         // Monitor main thread exit to auto-close device via hangup callback
-        tgidmap = thread_map__new_by_tid(tgid);
+        tgidmap = thread_map__new_by_tid(scope.tgids[0]);
         if (!tgidmap)
             goto failed;
         tgiddev = trace_dev_open("sched:sched_process_exit", NULL, tgidmap, dev, NULL, (void *)prof_dev_close);

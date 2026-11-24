@@ -372,13 +372,14 @@ int BPF_PROG(kvm_entry_pid) // int vcpu_id | unsigned long vcpu_pc
         data->exit_latency = bpf_ktime_get_ns() - EXIT_TIME(data);
         /*
          * This path never attaches to sched_switch, so switches, runq_delay
-         * and offcpu_wait are always 0 and the event is truncated before
-         * runq_delay on output. A filter must not rely on them here.
+         * and offcpu_wait are always 0 here. The event is still output in
+         * full: an expression reads the raw data at the BTF offsets, past a
+         * truncated end it would read beyond the record.
          * The map entry only exists once kvm_exit_track_pid() has run, which
          * is why no exit-time validity check is needed.
          */
         if (expr_filter(data))
-            perf_output(ctx, data, offsetof(struct kvm_vcpu_event, runq_delay));
+            perf_output(ctx, data, sizeof(*data));
     }
     return 0;
 }
