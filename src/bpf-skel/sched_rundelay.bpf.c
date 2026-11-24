@@ -126,6 +126,7 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_s
 
     pid = BPF_CORE_READ(next, pid);
     r = bpf_map_lookup_elem(&runnable, &pid);
+    barrier_var(cpu);
     if (!r || cpu >= MAX_CPUS)
         return 0;
 
