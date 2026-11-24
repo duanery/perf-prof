@@ -1711,17 +1711,16 @@ static void trace_print_lat_fmt(struct trace_entry *entry)
     }
 }
 
-void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, void *data, int size)
+void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, int tid, void *data, int size)
 {
     if (!tp)
         tep__print_event(ts, cpu, data, size);
     else {
         struct trace_entry *entry = data;
-        int pid = entry->common_pid;
-        char *comm = global_comm_get(pid);
+        char *comm = global_comm_get(tid);
         char *name = tp->id <= TRACE_EVENT_TYPE_MAX ? tp->name : (tp->alias ? : tp->name);
 
-        printf("%16s %6u ", comm ? : "<...>", pid);
+        printf("%16s %6u ", comm ? : "<...>", tid);
         trace_print_lat_fmt(entry);
 
         if (likely(cpu >= 0))

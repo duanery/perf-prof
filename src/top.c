@@ -500,7 +500,7 @@ static void top_sample(struct prof_dev *dev, union perf_event *event, int cpu, i
             prof_dev_print_time(dev, raw->time, stdout);
             tp_print_marker(tp);
         }
-        tp_print_event(tp, raw->time, raw->cpu_entry.cpu, data, size);
+        tp_print_event(tp, raw->time, raw->cpu_entry.cpu, raw->tid_entry.tid, data, size);
     }
 
     tp_broadcast_event(tp, event);

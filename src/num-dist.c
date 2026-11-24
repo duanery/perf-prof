@@ -314,7 +314,7 @@ static void num_dist_sample(struct prof_dev *dev, union perf_event *event, int c
         env->verbose >= VERBOSE_EVENT) {
         if (dev->print_title) prof_dev_print_time(dev, hdr->time, stdout);
         tep__update_comm(NULL, hdr->tid_entry.tid);
-        tp_print_event(tp, hdr->time, hdr->cpu_entry.cpu, raw, size);
+        tp_print_event(tp, hdr->time, hdr->cpu_entry.cpu, hdr->tid_entry.tid, raw, size);
         __print_callchain(ctx, event, tp);
     }
 }

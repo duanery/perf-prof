@@ -1708,7 +1708,7 @@ static void expr_sample(struct prof_dev *dev, union perf_event *event, int cpu, 
 
     prof_dev_print_time(dev, raw->time, stdout);
     tp_print_marker(&info->tp_list->tp[0]);
-    tp_print_event(&info->tp_list->tp[0], raw->time, raw->cpu_entry.cpu, raw->raw.data, raw->raw.size);
+    tp_print_event(&info->tp_list->tp[0], raw->time, raw->cpu_entry.cpu, raw->tid_entry.tid, raw->raw.data, raw->raw.size);
 
     info->prog->glo._cpu = raw->cpu_entry.cpu;
     info->prog->glo._pid = raw->tid_entry.pid;

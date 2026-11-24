@@ -1656,7 +1656,7 @@ static PyObject *PerfEvent_print(PerfEventObject *self, PyObject *args, PyObject
 
         /* Print event */
         perfevent_get_raw(self, &raw, &raw_size, &callchain);
-        tp_print_event(self->tp, self->_time, self->_cpu, raw, raw_size);
+        tp_print_event(self->tp, self->_time, self->_cpu, self->_tid, raw, raw_size);
 
         /* Print callchain if requested */
         if (print_callchain && callchain) {

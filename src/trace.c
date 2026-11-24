@@ -251,7 +251,7 @@ static void trace_print_event(struct prof_dev *dev, union perf_event *event, int
     }
 
     __raw_size(event, &raw, &size, tp->stack);
-    tp_print_event(tp, data->time, data->cpu_entry.cpu, raw, size);
+    tp_print_event(tp, data->time, data->cpu_entry.cpu, data->tid_entry.tid, raw, size);
 
     if (tp->stack && !(flags & OMIT_CALLCHAIN)) {
         struct callchain_data cd;
@@ -282,7 +282,7 @@ static void trace_sample(struct prof_dev *dev, union perf_event *event, int cpu,
     prof_dev_print_time(dev, data->time, stdout);
     tp_print_marker(tp);
     __raw_size(event, &raw, &size, tp->stack);
-    tp_print_event(tp, data->time, data->cpu_entry.cpu, raw, size);
+    tp_print_event(tp, data->time, data->cpu_entry.cpu, data->tid_entry.tid, raw, size);
     if (tp->exec_prog)
         tp_prog_run(tp, tp->exec_prog, GLOBAL(data->cpu_entry.cpu, data->tid_entry.pid, raw, size));
     __print_callchain(dev, tp, event);

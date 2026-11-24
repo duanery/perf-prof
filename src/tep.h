@@ -250,7 +250,7 @@ unsigned long tp_get_mem_size(struct tp *tp, struct expr_global *global);
 unsigned long tp_get_key(struct tp *tp, struct expr_global *global);
 unsigned long tp_get_role(struct tp *tp, struct expr_global *global);
 unsigned long tp_get_num(struct tp *tp, struct expr_global *global);
-void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, void *data, int size);
+void tp_print_event(struct tp *tp, unsigned long long ts, int cpu, int tid, void *data, int size);
 
 struct perf_evsel *tp_evsel_new(struct tp *tp, struct perf_event_attr *tmpl);
 struct tp *tp_from_evsel(struct perf_evsel *evsel, struct tp_list *tp_list);

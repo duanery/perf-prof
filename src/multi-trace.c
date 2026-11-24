@@ -1087,7 +1087,7 @@ void multi_trace_print_title(union perf_event *event, struct tp *tp, const char 
     }
 
     multi_trace_raw_size(event, &raw, &size, tp);
-    tp_print_event(tp, data->h.time, data->h.cpu_entry.cpu, raw, size);
+    tp_print_event(tp, data->h.time, data->h.cpu_entry.cpu, data->h.tid_entry.tid, raw, size);
 
     if (tp->stack) {
         struct callchain_data cd;
