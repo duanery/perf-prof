@@ -6,6 +6,9 @@
 #include "kvm_exit.h"
 #include "perf_output.bpf.h"
 #include "expr_filter.bpf.h"
+#include "bpf_event.bpf.h"
+
+BPF_EVENT_DESC("kvm_exit to kvm_entry latency of each vcpu exit, with the time off-CPU and runnable.");
 
 #define MAX_CPUS 4096
 #define MAX_VCPUS 8192

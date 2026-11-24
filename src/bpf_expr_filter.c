@@ -42,7 +42,8 @@
 
 /*
  * Resolve the event struct that the filter placeholder takes a pointer to.
- * Returns the STRUCT type, or NULL with a diagnostic.
+ * Returns the STRUCT type, or NULL with a diagnostic; its BTF id goes to
+ * `type_id' if that is non-NULL.
  *
  * `obj' is only needed to name the offending object in diagnostics; several
  * BPF event sources may be loaded at once, so a bare complaint about
@@ -50,7 +51,7 @@
  */
 static const struct btf_type *
 expr_filter_event_type(struct bpf_object *obj, struct btf *btf,
-                       const char **type_name)
+                       const char **type_name, __s32 *type_id)
 {
     const char *objname = bpf_object__name(obj) ? : "(unknown)";
     const struct btf_type *t;
@@ -91,7 +92,29 @@ expr_filter_event_type(struct bpf_object *obj, struct btf *btf,
 
     if (type_name)
         *type_name = btf__name_by_offset(btf, t->name_off) ? : "(anon)";
+    if (type_id)
+        *type_id = id;
     return t;
+}
+
+/*
+ * BTF id of the event struct, in bpf_object__btf(obj). For callers that need
+ * more of the struct than bpf_expr_filter_fields() describes: the members it
+ * skips, or the type names. Returns -1 with a diagnostic on failure.
+ */
+int bpf_expr_filter_event_id(struct bpf_object *obj)
+{
+    struct btf *btf = bpf_object__btf(obj);
+    __s32 id;
+
+    if (!btf) {
+        fprintf(stderr, "bpf filter: %s: object has no BTF\n",
+                bpf_object__name(obj) ? : "(unknown)");
+        return -1;
+    }
+    if (!expr_filter_event_type(obj, btf, NULL, &id))
+        return -1;
+    return id;
 }
 
 /*
@@ -119,7 +142,7 @@ struct global_var_declare *bpf_expr_filter_fields(struct bpf_object *obj)
         return NULL;
     }
 
-    st = expr_filter_event_type(obj, btf, &type_name);
+    st = expr_filter_event_type(obj, btf, &type_name, NULL);
     if (!st)
         return NULL;
 

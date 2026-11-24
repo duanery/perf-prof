@@ -41,6 +41,7 @@ perf-prof-y += list.o
 perf-prof-y += kcore.o
 perf-prof-$(CONFIG_LIBBPF) += bpf_kvm_exit.o
 perf-prof-$(CONFIG_LIBBPF) += bpf_expr_filter.o
+perf-prof-$(CONFIG_LIBBPF) += bpf_event.o
 perf-prof-y += misc.o
 perf-prof-y += sql.o
 perf-prof-$(CONFIG_LIBPYTHON) += python.o

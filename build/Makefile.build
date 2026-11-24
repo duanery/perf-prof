@@ -91,6 +91,15 @@ quiet_cmd_bpf_o_c = BPF     $@
 quiet_cmd_bpf_skel_h = GEN-SKL $@
       cmd_bpf_skel_h = $(BPFTOOL) gen skeleton $< > $@
 
+# bpf_event.tmpl.c includes the skeleton $<, preceded by the source's own
+# xxx.h if there is one: a skeleton names the types of the source's global
+# variables without defining them.
+event-name = $(basename $(basetarget))
+quiet_cmd_cc_o_event = CC      $@
+      cmd_cc_o_event = $(CC) $(c_flags) -DBPF_EVENT_NAME=$(event-name) -DBPF_EVENT_SKEL='"$<"' \
+                       $(if $(wildcard $(dir)/$(event-name).h),-DBPF_EVENT_TYPES='"$(event-name).h"') \
+                       -c -o $@ $(dir)/bpf_event.tmpl.c
+
 quiet_cmd_vmlinux_h = VMLINUX $@
       cmd_vmlinux_h = $(BPFTOOL) btf dump file $< format c > $@
 
@@ -166,6 +175,17 @@ subdir-obj-y := $(addprefix $(objprefix),$(subdir-obj-y))
 # Final '$(obj)-in.o' object
 in-target := $(objprefix)$(obj)-in.o
 skel-target := $(filter %.skel.h,$(obj-y))
+
+# A BPF event source is declared as 'xxx.event.o': the skeleton xxx.skel.h is
+# generated from xxx.bpf.c as above, then bpf_event.tmpl.c is compiled against
+# it, which registers the source from a constructor (see src/bpf_event.h). There is no xxx.event.c, so the generic '%.o: %.c' rule
+# cannot match; the static pattern rule below is the only one that does.
+#
+# The skeleton is not in $(obj-y) this way, so it is added to the targets
+# whose .cmd files are read (or if_changed would regenerate it every time)
+# and to the clean list explicitly.
+event-target := $(filter %.event.o,$(obj-y))
+skel-target  += $(patsubst %.event.o,%.skel.h,$(event-target))
 # A .bpf.o normally comes from a declared .skel.h, but Makefile.config's BPF
 # slot check builds src/bpf-skel/slot_check.bpf.o as a direct goal and lists
 # it in no Build file. Pick it up from $(MAKECMDGOALS) as well, or the static
@@ -203,6 +223,10 @@ $(skel-target): $(objprefix)%.skel.h: $(objprefix)%.bpf.o FORCE
 	$(call rule_mkdir)
 	$(call if_changed,bpf_skel_h)
 
+$(event-target): $(objprefix)%.event.o: $(objprefix)%.skel.h $(dir)/bpf_event.tmpl.c FORCE
+	$(call rule_mkdir)
+	$(call if_changed_dep,cc_o_event)
+
 # A generated skeleton header has no dependency edge to the objects that
 # #include it -- being listed earlier in the same Build file only happens
 # to work under -j1. Order every compile here after the skeletons of this
@@ -236,14 +260,14 @@ $(subdir-clean-y):
 	$(Q)$(MAKE) -f $(build-dir)/Makefile.build dir=$(dir)/$(patsubst %-clean,%,$(notdir $@)) obj=$(obj) clean
 
 clean: $(subdir-clean-y)
-	$(call _clean,clean,$(in-target) $(bpf-target) $(vmlinux-target) $(obj-y) $(objprefix)*.o $(objprefix).*.cmd $(objprefix).*.d)
+	$(call _clean,clean,$(in-target) $(bpf-target) $(skel-target) $(vmlinux-target) $(obj-y) $(objprefix)*.o $(objprefix).*.cmd $(objprefix).*.d)
 
 PHONY += FORCE
 FORCE:
 
 # Include all cmd files to get all the dependency rules
 # for all objects included
-targets   := $(wildcard $(sort $(obj-y) $(in-target) $(bpf-target) $(vmlinux-target) $(MAKECMDGOALS)))
+targets   := $(wildcard $(sort $(obj-y) $(in-target) $(bpf-target) $(skel-target) $(vmlinux-target) $(MAKECMDGOALS)))
 cmd_files := $(wildcard $(foreach f,$(targets),$(dir $(f)).$(notdir $(f)).cmd))
 
 ifneq ($(cmd_files),)

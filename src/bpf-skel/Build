@@ -1,1 +1,1 @@
-perf-prof-$(CONFIG_LIBBPF) += kvm_exit.skel.h
+perf-prof-$(CONFIG_LIBBPF) += kvm_exit.event.o

@@ -23,6 +23,9 @@ int bpf_expr_filter_apply(struct bpf_object *obj, const char *expr_str, int verb
  * terminated. Mainly useful for diagnostics, apply() calls it itself. */
 struct global_var_declare *bpf_expr_filter_fields(struct bpf_object *obj);
 
+/* BTF id of the event struct in bpf_object__btf(obj), or -1. */
+int bpf_expr_filter_event_id(struct bpf_object *obj);
+
 /* Print the fields an expression may refer to. */
 void bpf_expr_filter_help(struct bpf_object *obj);
 
