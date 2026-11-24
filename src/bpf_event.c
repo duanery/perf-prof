@@ -38,6 +38,9 @@
 
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
+#include <perf/evsel.h>
+#include <perf/cpumap.h>
+#include <perf/threadmap.h>
 #include <bpf_expr_filter.h>
 #include <bpf-skel/bpf_event.bpf.h>
 
@@ -62,6 +65,13 @@ struct bpf_event_pending_ops {
     struct bpf_event_pending_ops *next;
     const char *name;
     const struct bpf_event_ops *ops;
+};
+
+struct bpf_event {
+    struct bpf_event_source *src;
+    struct bpf_event_scope scope;       /* own copy: cpus referenced, tgids copied */
+    struct perf_evsel *evsel;           /* not owned, see bpf_event_new() */
+    void *s;                            /* the skeleton, once started */
 };
 
 static struct bpf_event_source *sources;
@@ -380,6 +390,259 @@ void bpf_event_source_print(struct bpf_event_source *src, const void *data, int 
         printf("}");
     }
     printf("\n");
+}
+
+/* ---- instances ---- */
+
+struct bpf_event *bpf_event_new(struct bpf_event_source *src, const struct bpf_event_scope *scope,
+                                const struct perf_event_attr *tmpl)
+{
+    struct perf_event_attr attr = *tmpl;
+    struct perf_cpu_map *cpus = NULL;
+    struct perf_thread_map *threads = NULL;
+    struct bpf_event *ev;
+
+    if (source_parse(src) < 0)
+        return NULL;
+    if (scope->type == BPF_EVENT_SCOPE_PROCESS && !(src->ops && src->ops->prepare)) {
+        fprintf(stderr, "bpf:%s: can only trace cpus, not processes\n", src->name);
+        return NULL;
+    }
+    /*
+     * Kernel constraint: a BPF output sample has period 0 and does not count
+     * the event, bpf_perf_event_output() in kernel/trace/bpf_trace.c inits it
+     * with perf_sample_data_init(sd, 0, 0), already in a43eec304259 ("bpf:
+     * introduce bpf_perf_event_output() helper"), in v4.4. Counting it would
+     * always read 0, so only sampling is allowed.
+     */
+    if (!attr.freq && attr.sample_period == 0) {
+        fprintf(stderr, "bpf:%s: can only be sampled, not counted\n", src->name);
+        return NULL;
+    }
+
+    ev = calloc(1, sizeof(*ev));
+    if (!ev)
+        return NULL;
+    ev->src = src;
+    ev->scope.type = scope->type;
+    if (scope->type == BPF_EVENT_SCOPE_PROCESS) {
+        ev->scope.tgids = malloc(scope->nr_tgids * sizeof(*scope->tgids));
+        if (!ev->scope.tgids)
+            goto failed;
+        memcpy((int *)ev->scope.tgids, scope->tgids, scope->nr_tgids * sizeof(*scope->tgids));
+        ev->scope.nr_tgids = scope->nr_tgids;
+    }
+
+    /*
+     * Kernel constraint: a perf event stored in a PERF_EVENT_ARRAY must not
+     * be inherited, perf_event_fd_array_get_ptr() in kernel/bpf/arraymap.c:
+     * the map update fails with -EINVAL since 62544ce8e01c ("bpf: fix
+     * bpf_perf_event_read() helper"), in v4.4, and with -EOPNOTSUPP, through
+     * perf_event_read_local(), since f91840a32dee ("perf, bpf: Add BPF support
+     * to all perf_event types"), in v4.13.
+     */
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.config = PERF_COUNT_SW_BPF_OUTPUT;
+    attr.inherit = 0;
+
+    /*
+     * Kernel constraint: __bpf_perf_event_output() in kernel/trace/bpf_trace.c
+     * outputs to the map entry of the current cpu, and drops the event if
+     * that is empty (-ENOENT) or holds an event of another cpu (-EOPNOTSUPP),
+     * already in a43eec304259 ("bpf: introduce bpf_perf_event_output()
+     * helper"), in v4.4. So the evsel is opened per cpu, for no task, on every
+     * cpu an event may happen on: the traced ones, or all of them when tracing
+     * processes, which run anywhere. Events on other cpus are lost.
+     */
+    cpus = scope->type == BPF_EVENT_SCOPE_CPU ? perf_cpu_map__get(scope->cpus) : perf_cpu_map__new(NULL);
+    threads = perf_thread_map__new_dummy();
+    if (!cpus || !threads)
+        goto failed;
+    ev->evsel = perf_evsel__new(&attr);
+    if (!ev->evsel)
+        goto failed;
+    perf_evsel__set_own_cpus(ev->evsel, cpus);
+    perf_evsel__set_own_threads(ev->evsel, threads);
+    if (scope->type == BPF_EVENT_SCOPE_CPU)
+        ev->scope.cpus = cpus;
+    else
+        perf_cpu_map__put(cpus);
+    perf_thread_map__put(threads);
+    return ev;
+
+failed:
+    perf_cpu_map__put(cpus);
+    perf_thread_map__put(threads);
+    free((int *)ev->scope.tgids);
+    free(ev);
+    return NULL;
+}
+
+struct perf_evsel *bpf_event_evsel(struct bpf_event *ev)
+{
+    return ev->evsel;
+}
+
+static int quiet_print(enum libbpf_print_level level, const char *format, va_list args)
+{
+    return 0;
+}
+
+enum {
+    STEP_OK,
+    STEP_FILTER,    /* failed, and @filter may be why */
+    STEP_FAILED,
+};
+
+/* open -> filter -> prepare -> load. The skeleton is in ev->s on STEP_OK only. */
+static int bpf_event_load(struct bpf_event *ev, const char *filter, bool quiet, int verbose)
+{
+    struct bpf_event_source *src = ev->src;
+    libbpf_print_fn_t old = NULL;
+    int err;
+
+    ev->s = src->skel->open();
+    if (!ev->s) {
+        fprintf(stderr, "bpf:%s: failed to open the BPF object\n", src->name);
+        return STEP_FAILED;
+    }
+    /* The fallback without the filter follows, the error of this try only distracts. */
+    if (quiet && !verbose)
+        old = libbpf_set_print(quiet_print);
+
+    err = STEP_FILTER;
+    if (filter && bpf_expr_filter_apply(src->skel->obj(ev->s), filter, verbose) < 0)
+        goto failed;
+
+    err = STEP_FAILED;
+    if (src->ops && src->ops->prepare) {
+        int ret = src->ops->prepare(ev->s, &ev->scope);
+        if (ret < 0) {
+            if (ret == -EOPNOTSUPP)
+                fprintf(stderr, "bpf:%s: cannot trace %s\n", src->name,
+                        ev->scope.type == BPF_EVENT_SCOPE_CPU ? "cpus" : "these processes");
+            else
+                fprintf(stderr, "bpf:%s: failed to prepare the BPF object\n", src->name);
+            goto failed;
+        }
+    }
+
+    if (src->skel->load(ev->s) < 0) {
+        err = filter ? STEP_FILTER : STEP_FAILED;
+        /*
+         * Kernel constraint: a source needs bpf-to-bpf calls (expr_filter() is
+         * a subprog), since cc8b0b92a169 ("bpf: introduce function calls
+         * (function boundaries)"), in v4.16, and global data in .bss/.rodata,
+         * since d8eca5bbb2be ("bpf: implement lookup-free direct value access
+         * for maps"), in v5.2. A source using CO-RE also needs the kernel's
+         * BTF, which libbpf looks for in several places. The verifier log
+         * alone does not say this.
+         */
+        if (!quiet || verbose)
+            fprintf(stderr, "bpf:%s: failed to load the BPF object, may need a newer kernel or kernel BTF\n",
+                    src->name);
+        goto failed;
+    }
+    if (old)
+        libbpf_set_print(old);
+    return STEP_OK;
+
+failed:
+    if (old)
+        libbpf_set_print(old);
+    src->skel->destroy(ev->s);
+    ev->s = NULL;
+    return err;
+}
+
+/*
+ * Point the perf_events map at the evsel's fds.
+ *
+ * Kernel constraint: BPF_F_CURRENT_CPU indexes the map with
+ * smp_processor_id(), __bpf_perf_event_output() in kernel/trace/bpf_trace.c,
+ * since 1e33759c788c ("bpf, trace: add BPF_F_CURRENT_CPU flag for
+ * bpf_perf_event_output"), in v4.7. The key is the cpu number, not an index
+ * into the cpu map: they differ once the cpus are not 0..n-1. A map without
+ * max_entries is sized by libbpf to the possible cpus.
+ */
+static int bpf_event_bind_outputs(struct bpf_event *ev)
+{
+    struct bpf_map *map = ev->src->skel->perf_events(ev->s);
+    struct perf_evsel_fd *pos;
+
+    perf_evsel__for_each_fd(ev->evsel, pos) {
+        int cpu = perf_evsel_fd__cpu(pos);
+        int fd = perf_evsel__fd(ev->evsel, cpu, perf_evsel_fd__tid(pos));
+        int err = bpf_map__update_elem(map, &cpu, sizeof(cpu), &fd, sizeof(fd), 0);
+
+        if (err) {
+            fprintf(stderr, "bpf:%s: failed to bind the output on cpu %d: %s\n",
+                    ev->src->name, cpu, strerror(-err));
+            return err;
+        }
+    }
+    return 0;
+}
+
+int bpf_event_start(struct bpf_event *ev, const char *filter, int flags, int verbose)
+{
+    struct bpf_event_source *src = ev->src;
+    bool userspace_ok = flags & BPF_EVENT_USERSPACE_OK;
+    int ret = 0, err;
+
+    if (ev->s)
+        return -EBUSY;
+    if (!perf_evsel__next_fd(ev->evsel, NULL))
+        return -EINVAL;
+    if (filter && !filter[0])
+        filter = NULL;
+
+    err = bpf_event_load(ev, filter, userspace_ok, verbose);
+    if (err == STEP_FILTER && userspace_ok) {
+        if (verbose)
+            fprintf(stderr, "bpf:%s: the filter cannot run in the kernel, retrying without it\n", src->name);
+        err = bpf_event_load(ev, NULL, false, verbose);
+        ret = 1;
+    }
+    if (err != STEP_OK)
+        return -EINVAL;
+
+    err = bpf_event_bind_outputs(ev);
+    if (!err) {
+        err = src->skel->attach(ev->s);
+        if (err)
+            fprintf(stderr, "bpf:%s: failed to attach: %s\n", src->name, strerror(-err));
+    }
+    if (err) {
+        src->skel->destroy(ev->s);
+        ev->s = NULL;
+        return err < 0 ? err : -EINVAL;
+    }
+    return ret;
+}
+
+void *bpf_event_skel(struct bpf_event *ev)
+{
+    return ev->s;
+}
+
+/*
+ * Kernel constraint: a perf event in a PERF_EVENT_ARRAY is held by a
+ * reference to its file, and the entries a map file added are removed when it
+ * is released, perf_event_fd_array_release() in kernel/bpf/arraymap.c, since
+ * 3b1efb196eee ("bpf, maps: flush own entries on perf map release"), in v4.8
+ * (before, when the map is freed). So the BPF object and the evsel's fds can
+ * go in either order.
+ */
+void bpf_event_free(struct bpf_event *ev)
+{
+    if (!ev)
+        return;
+    if (ev->s)
+        ev->src->skel->destroy(ev->s);
+    perf_cpu_map__put(ev->scope.cpus);
+    free((int *)ev->scope.tgids);
+    free(ev);
 }
 
 #endif
