@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import os
 import platform
+import tempfile
 import time
 import pytest
 
@@ -14,6 +16,13 @@ pytestmark = pytest.mark.skipif(not PerfProf.btf_exists(), reason="no /sys/kerne
 def kernel_release():
     major, minor = platform.release().split('.')[:2]
     return int(major), int(minor)
+
+def write_script(content, suffix='.py'):
+    """Write a Python script to a temporary file and return the path."""
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix='perf_prof_test_')
+    with os.fdopen(fd, 'w') as f:
+        f.write(content)
+    return path
 
 def run_ok(args, runtime, memleak_check):
     prof = PerfProf(args)
@@ -173,11 +182,35 @@ def test_reject_processes():
     expect_error(['trace', '-e', 'bpf:sched_rundelay', '-p', '1,2', '-N', '1'], 'cannot trace these processes')
     expect_error(['trace', '-e', 'bpf:kvm_exit', '-p', '1,2', '-N', '1'], 'cannot trace these processes')
 
-def test_reject_sql():
-    expect_error(['sql', '-e', 'bpf:sched_rundelay', '-i', '1000', '--query', 'select 1'],
-                 'BPF events are not supported')
 
-def test_reject_python():
+#
+# python / sql read the fields of a BPF event: char[] as str, other arrays
+# bytes, the rest int. No common_* columns: the raw is the struct alone.
+#
+def test_python(runtime, memleak_check):
     if 'python' not in PerfProf.profilers():
         pytest.skip("perf-prof is built without python")
-    expect_error(['python', '-e', 'bpf:sched_rundelay', 'x.py'], 'BPF events are not supported')
+    script = write_script('''
+n = 0
+def bpf__sched_rundelay(event):
+    global n
+    n += 1
+    assert 'common_pid' not in event, event.keys()
+    assert event.rundelay >= 0, event.to_dict()
+    assert isinstance(event.comm, str), type(event.comm)
+    assert event._period == 0
+def __exit__():
+    print("events", n)
+''')
+    prof = PerfProf(['python', '-e', 'bpf:sched_rundelay', '-C', '0', '-m', '64', script])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)
+    os.unlink(script)
+
+def test_sql(runtime, memleak_check):
+    #perf-prof sql -e bpf:sched_rundelay -i 1000 --query ...
+    prof = PerfProf(['sql', '-e', 'bpf:sched_rundelay', '-i', '1000', '-m', '64',
+                     '--query', 'SELECT comm, COUNT(*) AS n FROM sched_rundelay '
+                                'WHERE rundelay > 0 AND prio >= 100 GROUP BY comm ORDER BY n DESC LIMIT 3'])
+    for std, line in prof.run(runtime, memleak_check):
+        result_check(std, line, runtime, memleak_check)
