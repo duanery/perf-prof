@@ -25,6 +25,23 @@ long tep__sched_switch_preempt_state(void);
 typedef struct global_var_declare event_fields;
 event_fields *tep__event_fields(int id);
 
+/*
+ * The value of the scalar field @f in @raw, extended by its sign. For a field
+ * of tep__event_fields() that is not an array (size == elementsize).
+ */
+static inline long long event_field_scalar(const event_fields *f, const void *raw)
+{
+    const void *p = raw + f->offset;
+
+    switch (f->size) {
+    case 1: return f->is_unsigned ? (long long)*(const u8 *)p  : *(const s8 *)p;
+    case 2: return f->is_unsigned ? (long long)*(const u16 *)p : *(const s16 *)p;
+    case 4: return f->is_unsigned ? (long long)*(const u32 *)p : *(const s32 *)p;
+    case 8: return *(const s64 *)p;
+    default: return 0;
+    }
+}
+
 char *next_sep(char *s, int c);
 
 struct prof_dev;

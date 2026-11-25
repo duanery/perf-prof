@@ -207,6 +207,13 @@ struct global_var_declare *bpf_expr_filter_fields(struct bpf_object *obj)
         /* Enums are unsigned unless BTF says otherwise. */
         declare[n].is_unsigned = btf_is_enum(elem) ||
                                  !(btf_int_encoding(elem) & BTF_INT_SIGNED);
+        /*
+         * `char x[N]' is text, `u8 x[N]' bytes. Only the name tells them
+         * apart: the encoding of `char' is signed or not by the arch, and
+         * u8 resolves to `unsigned char'.
+         */
+        declare[n].is_string = btf_is_array(ft) && btf_is_int(elem) && elemsize == 1 &&
+                               strcmp(btf__name_by_offset(btf, elem->name_off), "char") == 0;
         n++;
     }
 

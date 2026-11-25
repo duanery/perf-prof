@@ -59,6 +59,13 @@ struct global_var_declare {
     int size;
     int elementsize;
     bool is_unsigned;
+    /*
+     * A char array holding text rather than bytes, for consumers that type
+     * the fields (python str vs bytes, sql TEXT vs BLOB). Set by the fields of
+     * BPF events, from BTF. Tracepoint fields leave it false: those consumers
+     * read them through libtraceevent, see tep__string_field_as_binary().
+     */
+    bool is_string;
 };
 
 #define GLOBAL(a,b,c,d) &((struct expr_global){a,b,c,d})
