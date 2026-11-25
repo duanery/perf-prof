@@ -1,6 +1,7 @@
 # BPF 事件源：`-e bpf:xxx` 与 tracepoint / kprobe 并列
 
-Status: Done — implemented in commits 1a38096 f2d1efb 8c0c552 668681a 277e00b 8ca79bb (source) / afda002 (tests) / cca590e (docs); 与本稿的差异见第 13 节
+Status: Done — implemented in commits 1a38096 f2d1efb 8c0c552 668681a 277e00b 8ca79bb (source) / afda002 (tests) / cca590e (docs); 与本稿的差异见第 13 节。
+第 2 期 F1（python / sql）implemented in commits 686e47a b3563c7 (source) / 5f93934 (tests)，记录见第 14 节；F2、F3 未实现
 Date: 2026-11-24
 Base: main 65efec1
 
@@ -764,3 +765,32 @@ K16 在 v3.10 与 v7.3-rc1 上核实。实现时写 `Kernel constraint:` 注释�
 | `tp_print_event()` 占位 | 4 个空格 | `....`（用户 review） | 表示该列为空 |
 | 多进程 | kvm_exit 分析器只取第一个线程的 tgid | 分析器与事件源共用 prepare，多个进程一并拒绝 | 准则 8，一份配置 |
 
+## 14 第 2 期 F1：python / sql 按字段访问 BPF 事件
+
+Date: 2026-11-25。源码 686e47a（python 与公共部分）、b3563c7（sql），测试 5f93934。按 6.6 的 F1 实现：
+`bpf_event` 接口不变，字段一律经 `tep__event_fields(tp->id)` 取，`global_var_declare` 加 `is_string`。
+
+**行为**
+
+| 使用者 | BPF 事件 |
+|---|---|
+| python PerfEvent | 字段集同 tracepoint 去掉 `common_*`（`keys()`、`len()`、`in` 一致）；`_period` 为 0（K10）；`char[]` 为 str，其他数组 bytes，其余 int |
+| python 脚本模板 / `-h` | 字段与类型来自 BTF；`-h` 加 BPF 事件一节 |
+| sql 表 | 5 个系统列（`_pid` `_tid` `_time` `_cpu` `_period`），没有 `common_*`；`char[]` TEXT，其他数组 BLOB，其余 INTEGER；文件模式、虚拟表、普通表一致 |
+| sql WHERE 下推 | 只下推整数事件字段，拼成的表达式作为 `tp->filter` 编译进 BPF |
+| sql `symbolic()` / `ksymbol()` 等 | 不注册：它们从 print_fmt 推导，BPF 事件没有 |
+
+**实现与 6.6 的差异**
+
+| 位置 | 6.6 原写法 | 实现 | 原因 |
+|---|---|---|---|
+| `is_string` | 加一位 `is_string`，未说 tracepoint 字段怎么设 | 只有 `bpf_expr_filter_fields()` 设置（BTF 类型名为 `char` 的数组）；tracepoint 字段恒为 false | python / sql 读 tracepoint 仍走 `tep_format_field`（要 `__data_loc`、`tep__string_field_as_binary()` 的 `%p` 判断），`tep__event_fields()` 表达不了这些，不迁移 |
+| 读标量 | — | `tep.h` 新增 `event_field_scalar()`，python 与 sql 共用 | 准则 8：两个使用者的同一份按符号读取 |
+| sql 列 | — | 列名、列类型收进 `ColumnName()` / `ColumnType()`，`tp_private` 加 `nr_sys`（系统列个数：tracepoint 8、BPF 5） | 原先文件模式、xConnect、普通表各写一份 8 列的常量，BPF 的列数不同，第四份就是准则 8 说的重复 |
+| sql 下推 | — | BPF 事件不下推 `_cpu` 与 `TEXT` 列 | BPF 后端拒绝 `_cpu`（`EXPR_F_NO_SAMPLE_GLO`）与字符串比较，一个不支持的约束会让整个过滤器退到用户态，丢掉其余约束的内核过滤 |
+
+顺带修正：`sqlite_symbolic()` 遍历字段数组时以 `nr_fields` 为界，而 `nr_fields` 含系统列，会越过 NULL 结尾；改为遇 NULL 停止。
+
+**依赖的内核约束**：无新增。`_period` 为 0 是 K10 的结果，代码不依赖它。
+
+**仍未做**：F2（多进程 tgid map）、F3（`perf-prof bpf:kvm_exit` 基于事件源）。

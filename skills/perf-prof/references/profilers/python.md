@@ -38,7 +38,7 @@ perf-prof python -e EVENT[,EVENT...] [选项] [--] module [args...]
   - **profiler**: `profiler[/option/ATTR/.../]` - 嵌入其他分析器作为事件源
   - **kprobe/kretprobe**: `kprobe[:module]:fn[+off][/filter/ATTR/.../]` 或 `kprobe:0xADDR[/filter/ATTR/.../]`（bpftrace 风格；`kretprobe` 不支持 `+off`）
   - **uprobe/uretprobe**: `uprobe:BINARY:fn[+off][/filter/ATTR/.../]` 或 `uprobe:BINARY:offset[/filter/ATTR/.../]`（bpftrace 风格；`uretprobe` 不支持 `+off`）
-  - **bpf:name**: 暂不支持 BPF 事件源
+  - **bpf:name**: `bpf:name[/EXPR/ATTR/.../]` - perf-prof 内置 BPF 程序产生的事件（`perf-prof list bpf` 列出），EXPR 是 C 表达式过滤器
 - `module`: **[必需]** Python脚本或模块（位置参数）
 - `args...`: 传递给脚本的参数（通过`sys.argv`访问，用`--`分隔）
 
@@ -54,6 +54,11 @@ perf事件 → PerfEvent对象 → 惰性字段解析 → 回调函数 → 用�
 **Tracepoint事件** (`-e sys:name`):
 - sample_type: TID、TIME、ID、CPU、PERIOD、RAW、CALLCHAIN（使用`-g`或`stack`属性时）
 - 支持事件过滤器、通配符匹配、stack属性
+
+**BPF事件源** (`-e bpf:name`):
+- sample_type 与 Tracepoint 相同，raw 是 BPF 程序输出的事件结构体本身（没有 trace_entry）
+- 字段来自结构体的 BTF，`perf-prof trace -e bpf:name help` 查看
+- 支持 `/EXPR/` 过滤器（编译成 BPF 在内核执行，内核不支持时回退到用户态）、stack属性
 
 **Profiler事件源** (`-e profiler`):
 - 通过`-e profiler[/option/]`指定已有profiler作为事件源
@@ -94,6 +99,12 @@ perf事件 → PerfEvent对象 → 惰性字段解析 → 回调函数 → 用�
 | `_callchain` | list | 调用栈列表 |
 | `_event` | str | 事件名称（仅`__sample__`） |
 | `<field>` | 各类型 | 事件特定tep字段 |
+
+**BPF事件字段**: 同Tracepoint事件字段，但：
+- 没有 `common_*`（raw 里没有 trace_entry）
+- `_period` 恒为 0（BPF 输出的样本没有周期）
+- `<field>` 来自 BTF：`char[]` 为 str，其他数组为 bytes，其余为 int
+- 样本头的 `_pid`/`_tid` 是运行 BPF 程序的任务，被描述的任务看事件里的字段（如 `pid`、`comm`）
 
 **Profiler事件字段**:
 
@@ -207,6 +218,9 @@ perf-prof python -e 'profile/-F 997 -g/' -i 1000 profile_analyzer.py
 
 # 7. 联合分析tracepoint和profiler
 perf-prof python -e sched:sched_wakeup,profile -i 1000 --order combined.py
+
+# 8. BPF事件：调度延迟>1ms，按字段 comm、rundelay 分析
+perf-prof python -e 'bpf:sched_rundelay/rundelay>1000000/' -i 1000 rundelay.py
 ```
 
 ### 高级技巧

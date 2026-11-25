@@ -25,7 +25,7 @@ OPTION:
 - `--no-kernel-callchain`: 禁用内核态堆栈采样
 
 PROFILER OPTION:
-- `-e, --event`: 指定tracepoint事件或profiler事件源（必需）
+- `-e, --event`: 指定tracepoint事件、BPF事件（`bpf:name`）或profiler事件源（必需）
 - `module`: Python脚本或模块（必需，位置参数）
 - `args...`: 传递给脚本的参数，通过`sys.argv`访问
 
@@ -77,6 +77,9 @@ perf-prof python -e profile -i 1000 profile_analyzer.py
 
 # 联合分析：同时处理tracepoint和profiler事件
 perf-prof python -e sched:sched_wakeup,profile -i 1000 combined.py
+
+# 使用BPF事件：调度延迟>1ms的事件，按字段分析
+perf-prof python -e 'bpf:sched_rundelay/rundelay>1000000/' rundelay.py
 ```
 
 ### 脚本参数
@@ -193,7 +196,7 @@ perf事件 → PerfEvent对象 → 惰性字段解析 → 回调函数 → 用�
 
 ### 事件源
 
-python profiler 支持两类事件源：
+python profiler 支持三类事件源：
 
 #### Tracepoint事件源
 
@@ -211,6 +214,16 @@ python profiler 支持两类事件源：
   - 支持事件过滤器: `-e 'sched:sched_wakeup/pid>1000/'`
   - 支持多个事件: `-e event1,event2,event3`
   - 支持stack属性启用堆栈: `-e 'event//stack/'`
+
+#### BPF事件源（`bpf:name`）
+
+perf-prof 内置的 BPF 程序产生的事件（`perf-prof list bpf` 列出），用法与 tracepoint 相同。
+
+- **sample_type**: 与 Tracepoint 事件源相同。raw 是 BPF 程序输出的事件结构体本身，没有 trace_entry 头
+- **事件字段**: 来自事件结构体的 BTF，`perf-prof trace -e bpf:name help` 查看；类型映射见下文"BPF事件字段"
+- **过滤器**: `/EXPR/` 是以字段为变量的 C 表达式，编译成 BPF 在内核态执行；BPF 后端不支持的表达式（如旧内核上的有符号除法）回退到用户态执行
+- **样本头**: `_pid`/`_tid`/`comm` 是运行 BPF 程序的任务，不一定是事件描述的任务，后者看事件里的字段（如 `bpf:sched_rundelay` 的 `pid`、`comm`）
+- 其余限制（只能采样、`-p/-t` 最多一个进程等）见 [trace.md](trace.md)
 
 #### Profiler事件源（dev_tp）
 
@@ -330,7 +343,7 @@ python profiler 支持两类事件源：
 
 **PerfEvent对象字段**
 
-PerfEvent是一个惰性求值的事件对象，直接访问字段比字典更高效。两种事件类型的字段集不同：
+PerfEvent是一个惰性求值的事件对象，直接访问字段比字典更高效。三种事件类型的字段集不同：
 
 **Tracepoint事件字段** (`-e sys:name`)
 
@@ -349,6 +362,19 @@ PerfEvent是一个惰性求值的事件对象，直接访问字段比字典更�
 | `_callchain` | list | 调用栈列表（使用`-g`或`stack`属性时） | 惰性计算 |
 | `_event` | str | 事件名称（仅`__sample__`） | 惰性计算 |
 | `<field>` | 各类型 | 事件特定tep字段 | 惰性解析 |
+
+**BPF事件字段** (`-e bpf:name`)
+
+与Tracepoint事件字段相同，但没有 `common_type`、`common_flags`、`common_preempt_count`、`common_pid`（raw 里没有 trace_entry），`'common_pid' in event` 为 False。
+
+| 字段名 | 类型 | 描述 | 求值方式 |
+|--------|------|------|----------|
+| `_pid`, `_tid`, `_time`, `_cpu` | int | 同Tracepoint事件 | 直接访问 |
+| `_period` | int | 恒为 0（BPF 输出的样本没有周期） | 直接访问 |
+| `_realtime`, `_callchain`, `_event` | | 同Tracepoint事件 | 惰性计算 |
+| `<field>` | int/str/bytes | 事件结构体的成员，来自 BTF | 惰性解析 |
+
+`<field>` 的类型按 BTF 映射：`char` 数组为 str（遇到 `\0` 截止，最长为数组长度），其他数组（如 `u8[]`、`u16[]`）为 bytes，其余标量与枚举为 int（按符号扩展）。位域、嵌套结构体、指针成员不可访问。
 
 **Profiler事件字段** (`-e profiler`)
 

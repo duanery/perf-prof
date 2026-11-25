@@ -343,7 +343,8 @@ perf-prof top -h
    -e 'bpf:sched_rundelay/rundelay>1000000/'           # 调度延迟（唤醒/被抢占到运行）>1ms，内核态过滤
    -e 'bpf:kvm_exit/exit_reason==12/'                  # KVM 退出延迟
    ```
-   `/EXPR/` 是以事件字段为变量的 C 表达式；只能采样；`-p/-t` 最多一个进程；不支持 `--cgroups`、`push=`/`pull=`、python/sql。
+   `/EXPR/` 是以事件字段为变量的 C 表达式；只能采样；`-p/-t` 最多一个进程；不支持 `--cgroups`、`push=`/`pull=`。
+   python/sql 可按字段使用（没有 `common_*`）：`perf-prof sql -e bpf:sched_rundelay -i 1000 --query 'SELECT comm, MAX(rundelay) FROM sched_rundelay GROUP BY comm'`。
    样本头的 comm/pid 是运行 BPF 程序的任务，被描述的任务看事件里的 `comm`/`pid` 字段。
 
 5. **新增动态探针**（当系统事件不满足要求且动态探针无法使用或需要增加参数时）：
