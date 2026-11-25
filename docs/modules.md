@@ -144,6 +144,9 @@ perf-prof 的分析器建立在一组公共模块上：事件的打开与分发�
   - **字段探测要在持有 tep 时做**：tep 为 NULL 时 `tep__event_id()` 只读 id 不解析 format，之后的
     `tep__event_has_field()` 等会在空 tep 上查找而失败。profiler 在 init 开头 `tep__ref()`，deinit 才 unref。
   - `tep__event_fields()` 返回的数组由调用者 free，但 name 指向 tep 内部，tep 释放后不能用。
+    BPF 事件（`tp_is_bpf()`）的字段来自 BTF，name 指向源的缓存，进程退出前一直有效。
+  - `event_field_scalar()` 按 `is_unsigned` 读出一个标量字段（`size == elementsize`）并扩展到 `long long`；
+    无符号字段由调用者转回 `unsigned long long`。python、sql 读 BPF 事件的字段共用它。
   - 有人持有 `tep__ref()` 时 `tep__update_comm()` 不生效，comm 走 global_comm（见 5.2）。
   - `tep__sched_switch_preempt_state()` 结果缓存在静态变量；探测失败为 0，只警告一次。
 - **内核功能**：tracepoint / ftrace。
@@ -258,7 +261,9 @@ perf-prof 的分析器建立在一组公共模块上：事件的打开与分发�
   - **启动顺序**：`prof_dev_bpf_start()` 在 `perf_evlist__open()` 之后、`prof->filter()` 之前，此时才 load 并把 fd 放进 map；
     用户态过滤器先编译，BPF 后端失败（如旧内核的有符号除法）时事件不带内核过滤器重新启动，并退到用户态过滤（`tp->ftrace_filter`）。
   - **样本头的 comm / pid 是运行 BPF 程序的任务**，不一定是事件描述的任务；要给用户看的任务写在结构体里。
-  - 不支持：`push=` / `pull=`、`prof_dev_replace_filter()`、python 与 sql 分析器（它们在 init 里拒绝 `nr_bpf`）。
+  - 不支持：`push=` / `pull=`、`prof_dev_replace_filter()`。
+  - **python / sql 按字段访问**：字段一律经 `tep__event_fields(tp->id)` 取（BTF），不要用 `tep_find_event()`——BPF 事件不在 tep 里。
+    raw 没有 trace_entry，读 `common_*` 会读到结构体的前 8 字节；要区分 `char[]`（文本）与 `u8[]`（字节）看 `is_string`（第 4 节）。
   - `tp_print_event()` 对 BPF 事件走源的 `ops->print`，没有则按 BTF 通用打印（标量、枚举名、char 数组为字符串）；它的 `tid` 参数是样本的 tid。
   - 事件 id 是 tep 之外的伪 id（从 `BPF_EVENT_BASE` 起），用 `tp_is_bpf()` 判断，不要拿去查 tep。
 - **内核功能**：eBPF（4.1）、perf_event。
@@ -333,6 +338,9 @@ perf-prof 的分析器建立在一组公共模块上：事件的打开与分发�
 
 - **源码**：`src/expr.c`、`src/expr.h`，语法见 [expr.md](expr.md)
 - **能力**：c4 表达式编译器：事件属性里的 EXPR、tracepoint 过滤器的用户态回退；变量由 `global_var_declare` 声明；可生成 eBPF 指令。
+  `global_var_declare.is_string` 标记文本型 `char` 数组（与 `u8` 数组区分，供 python 的 str/bytes、sql 的 TEXT/BLOB 使用），
+  只有 BPF 事件的字段（`bpf_expr_filter_fields()`，按 BTF 类型名 `char`）会设置；tracepoint 字段恒为 false，
+  它们的字符串属性仍从 libtraceevent 读（`tep__string_field_as_binary()`）。表达式编译器不看这一位。
 - **注意事项**：
   - 编译器用全局状态与 `setjmp`，**不可重入、不能多线程**。
   - 每个 prog 只有一块 data：先 load 再 run，同一个 prog 不能在嵌套回调里交叉 load / run。

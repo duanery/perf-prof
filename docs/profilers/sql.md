@@ -102,6 +102,10 @@ perf-prof sql -e 'sched:sched_wakeup/prio<10/' -i 1000 \
 # 使用别名区分多个相同事件（不同过滤条件）
 perf-prof sql -e 'sched:sched_wakeup/prio<10/alias=high_prio/,sched:sched_wakeup/prio>=10/alias=low_prio/' -i 1000 \
   --query 'SELECT "high_prio" as type, COUNT(*) FROM high_prio UNION SELECT "low_prio", COUNT(*) FROM low_prio'
+
+# BPF事件：调度延迟>1ms的进程，rundelay>1000000 下推为内核态BPF过滤器
+perf-prof sql -e bpf:sched_rundelay -i 1000 \
+  --query 'SELECT comm, COUNT(*), MAX(rundelay) FROM sched_rundelay WHERE rundelay > 1000000 GROUP BY comm'
 ```
 
 ## 核心原理
@@ -116,13 +120,14 @@ perf-prof sql -e 'sched:sched_wakeup/prio<10/alias=high_prio/,sched:sched_wakeup
   - 数值字段 → INTEGER 类型
   - 字符串字段 → TEXT 类型
   - 数组字段 → BLOB 类型
+  - BPF事件（`bpf:name`）的字段来自事件结构体的 BTF：`char` 数组 → TEXT，其他数组（如 `u8[]`）→ BLOB，标量与枚举 → INTEGER
 - **系统列**: 每张表包含固定的系统列
   - `_pid`: 进程ID
   - `_tid`: 线程ID
   - `_time`: 事件时间戳
   - `_cpu`: CPU编号
-  - `_period`: 采样周期
-  - `common_flags`, `common_preempt_count`, `common_pid`: trace event通用字段
+  - `_period`: 采样周期（BPF事件恒为 0）
+  - `common_flags`, `common_preempt_count`, `common_pid`: trace event通用字段。BPF事件的表没有这 3 列：raw 是事件结构体本身，没有 trace_entry
 - **元数据表**: 自动创建 `event_metadata` 表存储事件元信息
   - `table_name`: 事件表名（主键）
   - `event_system`: 事件系统（如 sched）
@@ -157,10 +162,11 @@ perf-prof sql -e 'sched:sched_wakeup/prio<10/alias=high_prio/,sched:sched_wakeup
   - 支持所有tracepoint事件: `sys:name`
   - 支持通配符: `sched:*`, `irq:irq_*`
   - 支持kprobe/uprobe（bpftrace 风格）: `kprobe[:module]:fn[+off]`, `kprobe:0xADDR`, `uprobe:BINARY:fn[+off]`, `uprobe:BINARY:offset`
-  - 不支持 `bpf:name` 事件（BPF 事件源）
+  - 支持BPF事件: `bpf:name`（`perf-prof list bpf` 列出，`perf-prof trace -e bpf:name help` 查看字段）
   - **过滤器**: 支持trace event过滤器语法，在内核态过滤事件
     - 示例: `-e 'sched:sched_wakeup/pid>1000 && prio<10/'`
     - trace event过滤器失败时在用户态执行过滤
+    - BPF事件的过滤器是 C 表达式（`-e 'bpf:sched_rundelay/rundelay>1000000/'`），编译成 BPF 在内核执行，BPF 后端不支持时回退到用户态
   - **属性**:
     - `alias=name`: 设置表别名（默认使用事件名）
     - `index=field`: 指定索引字段（覆盖自动选择的索引字段，仅内存模式有效）
@@ -259,6 +265,8 @@ perf-prof sql -e 'sched:sched_wakeup/prio<10/alias=high_prio/,sched:sched_wakeup
 - 只有内核支持的字段和运算符才能生成ftrace filter
   - `INTEGER` 列: 支持 `=`, `>`, `<`, `>=`, `<=`, `!=`
   - `TEXT` 列：支持 `=`, `!=`, `GLOB`，分别转换为 `==`, `!=`, `~` 内核运算符。
+- BPF事件只下推 `INTEGER` 的事件字段，生成的表达式（如 `rundelay>1000000&&prio>=100`）编译进 BPF 程序在内核过滤。
+  `_cpu` 与 `TEXT` 列不下推：BPF 后端不支持它们，混进来会让整个过滤器退到用户态；它们照常在用户态过滤
 - 单次`xFilter`内的约束用`&&`组合：`WHERE pid>1000 AND prio<10` → `pid>1000&&prio<10`
 - 多次`xFilter`调用的filter用`||`组合：`(pid>1000)||(comm~"perf*")`
 - 生成的filter存入`priv->ftrace_filter`，后续应用到`tp->filter`实现内核态过滤

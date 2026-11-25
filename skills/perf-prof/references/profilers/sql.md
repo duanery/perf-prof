@@ -52,6 +52,7 @@ sql分析器支持trace event过滤器，在内核态过滤事件：
 - 事件字段 → SQL列（数值→INTEGER，字符串→TEXT，数组→BLOB）
 - 系统列: `_pid`, `_tid`, `_time`, `_cpu`, `_period`
 - trace event通用字段: `common_flags`, `common_preempt_count`, `common_pid`
+- BPF事件（`bpf:name`）的表没有 `common_*`，事件字段按 BTF 映射：`char[]`→TEXT，其他数组→BLOB，其余→INTEGER
 
 **元数据表**: `event_metadata`（存储事件元信息和可用函数列表）
   - `table_name`: 事件表名（主键）
@@ -74,7 +75,7 @@ sql分析器支持trace event过滤器，在内核态过滤事件：
 ```
 
 ### 事件源
-- **自定义事件**: 通过 `-e` 选项指定tracepoint、kprobe、uprobe事件
+- **自定义事件**: 通过 `-e` 选项指定tracepoint、kprobe、uprobe、BPF事件（`bpf:name`）
 
 ### 过滤器层次
 1. **trace event过滤器（内核态）**: 通过事件选择器语法 `/filter/` 指定
@@ -91,6 +92,7 @@ sql分析器支持trace event过滤器，在内核态过滤事件：
 ### 内存模式
 
 - **Virtual Table约束下推**：把WHERE查询子句转换为 **trace event过滤器**，在内核态直接过滤事件。
+  BPF事件只下推整数字段，生成 C 表达式编译进 BPF 程序；`_cpu` 和字符串约束不下推（只在用户态过滤）。
 - **单字段索引**：内存模式支持自动建立单字段索引。
   - 统计每个 `INTEGER` 和 `TEXT` 字段被引用的次数，选择引用最多的字段作为索引字段。
   - 在自动选择的索引字段不是最优时，使用 `index=` 属性手动选择。
@@ -155,6 +157,10 @@ perf-prof sql -e sched:sched_switch -i 1000 \
 # 3. 约束下推，构建 "pid>1000" 内核态过滤器
 perf-prof sql -e sched:sched_wakeup -i 1000 \
   --query 'SELECT * FROM sched_wakeup WHERE pid > 1000'
+
+# 4. BPF事件：调度延迟>1ms的进程，"rundelay>1000000" 下推为内核态BPF过滤器
+perf-prof sql -e bpf:sched_rundelay -i 1000 \
+  --query 'SELECT comm, COUNT(*), MAX(rundelay) FROM sched_rundelay WHERE rundelay > 1000000 GROUP BY comm'
 ```
 
 ### 高级技巧
