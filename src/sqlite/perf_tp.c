@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <monitor.h>
 #include <tep.h>
+#include <linux/kernel.h>
 #include <linux/rblist.h>
 #include <linux/bitmap.h>
 #include <event-parse-local.h>
@@ -550,7 +551,8 @@ static void sqlite_symbolic(sqlite3_context *context, int argc, sqlite3_value **
         }
 
         if (match) {
-            for (j = 0; j < tp_priv->nr_fields; j++) {
+            /* tep fields only: a BPF event has no print_fmt to give symbols */
+            for (j = 0; tp_priv->fields && tp_priv->fields[j]; j++) {
                 struct tep_format_field *field = tp_priv->fields[j];
                 if (strcmp(field->name, field_name) == 0) {
                     symbol = symbolic_lookup(ctx, tp->id, field->offset, value);
@@ -749,32 +751,41 @@ static struct sql_tp_ctx *sql_tp_common_init(sqlite3 *sql, struct tp_list *tp_li
         struct tp_private *priv = tp->private;
 
         if (!priv) {
-            fields = event ? tep_event_fields(event) : NULL;
             priv = calloc(1, sizeof(struct tp_private));
-            if (!priv) {
-                if (fields) free (fields);
+            if (!priv)
                 goto failed;
-            }
-            priv->fields = fields;
-
-            for (j = 0; fields && fields[j]; j++) {
-                if ((fields[j]->flags & TEP_FIELD_IS_STRING) &&
-                    tep__string_field_as_binary(event, fields[j])) {
-                    fields[j]->flags &= ~TEP_FIELD_IS_STRING;
-                }
-            }
-            /*
-            * nr_fields = 8 system columns + j event-specific columns
-            * System columns: _pid, _tid, _time, _cpu, _period,
-            *                 common_flags, common_preempt_count, common_pid
-            */
-            priv->nr_fields = 8 + j;
-            priv->table_name = tp->alias ? tp->alias : tp->name;
-            priv->mode = FILE_MODE;
             INIT_LIST_HEAD(&priv->event_list);
             priv->index_tree = RB_ROOT;
-
             tp->private = priv;
+
+            if (tp_is_bpf(tp)) {
+                /* bpf:xxx: the event struct from BTF, no trace_entry */
+                priv->bpf_fields = tep__event_fields(tp->id);
+                if (!priv->bpf_fields)
+                    goto failed;
+                for (j = 0; priv->bpf_fields[j].name; j++)
+                    ;
+                priv->nr_sys = 5;
+            } else {
+                fields = event ? tep_event_fields(event) : NULL;
+                priv->fields = fields;
+
+                for (j = 0; fields && fields[j]; j++) {
+                    if ((fields[j]->flags & TEP_FIELD_IS_STRING) &&
+                        tep__string_field_as_binary(event, fields[j])) {
+                        fields[j]->flags &= ~TEP_FIELD_IS_STRING;
+                    }
+                }
+                priv->nr_sys = 8;
+            }
+            /*
+            * nr_fields = nr_sys system columns + j event-specific columns
+            * System columns: _pid, _tid, _time, _cpu, _period,
+            *                 common_flags, common_preempt_count, common_pid (tracepoints only)
+            */
+            priv->nr_fields = priv->nr_sys + j;
+            priv->table_name = tp->alias ? tp->alias : tp->name;
+            priv->mode = FILE_MODE;
         } else {
             if (priv->function_list) {
                 free(priv->function_list);
@@ -842,66 +853,126 @@ failed:
     return NULL;
 }
 
+static const char *ColumnName(struct tp_private *priv, int i)
+{
+    static const char *sys_columns[] = {
+        // common fields
+        "_pid", "_tid", "_time", "_cpu", "_period",
+        // common_* (common_type removed - use event_id from event_metadata table)
+        "common_flags", "common_preempt_count", "common_pid",
+    };
+
+    if (i >= 0 && i < priv->nr_sys)
+        return sys_columns[i];
+    if (i >= priv->nr_sys && i < priv->nr_fields)
+        return priv->bpf_fields ? priv->bpf_fields[i - priv->nr_sys].name :
+                                  priv->fields[i - priv->nr_sys]->name;
+    return "unknown";
+}
+
+/*
+ * SQLite type of column i, the same in all storage modes. SQLITE_NULL: no
+ * such column.
+ *
+ * 1. TEXT: String fields
+ *    - char comm[16];            offset:8;  size:16; -> TEXT
+ *    - __data_loc char[] cmd;    offset:40; size:4;  -> TEXT
+ *    Tracepoints: IS_STRING flag. Fields requiring special format (e.g., %pI4, %pM)
+ *    have IS_STRING flag cleared in sql_tp_common_init() to be treated as BLOB.
+ *    Note: IS_SIGNED flag is no longer reliable for char arrays because:
+ *    - arm64 kernel: char is unsigned by default
+ *    - kernel commit 3bc753c06dd0 ("kbuild: treat char as always unsigned")
+ *    BPF events: char arrays (is_string from BTF), not u8 arrays.
+ *
+ * 2. BLOB: Array fields without string semantics
+ *    - __u8 saddr[4];            offset:28; size:4;  -> BLOB
+ *    - long sysctl_mem[3];       offset:40; size:24; -> BLOB
+ *    Arrays without string semantics are stored as binary data.
+ *
+ * 3. INTEGER: All other fields (numeric types), and the system columns
+ *    - int pid;                  offset:24; size:4;  -> INTEGER
+ */
+static int ColumnType(struct tp_private *priv, int i)
+{
+    if (i < priv->nr_sys)
+        return SQLITE_INTEGER;
+    if (i >= priv->nr_fields)
+        return SQLITE_NULL;
+    if (priv->bpf_fields) {
+        event_fields *field = &priv->bpf_fields[i - priv->nr_sys];
+        if (field->is_string)
+            return SQLITE_TEXT;
+        if (field->size != field->elementsize)
+            return SQLITE_BLOB;
+    } else {
+        struct tep_format_field *field = priv->fields[i - priv->nr_sys];
+        if (field->flags & TEP_FIELD_IS_STRING)
+            return SQLITE_TEXT;
+        if (field->flags & TEP_FIELD_IS_ARRAY)
+            return SQLITE_BLOB;
+    }
+    return SQLITE_INTEGER;
+}
+
+static const char *ColumnTypeName(struct tp_private *priv, int i)
+{
+    switch (ColumnType(priv, i)) {
+        case SQLITE_TEXT: return "TEXT";
+        case SQLITE_BLOB: return "BLOB";
+        default: return "INTEGER";
+    }
+}
+
+/*
+ * Bind or return a field of a BPF event, typed as ColumnType() says. A string
+ * fills its array without a terminator at most.
+ */
+static void bpf_field_bind(sqlite3_stmt *stmt, int idx, event_fields *field, void *base)
+{
+    void *ptr = base + field->offset;
+
+    if (field->is_string)
+        sqlite3_bind_text(stmt, idx, ptr, strnlen(ptr, field->size), SQLITE_STATIC);
+    else if (field->size != field->elementsize)
+        sqlite3_bind_blob(stmt, idx, ptr, field->size, SQLITE_STATIC);
+    else
+        sqlite3_bind_int64(stmt, idx, event_field_scalar(field, base));
+}
+
+static void bpf_field_result(sqlite3_context *ctx, event_fields *field, void *base)
+{
+    void *ptr = base + field->offset;
+
+    if (field->is_string)
+        sqlite3_result_text(ctx, ptr, strnlen(ptr, field->size), SQLITE_STATIC);
+    else if (field->size != field->elementsize)
+        sqlite3_result_blob(ctx, ptr, field->size, SQLITE_STATIC);
+    else
+        sqlite3_result_int64(ctx, event_field_scalar(field, base));
+}
+
 static int sql_create_table(struct sql_tp_ctx *ctx)
 {
     struct tp *tp;
     int i;
-    const char *table_fmt = "DROP TABLE IF EXISTS %s; "
-        "CREATE TABLE %s ("
-                "_pid INTEGER, "
-                "_tid INTEGER, "
-                "_time INTEGER, "
-                "_cpu INTEGER, "
-                "_period INTEGER, "
-                "common_flags INTEGER, "
-                "common_preempt_count INTEGER, "
-                "common_pid INTEGER"
-                "%s" // raw data columns
-        ");";
-    const char *insert_fmt = "INSERT INTO %s VALUES(?, ?, ?, ?, ?, ?, ?, ?%s);";
-    char buf[1024 + strlen(table_fmt)];
+    const char *table_fmt = "DROP TABLE IF EXISTS %s; CREATE TABLE %s (%s);";
+    const char *insert_fmt = "INSERT INTO %s VALUES(%s);";
+    char buf[1024 + 256 + strlen(table_fmt)];
     char *errmsg = NULL;
 
     for_each_real_tp(ctx->tp_list, tp, i) {
         struct tp_private *priv = (struct tp_private *)tp->private;
-        struct tep_format_field **fields = priv->fields;
-        char col_buf[1024];
+        char col_buf[1024 + 256];
         char ins_buf[512];
-        int j = 0, col_len = 0, ins_len = 0;
+        int j, col_len = 0, ins_len = 0;
 
-        while (fields && fields[j]) {
-            /* Field type mapping to SQLite types:
-             *
-             * 1. TEXT: String fields (IS_STRING flag)
-             *    - char comm[16];            offset:8;  size:16; -> TEXT
-             *    - __data_loc char[] cmd;    offset:40; size:4;  -> TEXT
-             *    Note: Fields requiring special format (e.g., %pI4, %pM) have IS_STRING
-             *    flag cleared during arg_pointer_register() to be treated as BLOB.
-             *    Note: IS_SIGNED flag is no longer reliable for char arrays because:
-             *    - arm64 kernel: char is unsigned by default
-             *    - kernel commit 3bc753c06dd0 ("kbuild: treat char as always unsigned")
-             *
-             * 2. BLOB: Array fields (IS_ARRAY flag, without IS_STRING)
-             *    - __u8 saddr[4];            offset:28; size:4;  -> BLOB
-             *    - long sysctl_mem[3];       offset:40; size:24; -> BLOB
-             *    Arrays without string semantics are stored as binary data.
-             *
-             * 3. INTEGER: All other fields (numeric types)
-             *    - int pid;                  offset:24; size:4;  -> INTEGER
-             */
-            if ((fields[j]->flags & TEP_FIELD_IS_STRING))
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s TEXT", fields[j]->name);
-            else if (fields[j]->flags & TEP_FIELD_IS_ARRAY)
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s BLOB", fields[j]->name);
-            else
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s INTEGER", fields[j]->name);
+        /* System columns and raw data columns, typed by ColumnType() */
+        for (j = 0; j < priv->nr_fields; j++) {
+            col_len += scnprintf(col_buf + col_len, sizeof(col_buf) - col_len,
+                            "%s%s %s", j ? ", " : "", ColumnName(priv, j), ColumnTypeName(priv, j));
             if (!priv->insert_stmt)
-                ins_len += snprintf(ins_buf + ins_len, sizeof(ins_buf) - ins_len,
-                                ", ?");
-            j++;
+                ins_len += scnprintf(ins_buf + ins_len, sizeof(ins_buf) - ins_len,
+                                "%s?", j ? ", " : "");
         }
         col_buf[col_len] = '\0';
         ins_buf[ins_len] = '\0';
@@ -949,13 +1020,16 @@ static int sql_tp_file_sample(struct sql_tp_ctx *ctx, struct tp *tp, union perf_
     sqlite3_bind_int64(priv->insert_stmt, idx++, data->period);
 
     // common_* (common_type removed - use event_id from event_metadata table)
-    sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_flags);
-    sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_preempt_count);
-    sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_pid);
+    // A BPF event has no trace_entry.
+    if (!priv->bpf_fields) {
+        sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_flags);
+        sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_preempt_count);
+        sqlite3_bind_int(priv->insert_stmt, idx++, data->raw.common.common_pid);
+    }
 
     /* Parse and bind event-specific fields
         *
-        * Field type handling must match the SQLite type mapping in sql_create_table():
+        * Field type handling must match the SQLite type mapping in ColumnType():
         *
         * 1. TEXT binding: String fields (IS_STRING flag)
         *    - char comm[16];         -> sqlite3_bind_text()
@@ -967,7 +1041,11 @@ static int sql_tp_file_sample(struct sql_tp_ctx *ctx, struct tp *tp, union perf_
         *
         * 3. INTEGER binding: Numeric fields (default)
         *    - int pid;               -> sqlite3_bind_int64()
+        *
+        * BPF events: bpf_field_bind().
         */
+    for (i = 0; priv->bpf_fields && priv->bpf_fields[i].name; i++)
+        bpf_field_bind(priv->insert_stmt, idx++, &priv->bpf_fields[i], data->raw.data);
     for (i = 0; priv->fields && priv->fields[i]; i++) {
         struct tep_format_field *field = priv->fields[i];
         void *base = data->raw.data;
@@ -1137,7 +1215,7 @@ struct index_info {
      * in xFilter to bind actual runtime values from argv[].
      */
     struct one_op {
-        int field;                  /* Column index (0-7: system cols, 8+: event fields) */
+        int field;                  /* Column index (nr_sys system cols, then event fields) */
         int op;                     /* Comparison operator (EQ, GT, LE, LT, GE, NE) */
         int64_t value;              /* RHS value from sqlite3_vtab_rhs_value() */
     } op_table[0];
@@ -1344,52 +1422,15 @@ static int perf_tp_xConnect(sqlite3 *db, void *pAux, int argc, const char *const
     }
 
     if (table->tp) {
-        const char *table_fmt =
-                "CREATE TABLE x ("
-                        "_pid INTEGER, "
-                        "_tid INTEGER, "
-                        "_time INTEGER, "
-                        "_cpu INTEGER, "
-                        "_period INTEGER, "
-                        "common_flags INTEGER, "
-                        "common_preempt_count INTEGER, "
-                        "common_pid INTEGER"
-                        "%s" // raw data columns
-                ");";
-        char buf[1024 + strlen(table_fmt)];
-        struct tep_format_field **fields = priv->fields;
-        char col_buf[1024];
-        int j = 0, col_len = 0;
+        const char *table_fmt = "CREATE TABLE x (%s);";
+        char buf[1024 + 256 + strlen(table_fmt)];
+        char col_buf[1024 + 256];
+        int j, col_len = 0;
 
-        while (fields && fields[j]) {
-            /* Field type mapping to SQLite types:
-             *
-             * 1. TEXT: String fields (IS_STRING flag)
-             *    - char comm[16];            offset:8;  size:16; -> TEXT
-             *    - __data_loc char[] cmd;    offset:40; size:4;  -> TEXT
-             *    Note: Fields requiring special format (e.g., %pI4, %pM) have IS_STRING
-             *    flag cleared during arg_pointer_register() to be treated as BLOB.
-             *    Note: IS_SIGNED flag is no longer reliable for char arrays because:
-             *    - arm64 kernel: char is unsigned by default
-             *    - kernel commit 3bc753c06dd0 ("kbuild: treat char as always unsigned")
-             *
-             * 2. BLOB: Array fields (IS_ARRAY flag, without IS_STRING)
-             *    - __u8 saddr[4];            offset:28; size:4;  -> BLOB
-             *    Arrays without string semantics are stored as binary data.
-             *
-             * 3. INTEGER: All other fields (numeric types)
-             */
-            if ((fields[j]->flags & TEP_FIELD_IS_STRING))
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s TEXT", fields[j]->name);
-            else if (fields[j]->flags & TEP_FIELD_IS_ARRAY)
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s BLOB", fields[j]->name);
-            else
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                ", %s INTEGER", fields[j]->name);
-            j++;
-        }
+        /* System columns and raw data columns, typed by ColumnType() */
+        for (j = 0; j < priv->nr_fields; j++)
+            col_len += scnprintf(col_buf + col_len, sizeof(col_buf) - col_len,
+                            "%s%s %s", j ? ", " : "", ColumnName(priv, j), ColumnTypeName(priv, j));
         col_buf[col_len] = '\0';
 
         snprintf(buf, sizeof(buf), table_fmt, col_buf);
@@ -1461,65 +1502,34 @@ static inline const char *IndexOpName(unsigned char op)
     return "UNKNOWN";
 }
 
-static const char *ColumnName(struct tp_private *priv, int i)
-{
-    switch (i) {
-        // common fields
-        case 0: return "_pid";
-        case 1: return "_tid";
-        case 2: return "_time";
-        case 3: return "_cpu";
-        case 4: return "_period";
-        // common_* (common_type removed - use event_id from event_metadata table)
-        case 5: return "common_flags";
-        case 6: return "common_preempt_count";
-        case 7: return "common_pid";
-        default: {
-            struct tep_format_field *field = i < priv->nr_fields ? priv->fields[i - 8] : NULL;
-            if (field)
-                return field->name;
-            break;
-        }
-    }
-    return "unknown";
-}
-
 /*
  * Check if column i is an INTEGER type (suitable for constraint filtering).
- * System columns (0-7) are always integers. Event fields depend on TEP flags.
+ * System columns are always integers. Event fields depend on ColumnType().
  */
 static inline bool Column_isInt(struct tp_private *priv, int i)
 {
-    if (i < 8) return 1;
-    else {
-        struct tep_format_field *field = i < priv->nr_fields ? priv->fields[i - 8] : NULL;
-        if (field && !(field->flags & TEP_FIELD_IS_STRING) &&
-                     !(field->flags & TEP_FIELD_IS_ARRAY))
-            return 1;
-        else
-            return 0;
-    }
+    return ColumnType(priv, i) == SQLITE_INTEGER;
 }
 
 static inline bool Column_isStr(struct tp_private *priv, int i)
 {
-    if (i < 8) return 0;
-    else {
-        struct tep_format_field *field = i < priv->nr_fields ? priv->fields[i - 8] : NULL;
-        if (field && (field->flags & TEP_FIELD_IS_STRING))
-            return 1;
-        else
-            return 0;
-    }
+    return ColumnType(priv, i) == SQLITE_TEXT;
 }
 
 /*
- * Check if a constraint can be pushed down to kernel ftrace filter.
- * Only _cpu (column 3) and event fields (column > 4) can be converted
- * to kernel ftrace filter expressions.
+ * Check if a constraint can be pushed down to the kernel filter.
+ *
+ * Tracepoints: only _cpu (column 3), common_* and event fields can be
+ * converted to kernel ftrace filter expressions.
+ *
+ * BPF events: only integer event fields, the filter is an expression compiled
+ * to BPF (docs/bpf_event_filter.md). _cpu and strings cannot be: the BPF
+ * backend refuses them, and the whole filter would run in userspace.
  */
-static inline bool constraint_can_ftrace(int column)
+static inline bool constraint_can_ftrace(struct tp_private *priv, int column)
 {
+    if (priv->bpf_fields)
+        return column >= priv->nr_sys && Column_isInt(priv, column);
     return column > 4 || column == 3;
 }
 
@@ -1674,7 +1684,7 @@ static int perf_tp_xBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pIdxInfo)
              *
              * Final cost = average of all constraint costs.
              */
-            if (rhs_available && constraint_can_ftrace(column)) {
+            if (rhs_available && constraint_can_ftrace(priv, column)) {
                 cost += 10;   /* Best: kernel ftrace filter */
             } else {
                 if (op == EQ || op == NE)
@@ -1834,6 +1844,17 @@ static int perf_tp_xClose(sqlite3_vtab_cursor *pCursor)
 static inline sqlite3_int64 perf_tp_field(struct tp_private *priv, struct tp_event *e, int i)
 {
     struct sql_sample_type *data = (void *)e->event.sample.array;
+
+    // event-specific fields of BPF events: no common_* before them
+    if (priv->bpf_fields && i >= priv->nr_sys) {
+        event_fields *field = &priv->bpf_fields[i - priv->nr_sys];
+        void *base = data->raw.data;
+
+        if (field->is_string)
+            return (sqlite3_int64)base + field->offset;
+        return event_field_scalar(field, base);
+    }
+
     switch (i) {
         // common fields
         case 0: return data->tid_entry.pid;
@@ -1847,7 +1868,7 @@ static inline sqlite3_int64 perf_tp_field(struct tp_private *priv, struct tp_eve
         case 7: return data->raw.common.common_pid;
         // event-specific fields
         default: {
-            struct tep_format_field *field = priv->fields[i - 8];
+            struct tep_format_field *field = priv->fields[i - priv->nr_sys];
             void *base = data->raw.data;
             sqlite3_int64 val = 0;
             bool is_signed;
@@ -2470,7 +2491,7 @@ static inline void perf_tp_ftrace_filter(struct perf_tp_cursor *cursor)
         char *filter = NULL;
         for (i = 0; i < cursor->nr_ops; i++) {
             /* Only include fields supported by kernel ftrace filter */
-            if (constraint_can_ftrace(cursor->op_table[i].field)) {
+            if (constraint_can_ftrace(priv, cursor->op_table[i].field)) {
                 char *tmp = NULL;
                 const char *name;
                 int op = cursor->op_table[i].op;
@@ -2731,6 +2752,15 @@ static int perf_tp_xColumn(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
     struct sql_sample_type *data = (void *)e->event.sample.array;
 
     priv->xColumn++;
+
+    // event-specific fields of BPF events: no common_* before them
+    if (priv->bpf_fields && i >= priv->nr_sys) {
+        if (i >= priv->nr_fields)
+            return SQLITE_ERROR;
+        bpf_field_result(ctx, &priv->bpf_fields[i - priv->nr_sys], data->raw.data);
+        return SQLITE_OK;
+    }
+
     switch (i) {
         // common fields
         case 0: sqlite3_result_int(ctx, data->tid_entry.pid); break;
@@ -2746,7 +2776,7 @@ static int perf_tp_xColumn(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
 
         // event-specific fields
         default: {
-            struct tep_format_field *field = i < priv->nr_fields ? priv->fields[i - 8] : NULL;
+            struct tep_format_field *field = i < priv->nr_fields ? priv->fields[i - priv->nr_sys] : NULL;
             void *base = data->raw.data;
             long long val = 0;
             void *ptr;
@@ -2870,50 +2900,27 @@ static int sql_tp_mem_create_table(struct sql_tp_ctx *ctx)
     int i;
     const char *table_fmt = "DROP TABLE IF EXISTS %s; CREATE TABLE %s (%s);";
     const char *insert_fmt = "INSERT INTO %s VALUES(%s);";
-    char buf[1024 + strlen(table_fmt)];
+    char buf[1024 + 256 + strlen(table_fmt)];
     char *errmsg = NULL;
 
     for_each_real_tp(ctx->tp_list, tp, i) {
         struct tp_private *priv = (struct tp_private *)tp->private;
-        struct tep_format_field **fields = priv->fields;
-        char col_buf[1024];
+        char col_buf[1024 + 256];
         char ins_buf[512];
         int j, col_len = 0, ins_len = 0;
 
         if (priv->mode == MEM_VIRTUAL_TABLE_MODE)
             continue;
 
-        #define COLUMN(i, name) \
-        if (test_bit(i, &priv->col_used)) { \
-            col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len, "%s INTEGER, ", name); \
-            if (!priv->mem_insert_stmt) \
-                ins_len += snprintf(ins_buf + ins_len, sizeof(ins_buf) - ins_len, "?, "); \
-        }
-        COLUMN(0, "_pid");
-        COLUMN(1, "_tid");
-        COLUMN(2, "_time");
-        COLUMN(3, "_cpu");
-        COLUMN(4, "_period");
-        COLUMN(5, "common_flags");
-        COLUMN(6, "common_preempt_count");
-        COLUMN(7, "common_pid");
-        #undef COLUMN
-
-        for (j = 0; fields && fields[j]; j++) {
-            if (8 + j < BITS_PER_LONG && !test_bit(8 + j, &priv->col_used))
+        /* System columns and raw data columns used by the query, typed by ColumnType() */
+        for (j = 0; j < priv->nr_fields; j++) {
+            if (j < BITS_PER_LONG && !test_bit(j, &priv->col_used))
                 continue;
 
-            if ((fields[j]->flags & TEP_FIELD_IS_STRING))
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                "%s TEXT, ", fields[j]->name);
-            else if (fields[j]->flags & TEP_FIELD_IS_ARRAY)
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                "%s BLOB, ", fields[j]->name);
-            else
-                col_len += snprintf(col_buf + col_len, sizeof(col_buf) - col_len,
-                                "%s INTEGER, ", fields[j]->name);
+            col_len += scnprintf(col_buf + col_len, sizeof(col_buf) - col_len,
+                            "%s %s, ", ColumnName(priv, j), ColumnTypeName(priv, j));
             if (!priv->mem_insert_stmt)
-                ins_len += snprintf(ins_buf + ins_len, sizeof(ins_buf) - ins_len,
+                ins_len += scnprintf(ins_buf + ins_len, sizeof(ins_buf) - ins_len,
                                 "?, ");
         }
         if (col_len) col_len -= 2; // remove ", "
@@ -2994,14 +3001,22 @@ static int sql_tp_mem_sample(struct sql_tp_ctx *ctx, struct tp *tp, union perf_e
             sqlite3_bind_int64(priv->mem_insert_stmt, idx++, data->period);
 
         // common_* (common_type removed - use event_id from event_metadata table)
-        if (test_bit(5, &priv->col_used))
-            sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_flags);
-        if (test_bit(6, &priv->col_used))
-            sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_preempt_count);
-        if (test_bit(7, &priv->col_used))
-            sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_pid);
+        // A BPF event has no trace_entry, its event fields follow _period.
+        if (!priv->bpf_fields) {
+            if (test_bit(5, &priv->col_used))
+                sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_flags);
+            if (test_bit(6, &priv->col_used))
+                sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_preempt_count);
+            if (test_bit(7, &priv->col_used))
+                sqlite3_bind_int(priv->mem_insert_stmt, idx++, data->raw.common.common_pid);
+        }
 
         /* Parse and bind event-specific fields */
+        for (i = 0; priv->bpf_fields && priv->bpf_fields[i].name; i++) {
+            if (priv->nr_sys + i < BITS_PER_LONG && !test_bit(priv->nr_sys + i, &priv->col_used))
+                continue;
+            bpf_field_bind(priv->mem_insert_stmt, idx++, &priv->bpf_fields[i], data->raw.data);
+        }
         for (i = 0; priv->fields && priv->fields[i]; i++) {
             struct tep_format_field *field = priv->fields[i];
             void *base = data->raw.data;
@@ -3009,7 +3024,7 @@ static int sql_tp_mem_sample(struct sql_tp_ctx *ctx, struct tp *tp, union perf_e
             void *ptr;
             int len;
 
-            if (8 + i < BITS_PER_LONG && !test_bit(8 + i, &priv->col_used))
+            if (priv->nr_sys + i < BITS_PER_LONG && !test_bit(priv->nr_sys + i, &priv->col_used))
                 continue;
 
             if ((field->flags & TEP_FIELD_IS_STRING)) {
@@ -3359,6 +3374,7 @@ void sql_tp_free(struct sql_tp_ctx *ctx)
         if (priv) {
             if (priv->fields)
                 free(priv->fields);
+            free(priv->bpf_fields);
             if (priv->function_list)
                 free(priv->function_list);
             if (priv->col_refs)
