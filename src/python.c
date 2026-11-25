@@ -201,6 +201,7 @@ struct python_event_data {
     PyObject *handler;              /* sys__event_name handler */
     PyObject *event_name;           /* Cached "sys:name" or "sys:alias" string for _event field */
     struct tep_format_field **fields;  /* Event fields from tep */
+    event_fields *bpf_fields;       /* bpf:xxx: event fields from BTF, instead of fields */
     PyObject **field_keys;          /* Cached PyUnicode for each field name */
     int nr_fields;
 };
@@ -344,11 +345,23 @@ static const char *dev_common_field_names[] = {
     NULL
 };
 
-/* Check if a field name is a common field for the given tp type */
-static int is_common_field(const char *name, int is_dev)
+/*
+ * Common field names for BPF events (bpf:xxx). The raw data is the event
+ * struct alone, there is no trace_entry to give common_*.
+ * BPF events have: _pid,_tid,_time,_cpu,_period,_realtime,_callchain,_event + BTF fields
+ */
+static const char *bpf_common_field_names[] = {
+    "_pid", "_tid", "_time", "_cpu", "_period",
+    "_realtime", "_callchain", "_event",
+    NULL
+};
+
+/* Check if a field name is a common field for the type of @tp */
+static int is_common_field(const char *name, struct tp *tp)
 {
     const char **p;
-    const char **fields = is_dev ? dev_common_field_names : tp_common_field_names;
+    const char **fields = tp_is_dev(tp) ? dev_common_field_names :
+                          tp_is_bpf(tp) ? bpf_common_field_names : tp_common_field_names;
     for (p = fields; *p; p++) {
         if (strcmp(name, *p) == 0)
             return 1;
@@ -428,6 +441,25 @@ static PyObject *parse_event_field(void *raw_data, struct tep_format_field *fiel
     return value;
 }
 
+/*
+ * Parse a field of a BPF event: a char array is str, other arrays bytes, the
+ * rest int. A string fills its array without a terminator at most.
+ */
+static PyObject *parse_bpf_field(void *raw_data, const event_fields *field)
+{
+    const char *ptr = raw_data + field->offset;
+    long long val;
+
+    if (field->is_string)
+        return PyUnicode_FromStringAndSize(ptr, strnlen(ptr, field->size));
+    if (field->size != field->elementsize)
+        return PyBytes_FromStringAndSize(ptr, field->size);
+
+    val = event_field_scalar(field, raw_data);
+    return field->is_unsigned ? PyLong_FromUnsignedLongLong((unsigned long long)val) :
+                                PyLong_FromLongLong(val);
+}
+
 /* Get all field names (common + event-specific) */
 static PyObject *perfevent_get_all_field_names(PerfEventObject *self)
 {
@@ -453,6 +485,7 @@ static PyObject *perfevent_get_all_field_names(PerfEventObject *self)
      * Field layout:
      * - Tracepoint events: _pid,_tid,_time,_cpu,_period,common_type,common_flags,
      *                      common_preempt_count,common_pid,_realtime,_callchain,_event + tep fields
+     * - BPF events:        _pid,_tid,_time,_cpu,_period,_realtime,_callchain,_event + BTF fields
      * - Profiler events:   _pid,_tid,_time,_cpu,_realtime,_event + member_cache fields
      */
     APPEND_KEY(key_pid);
@@ -484,17 +517,19 @@ static PyObject *perfevent_get_all_field_names(PerfEventObject *self)
             }
         }
     } else {
-        /* Tracepoint event: full field set */
+        /* Tracepoint event: full field set, BPF event: no common_* */
         APPEND_KEY(key_period);
-        APPEND_KEY(key_common_type);
-        APPEND_KEY(key_common_flags);
-        APPEND_KEY(key_common_preempt_count);
-        APPEND_KEY(key_common_pid);
+        if (!tp_is_bpf(self->tp)) {
+            APPEND_KEY(key_common_type);
+            APPEND_KEY(key_common_flags);
+            APPEND_KEY(key_common_preempt_count);
+            APPEND_KEY(key_common_pid);
+        }
         APPEND_KEY(key_realtime);
         APPEND_KEY(key_callchain);
         APPEND_KEY(key_event);
 
-        /* Add tep event-specific fields */
+        /* Add tep or BTF event-specific fields */
         for (i = 0; i < ev->nr_fields; i++) {
             if (ev->field_keys[i]) {
                 if (PyList_Append(list, ev->field_keys[i]) < 0) {
@@ -862,7 +897,8 @@ static PyObject *perfevent_get_field(PerfEventObject *self, PyObject *field_name
 
     /* Parse field value */
     perfevent_get_raw(self, &raw, &raw_size, NULL);
-    value = parse_event_field(raw, ev->fields[i]);
+    value = ev->bpf_fields ? parse_bpf_field(raw, &ev->bpf_fields[i]) :
+                             parse_event_field(raw, ev->fields[i]);
     if (value) {
         /* Cache the value using the cached key */
         PyDict_SetItem(self->field_cache, ev->field_keys[i], value);
@@ -1196,6 +1232,7 @@ static PyObject *PerfEvent_getattro(PerfEventObject *self, PyObject *name)
      * Field layout:
      * - Tracepoint: _pid,_tid,_time,_cpu,_period,common_type,common_flags,
      *               common_preempt_count,common_pid,_realtime,_callchain,_event + tep fields
+     * - BPF:        _pid,_tid,_time,_cpu,_period,_realtime,_callchain,_event + BTF fields
      * - Profiler:   _pid,_tid,_time,_cpu,_realtime,_event + member_cache fields
      */
 
@@ -1220,15 +1257,17 @@ static PyObject *PerfEvent_getattro(PerfEventObject *self, PyObject *name)
     if (name == kc->key_event)
         return PerfEvent_get_event(self, NULL);
 
-    /* Tracepoint-only fields */
+    /* Fields of tracepoint and BPF events */
     if (!is_dev) {
-        struct trace_entry *entry;
-        int raw_size;
-
         if (name == kc->key_callchain)
             return PerfEvent_get_callchain(self, NULL);
         if (name == kc->key_period)
             return PyLong_FromUnsignedLongLong(self->_period);
+    }
+    /* trace_entry fields: tracepoints only, a BPF event has no trace_entry */
+    if (!is_dev && !tp_is_bpf(self->tp)) {
+        struct trace_entry *entry;
+        int raw_size;
 
         if (name == kc->key_common_type) {
             perfevent_get_raw(self, (void *)&entry, &raw_size, NULL);
@@ -1287,8 +1326,8 @@ static Py_ssize_t PerfEvent_length(PerfEventObject *self)
     } else {
         /* Tracepoint event: common fields count: _pid, _tid, _time, _cpu, _period,
            common_type, common_flags, common_preempt_count, common_pid,
-           _realtime, _callchain, _event = 12 */
-        count = 12;
+           _realtime, _callchain, _event = 12; BPF event: without common_* = 8 */
+        count = tp_is_bpf(self->tp) ? 8 : 12;
 
         ev = (struct python_event_data *)self->tp->private;
         if (ev)
@@ -1331,7 +1370,7 @@ static int PerfEvent_contains(PerfEventObject *self, PyObject *key)
         return -1;
 
     /* Check common fields */
-    if (is_common_field(field_name, tp_is_dev(self->tp)))
+    if (is_common_field(field_name, self->tp))
         return 1;
 
     if (tp_is_dev(self->tp)) {
@@ -1351,11 +1390,12 @@ static int PerfEvent_contains(PerfEventObject *self, PyObject *key)
             }
         }
     } else {
-        /* Tracepoint event: check event-specific fields using cached fields */
+        /* Tracepoint or BPF event: check event-specific fields using cached fields */
         ev = (struct python_event_data *)self->tp->private;
-        if (ev && ev->fields) {
+        if (ev && (ev->fields || ev->bpf_fields)) {
             for (i = 0; i < ev->nr_fields; i++) {
-                if (strcmp(ev->fields[i]->name, field_name) == 0)
+                const char *name = ev->bpf_fields ? ev->bpf_fields[i].name : ev->fields[i]->name;
+                if (strcmp(name, field_name) == 0)
                     return 1;
             }
         }
@@ -1767,9 +1807,9 @@ static const char PerfEvent_doc[] =
     "    _time             Event timestamp in nanoseconds (int)\n"
     "    _cpu              CPU number (int)\n"
     "    _period           Sample period (int)\n"
-    "    common_flags      Trace entry common flags (int)\n"
-    "    common_preempt_count  Trace entry preempt count (int)\n"
-    "    common_pid        Trace entry common_pid (int)\n"
+    "    common_flags      Trace entry common flags (int, tracepoints only)\n"
+    "    common_preempt_count  Trace entry preempt count (int, tracepoints only)\n"
+    "    common_pid        Trace entry common_pid (int, tracepoints only)\n"
     "\n"
     "Fields (lazy computed):\n"
     "    _realtime         Wall clock time in ns since Unix epoch (int)\n"
@@ -2024,6 +2064,9 @@ static void free_key_cache(struct python_key_cache *kc)
  *   Clears TEP_FIELD_IS_STRING flag for fields that require special pointer
  *   format output (e.g., %pI4, %pM), as they should be treated as binary data.
  *
+ * For BPF events (bpf:xxx, also real_tp):
+ *   The fields of the event struct, read from BTF by tep__event_fields().
+ *
  * For profiler event sources (dev_tp):
  *   Cache Python string keys in member_cache->members[].private for fast
  *   field lookup during PerfEvent_getattro().
@@ -2054,7 +2097,25 @@ static int cache_event_fields(struct python_ctx *ctx)
 
         tp->private = ev; /* Link tp to its python_event_data */
 
-        if (event) {
+        if (tp_is_bpf(tp)) {
+            /* bpf:xxx: the event struct from BTF, no tep event */
+            ev->bpf_fields = tep__event_fields(tp->id);
+            if (!ev->bpf_fields)
+                goto failed;
+
+            for (j = 0; ev->bpf_fields[j].name; j++) ;
+            ev->nr_fields = j;
+
+            ev->field_keys = calloc(ev->nr_fields, sizeof(PyObject *));
+            if (!ev->field_keys)
+                goto failed;
+
+            for (j = 0; j < ev->nr_fields; j++) {
+                ev->field_keys[j] = PyUnicode_InternFromString(ev->bpf_fields[j].name);
+                if (!ev->field_keys[j])
+                    goto failed;
+            }
+        } else if (event) {
             ev->fields = tep_event_fields(event);
             if (!ev->fields)
                 goto failed;
@@ -2457,6 +2518,7 @@ static void python_script_exit(struct python_ctx *ctx)
 
             if (ev->fields)
                 free(ev->fields);
+            free(ev->bpf_fields);
         }
         free(ctx->events);
     }
@@ -2687,10 +2749,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->tp_list = tp_list_new(dev, env->event);
     if (!ctx->tp_list)
         goto failed;
-    if (ctx->tp_list->nr_bpf) {
-        fprintf(stderr, "%s: BPF events are not supported yet\n", dev->prof->name);
-        goto failed;
-    }
 
     /* Initialize callchain support if enabled */
     if (env->callchain || ctx->tp_list->nr_need_stack) {
@@ -2977,6 +3035,60 @@ static const char *python_type_hint(struct tep_event *event, struct tep_format_f
         return "int";
 }
 
+/* Python type hint of a BPF event field, as parse_bpf_field() converts it */
+static const char *python_bpf_type_hint(const event_fields *field)
+{
+    if (field->is_string)
+        return "str";
+    else if (field->size != field->elementsize)
+        return "bytes";
+    else
+        return "int";
+}
+
+/* An event-specific field in the script template */
+struct field_hint {
+    const char *name;
+    const char *type;
+};
+
+/*
+ * The event-specific fields of @tp, from tep or, for bpf:xxx, from BTF.
+ * Ends with a NULL name; NULL if the fields are unknown. The names point into
+ * tep or the BPF event source, the caller frees the array.
+ */
+static struct field_hint *python_field_hints(struct tep_handle *tep, struct tp *tp)
+{
+    struct field_hint *hints = NULL;
+    int k, n;
+
+    if (tp_is_bpf(tp)) {
+        event_fields *fields = tep__event_fields(tp->id);
+
+        for (n = 0; fields && fields[n].name; n++) ;
+        if (fields)
+            hints = calloc(n + 1, sizeof(*hints));
+        for (k = 0; hints && k < n; k++) {
+            hints[k].name = fields[k].name;
+            hints[k].type = python_bpf_type_hint(&fields[k]);
+        }
+        free(fields);
+    } else {
+        struct tep_event *event = tep_find_event(tep, tp->id);
+        struct tep_format_field **fields = event ? tep_event_fields(event) : NULL;
+
+        for (n = 0; fields && fields[n]; n++) ;
+        if (fields)
+            hints = calloc(n + 1, sizeof(*hints));
+        for (k = 0; hints && k < n; k++) {
+            hints[k].name = fields[k]->name;
+            hints[k].type = python_type_hint(event, fields[k]);
+        }
+        free(fields);
+    }
+    return hints;
+}
+
 /*
  * Output Python script template with event handler functions
  */
@@ -3020,6 +3132,11 @@ static void python_help_script_template(struct help_ctx *hctx)
     printf("#                                     'offset': int, 'kernel': bool, 'dso': str}\n");
     printf("#   _event        : Event name with alias if set (str, only in __sample__, lazy computed)\n");
     printf("#   <field>       : Event-specific fields (int/str/bytes, lazy computed)\n");
+    printf("#\n");
+    printf("#   BPF events (-e bpf:name):\n");
+    printf("#   The fields of tracepoint events, without common_*. _period is 0.\n");
+    printf("#   <field>       : Fields of the event struct, from BTF (lazy computed)\n");
+    printf("#                   char[] is str, other arrays are bytes, the rest int\n");
     printf("#\n");
     printf("#   Profiler events (-e profiler):\n");
     printf("#   _pid, _tid    : Process/thread ID (int)\n");
@@ -3127,8 +3244,7 @@ static void python_help_script_template(struct help_ctx *hctx)
             char *handler_name;
 
             for_each_real_tp(hctx->tp_list[i], tp, j) {
-                struct tep_event *event = tep_find_event(tep, tp->id);
-                struct tep_format_field **fields = NULL;
+                struct field_hint *hints;
 
                 /* Build handler name using alias if available */
                 handler_name = build_handler_name(tp->sys, tp->name, tp->alias);
@@ -3145,16 +3261,12 @@ static void python_help_script_template(struct help_ctx *hctx)
                 printf("    event: PerfEvent  (lazy-evaluated event object)\n");
 
                 /* Document event-specific fields */
-                if (event) {
-                    fields = tep_event_fields(event);
-                    if (fields) {
-                        printf("    \n");
-                        printf("    Event-specific fields:\n");
-                        for (k = 0; fields[k]; k++) {
-                            printf("        %s : %s\n", fields[k]->name,
-                                   python_type_hint(event, fields[k]));
-                        }
-                    }
+                hints = python_field_hints(tep, tp);
+                if (hints) {
+                    printf("    \n");
+                    printf("    Event-specific fields:\n");
+                    for (k = 0; hints[k].name; k++)
+                        printf("        %s : %s\n", hints[k].name, hints[k].type);
                 }
                 printf("    \"\"\"\n");
 
@@ -3167,14 +3279,13 @@ static void python_help_script_template(struct help_ctx *hctx)
                 printf("    time_ns = event['_time']\n");
                 printf("    \n");
 
-                if (fields) {
+                if (hints) {
                     printf("    # Access event-specific fields\n");
-                    for (k = 0; fields[k]; k++) {
-                        printf("    # %s = event['%s']  # %s\n", fields[k]->name,
-                               fields[k]->name, python_type_hint(event, fields[k]));
-                    }
+                    for (k = 0; hints[k].name; k++)
+                        printf("    # %s = event['%s']  # %s\n", hints[k].name,
+                               hints[k].name, hints[k].type);
                     printf("    \n");
-                    free(fields);
+                    free(hints);
                 }
 
                 printf("    # Example: print event\n");
@@ -3318,6 +3429,11 @@ static const char *python_desc[] = PROFILER_DESC("python",
     "    _event                  - Event name, uses alias if set (only in __sample__)",
     "    <field>                 - Event-specific fields (int/str/bytes, lazy computed)",
     "",
+    "    BPF events (-e bpf:name):",
+    "    The fields of tracepoint events, without common_*. _period is 0.",
+    "    <field>                 - Fields of the event struct, from BTF (lazy computed)",
+    "                              char[] is str, other arrays are bytes, the rest int",
+    "",
     "    Profiler events (-e profiler):",
     "    _pid, _tid              - Process/thread ID",
     "    _time                   - Event timestamp (ns)",
@@ -3346,6 +3462,7 @@ static const char *python_desc[] = PROFILER_DESC("python",
     "    "PROGRAME" python -e 'sched:sched_wakeup/pid>1000/' -C 0-3 filter.py",
     "    "PROGRAME" python -e 'sched:sched_wakeup//alias=w1/,sched:sched_wakeup//alias=w2/' multi.py",
     "    "PROGRAME" python -e sched:sched_wakeup -g callstack.py  # with callchain",
+    "    "PROGRAME" python -e 'bpf:sched_rundelay/rundelay>1000000/' rundelay.py",
     "    "PROGRAME" python -e sched:sched_switch -- analyzer.py --top 10 -- ./workload arg1 arg2",
     "                                              # script args before second '--', workload after");
 
