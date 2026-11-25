@@ -146,10 +146,6 @@ static int monitor_ctx_init(struct prof_dev *dev)
     ctx->tp_list = tp_list_new(dev, env->event);
     if (!ctx->tp_list)
         goto failed;
-    if (ctx->tp_list->nr_bpf) {
-        fprintf(stderr, "%s: BPF events are not supported yet\n", dev->prof->name);
-        goto failed;
-    }
 
     ctx->sql = open_db(env->output2);
     if (!ctx->sql)
@@ -865,10 +861,11 @@ static const char *sql_desc[] = PROFILER_DESC("sql",
     "      _time             Event timestamp (nanoseconds)",
     "      _cpu              CPU number",
     "      _period           Sample period",
-    "      common_flags      Trace event common flags",
-    "      common_preempt_count  Preempt count",
-    "      common_pid        Common PID field",
-    "  Event-specific columns: mapped from trace event fields",
+    "      common_flags      Trace event common flags (not in bpf:name tables)",
+    "      common_preempt_count  Preempt count (not in bpf:name tables)",
+    "      common_pid        Common PID field (not in bpf:name tables)",
+    "  Event-specific columns: mapped from trace event fields, or the BTF of",
+    "  bpf:name events (char[] TEXT, other arrays BLOB, the rest INTEGER)",
     "      Use '"PROGRAME" trace -e EVENT help' to view event fields",
     "",
     "METADATA TABLE (event_metadata)",
@@ -920,7 +917,9 @@ static const char *sql_desc[] = PROFILER_DESC("sql",
     "    "PROGRAME" sql -e sched:sched_wakeup//alias=wake/,sched:sched_wakeup//index=comm/ -i 1000 \\",
     "        --query 'SELECT comm, COUNT(*) FROM wake GROUP BY comm; SELECT comm, COUNT(*) FROM sched_wakeup WHERE pid > 10 AND pid < 1000 GROUP BY comm'",
     "    "PROGRAME" sql -e sched:sched_wakeup -i 1000 \\",
-    "        --query 'SELECT table_name, function_list FROM event_metadata'");
+    "        --query 'SELECT table_name, function_list FROM event_metadata'",
+    "    "PROGRAME" sql -e bpf:sched_rundelay -i 1000 \\",
+    "        --query 'SELECT comm, COUNT(*), MAX(rundelay) FROM sched_rundelay WHERE rundelay > 1000000 GROUP BY comm'");
 static const char *sql_argv[] = PROFILER_ARGV("sql",
     PROFILER_ARGV_OPTION,
     PROFILER_ARGV_PROFILER, "event", "query", "output2\nSpecify DB file path", "verify");

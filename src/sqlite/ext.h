@@ -15,6 +15,9 @@
  * Perf event sample layout matching the sample_type configuration:
  * PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID | PERF_SAMPLE_CPU |
  * PERF_SAMPLE_PERIOD | PERF_SAMPLE_RAW
+ *
+ * raw.common is only there for tracepoints; the raw data of a BPF event is
+ * its struct alone.
  */
 struct sql_sample_type {
     struct {
@@ -79,6 +82,14 @@ struct tp_event {
 struct tp_private {
     /* Common fields */
     struct tep_format_field **fields;
+    event_fields *bpf_fields;   /* bpf:xxx: event fields from BTF, instead of fields */
+    /*
+     * Columns: nr_sys system columns, then the event fields, nr_fields in all.
+     * System columns: _pid, _tid, _time, _cpu, _period, and for tracepoints
+     * common_flags, common_preempt_count, common_pid. A BPF event has no
+     * trace_entry: 5 system columns.
+     */
+    int nr_sys;
     int nr_fields;
     const char *table_name;
     char *function_list;  /* Comma-separated list of available SQL functions for this event */
