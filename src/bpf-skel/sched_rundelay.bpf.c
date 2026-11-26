@@ -65,11 +65,31 @@ static __always_inline long task_state(struct task_struct *t)
     return BPF_CORE_READ((struct task_struct___old *)t, state);
 }
 
+/*
+ * Kernel constraint: with CONFIG_THREAD_INFO_IN_TASK, the current cpu is
+ * task_struct::cpu up to v5.15, and task_struct::thread_info.cpu since
+ * bcf9033e5449 ("sched: move CPU field back into thread_info if
+ * THREAD_INFO_IN_TASK=y"), in v5.16-rc1. Both are read through flavors, so
+ * one BPF object works on either layout; the member is absent without
+ * THREAD_INFO_IN_TASK and task_cpu() returns -1. t->cpu cannot be used
+ * directly: clang rejects it at compile time when vmlinux.h lacks the member,
+ * and bpf_core_field_exists() cannot guard a compile-time error.
+ */
+struct task_struct___cpu {
+    int cpu;
+} __attribute__((preserve_access_index));
+struct task_struct___ti {
+    struct {
+        unsigned int cpu;
+    } thread_info;
+} __attribute__((preserve_access_index));
+
 static __always_inline int task_cpu(struct task_struct *t)
 {
-    /* Only with CONFIG_THREAD_INFO_IN_TASK, as on x86 and arm64. */
-    if (bpf_core_field_exists(t->cpu))
-        return BPF_CORE_READ(t, cpu);
+    if (bpf_core_field_exists(((struct task_struct___cpu *)t)->cpu))
+        return BPF_CORE_READ((struct task_struct___cpu *)t, cpu);
+    if (bpf_core_field_exists(((struct task_struct___ti *)t)->thread_info.cpu))
+        return BPF_CORE_READ((struct task_struct___ti *)t, thread_info.cpu);
     return -1;
 }
 
