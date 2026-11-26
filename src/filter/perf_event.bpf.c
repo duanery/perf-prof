@@ -105,6 +105,27 @@ const volatile bool filter_nr_running = false;
 const volatile u32 nr_running_min = 0;
 const volatile u32 nr_running_max = 0xffffffff;
 
+/*
+ * Kernel constraint: the number of entities queued on a cfs_rq, struct cfs_rq
+ * in kernel/sched/sched.h. Since 736c55a02c47 ("sched/fair: Rename
+ * cfs_rq.nr_running into nr_queued"), in v6.14, it is nr_queued instead of
+ * nr_running; distributions may backport it. Both are read through flavors:
+ * reading the member that vmlinux.h lacks is a compile error, which
+ * bpf_core_field_exists() cannot guard.
+ */
+struct cfs_rq___old {
+    unsigned int nr_running;
+} __attribute__((preserve_access_index));
+struct cfs_rq___new {
+    unsigned int nr_queued;
+} __attribute__((preserve_access_index));
+
+static __always_inline u32 cfs_rq_nr_running(struct cfs_rq *cfs_rq)
+{
+    if (bpf_core_field_exists(((struct cfs_rq___new *)cfs_rq)->nr_queued))
+        return BPF_CORE_READ((struct cfs_rq___new *)cfs_rq, nr_queued);
+    return BPF_CORE_READ((struct cfs_rq___old *)cfs_rq, nr_running);
+}
 
 SEC("perf_event")
 int perf_event_do_filter(struct bpf_perf_event_data *ctx)
@@ -151,7 +172,7 @@ int perf_event_do_filter(struct bpf_perf_event_data *ctx)
         if (rq)
             nr_running = BPF_CORE_READ(rq, nr_running);
         else
-            nr_running = BPF_CORE_READ(task, se.cfs_rq, nr_running);
+            nr_running = cfs_rq_nr_running(BPF_CORE_READ(task, se.cfs_rq));
 
         if (nr_running < nr_running_min)
             return BREAK;
