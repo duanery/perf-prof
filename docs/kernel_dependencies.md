@@ -278,6 +278,11 @@ __x64_sys_clone / fork / vfork
 - 依赖：`src/filter/perf_event.bpf.c`
 - 做法与后果：在这之前，`task->thread_info` 的 CO-RE 重定位失败，程序加载失败。
 
+#### cfs_rq 的运行队列计数字段
+- 内核：`kernel/sched/sched.h`；736c55a02c47 ("sched/fair: Rename cfs_rq.nr_running into nr_queued"), in v6.14，把 `cfs_rq::nr_running` 改名为 `nr_queued`
+- 依赖：`src/filter/perf_event.bpf.c` `cfs_rq_nr_running()`；`--nr_running_min` / `--nr_running_max` 在没有 `se.cfs_rq->rq` 时读取当前任务的 CFS 队列计数
+- 做法与后果：用 CO-RE flavor 在运行内核中选择 `nr_queued` 或 `nr_running`，不按版本号判断（兼容回移植）；直接用编译机 `vmlinux.h` 中不存在的成员，clang 会在 CO-RE 重定位前报错。`rq::nr_running` 分支不受此更名影响。
+
 #### bpf_jit_kallsyms
 - 内核：`kernel/bpf/core.c` `bpf_prog_kallsyms_find()`、`include/linux/filter.h` `bpf_jit_kallsyms_enabled()`；74451e66d516 ("bpf: make jited programs visible in traces"), in v4.11；af91acbc6299 ("bpf: Fix bpf jit kallsym access"), in v5.5
 - 依赖：`src/monitor.c` `sysctl_bpf_jit_kallsyms()`；`src/misc.c` `ksymbol_dev_open()`
